@@ -24,44 +24,66 @@ This document proposes a cluster-local peer-to-peer distribution layer: the orig
 
 ## Architecture overview
 
-```mermaid
-flowchart TD
-    Origin["Origin registry<br/>(external, OCI-compliant)"]
+Cluster nodes form a peer-to-peer fabric over libp2p. Each node runs the agent as a DaemonSet; cached content is **sparsely distributed** — no node holds the full catalog, and each digest is replicated only across the nodes that have demanded it (plus its HRW-designated puller).
 
-    subgraph Cluster["Kubernetes cluster"]
-        direction TB
-        NodeA["Node A<br/>puller of D1"]
-        NodeB["Node B<br/>puller of D2"]
-        NodeC["Node C<br/>puller of D3"]
-        Peers["Remaining N−3 nodes<br/>fetch D1, D2, D3 via libp2p<br/>discovery + HTTP/2 transfer"]
+![Cache distribution across cluster nodes](images/cache-ring.png)
 
-        NodeA -- D1 --> Peers
-        NodeB -- D2 --> Peers
-        NodeC -- D3 --> Peers
-    end
+★ marks the HRW-designated puller (rank-0) for that digest — the only node that contacted origin for it. Other nodes hold the digest because they pulled it from the puller, not from origin. Per-digest HRW spreads cold-start origin contact across the cluster: an image's manifest, config, and layer digests generally HRW to *different* nodes, so origin contact is not concentrated on a single "image owner." Ring edges depict the libp2p mesh; in practice every node is a potential peer of every other.
 
-    Origin -- D1 --> NodeA
-    Origin -- D2 --> NodeB
-    Origin -- D3 --> NodeC
-```
-
-Each unique digest is pulled from origin at most a small constant number of times cluster-wide. Per-digest HRW spreads cold-start origin contact across the cluster: an image's manifest, config, and layer digests generally HRW to *different* nodes, so origin contact is not concentrated on a single "image owner." No traffic flows between the pullers themselves; each independently fans out its digest to the rest of the cluster.
-
-Per-node layout:
+### Warm pull (digest already cached on at least one peer)
 
 ```mermaid
-flowchart TD
-    Kubelet[kubelet] --> Containerd[containerd]
-    Containerd -->|hosts.toml mirror| Mirror["127.0.0.1:5000"]
-    Mirror --> Agent
+sequenceDiagram
+    participant containerd
+    participant agent as Local agent
+    participant dht as libp2p DHT
+    participant peer as Peer agent (provider)
 
-    subgraph Agent["P2P agent"]
-        direction TB
-        Components["Registry mirror server<br/>libp2p host + DHT<br/>HTTP transfer server<br/>HRW + K8s informer"]
-    end
-
-    Agent --> Cache[("hostPath:<br/>/var/lib/p2p-cache")]
+    containerd->>agent: GET blobs/sha256:D
+    Note over agent: cache miss
+    agent->>dht: FindProviders(D)
+    dht-->>agent: [peer]
+    agent->>peer: GET blobs/sha256:D<br/>Gantry-Mirrored: 1
+    peer-->>agent: blob bytes
+    Note over agent: digest-verify,<br/>cache, stream back
+    agent-->>containerd: blob bytes
+    agent->>dht: Provide(D)
 ```
+
+### Cold pull, happy path (no provider exists yet)
+
+```mermaid
+sequenceDiagram
+    participant containerd
+    participant agent as Local agent
+    participant dht as libp2p DHT
+    participant rank0 as Rank-0 (HRW puller)
+    participant other as Other top-K
+    participant origin as Origin registry
+
+    containerd->>agent: GET blobs/sha256:D
+    agent->>dht: FindProviders(D)
+    dht-->>agent: empty
+    Note over agent: compute HRW top-K
+    par probe top-K in parallel
+        agent->>rank0: pull_intent_query(D)
+        rank0-->>agent: neither cached nor in-flight
+    and
+        agent->>other: pull_intent_query(D)
+        other-->>agent: neither cached nor in-flight
+    end
+    Note over agent: confirmed cold-start
+    agent->>rank0: please_pull(D)
+    rank0-->>agent: started
+    rank0->>origin: GET blobs/sha256:D
+    origin-->>rank0: blob bytes
+    rank0->>dht: Provide(D)
+    Note over agent,dht: poll FindProviders(D)<br/>until provider appears
+    agent->>rank0: GET blobs/sha256:D<br/>Gantry-Mirrored: 1
+    rank0-->>agent: blob bytes
+    agent-->>containerd: blob bytes
+```
+
 ---
 
 ## API
@@ -95,15 +117,14 @@ Manifest requests come in two forms: by digest (`manifests/sha256:...`) and by t
 
 ### 1 Warm path — digest-keyed content exists in cluster
 
-On a local-cache miss, the agent looks up providers of the digest in the DHT, picks a reachable provider, and streams the bytes from that provider's transfer endpoint with the peer-fetch header set. The stream is digest-verified incrementally and written to the local cache while being streamed back to containerd. On completion, the agent advertises itself as a new provider via `dht.Provide`.
+On a local-cache miss, the agent looks up providers of the digest in the DHT, picks a reachable provider, and streams the bytes from that provider's transfer endpoint with the peer-fetch header set. The stream is digest-verified incrementally and written to the local cache while being streamed back to containerd. On completion, the agent advertises itself as a new provider.
 
-If a chosen provider stalls or errors mid-stream, the agent fails over to the next provider returned by the DHT lookup. After exhausting a small number of providers in succession, the agent returns a 5xx to containerd, which falls through its `hosts.toml` mirror chain to origin.
+If a chosen provider stalls or errors mid-stream, the agent fails over to the next provider returned by the DHT lookup. After exhausting a small number of providers in succession, the agent returns a 5xx to containerd, which falls through its mirror chain to origin.
 
-v1 ships **single-peer fetch** (one provider per blob, whole-blob GET). The transfer endpoint preserves `Range` support so v2 can add multi-peer striping without a protocol change. See [detailed-design.md §5.1](detailed-design.md#51-warm-path--digest-keyed-content-exists-in-cluster) for v1 timeout and retry constants and the v2 striping sketch.
 
 ### 1a Tag reference path
 
-Containerd resolves `image:tag` to a digest by fetching `manifests/<tag>` from the origin before any blob requests. **Gantry v1 does not handle this resolution.** When the agent receives a tag-shaped manifest request on its containerd-mirror loopback endpoint, it returns a 5xx immediately and containerd's `hosts.toml` fallback chain promotes the request to origin. Origin resolves the tag; containerd records the binding in its own image table; the agent observes the resulting digests via image events and routes the subsequent config and layer pulls through the digest-keyed warm or cold-start paths (F1-bounded).
+Containerd resolves `image:tag` to a digest by fetching `manifests/<tag>` from the origin before any blob requests. When the agent receives a tag-shaped manifest request on its containerd-mirror loopback endpoint, it returns a 5xx immediately and containerd's `hosts.toml` fallback chain promotes the request to origin. Origin resolves the tag; containerd records the binding in its own image table; the agent observes the resulting digests via image events and routes the subsequent config and layer pulls through the digest-keyed warm or cold-start paths (F1-bounded).
 
 The agent maintains **no tag→digest cache, no tag-keyed DHT advertisements, and no tag-freshness logic.** This eliminates the tag-rebinding coherence problem that a separate agent-layer cache would otherwise create, and preserves OCI's "tag is a pointer at origin, resolved on every pull" semantic exactly.
 
