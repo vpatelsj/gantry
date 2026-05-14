@@ -128,6 +128,15 @@ type Options struct {
 	// expansion pass under rule 5 / rule 6 (§5.2 step 5; §7.7
 	// `topk_expansion_factor_degraded`). Defaults to 2 when ≤1.
 	TopKExpansionFactor int
+
+	// TrustedFailureClasses is the set of §5.8 origin-error classes
+	// the requester accepts as a cluster-wide 5xx-immediate signal
+	// when a top-K responder reports recently_failed in rule 1.
+	// Classes outside this set (notably `transient`) are honored
+	// only locally by the reporting puller. Empty defaults to
+	// {auth, not_found, rate_limited} per design §5.8 / config
+	// `origin_failure_classes_trusted_cluster_wide`.
+	TrustedFailureClasses []ifaces.FailureClass
 }
 
 // Resolver runs the §5.2 cascade.
@@ -171,6 +180,13 @@ func New(opts Options) *Resolver {
 	}
 	if opts.TopKExpansionFactor < 2 {
 		opts.TopKExpansionFactor = 2
+	}
+	if len(opts.TrustedFailureClasses) == 0 {
+		opts.TrustedFailureClasses = []ifaces.FailureClass{
+			ifaces.FailureAuth,
+			ifaces.FailureNotFound,
+			ifaces.FailureRateLimited,
+		}
 	}
 	return &Resolver{
 		opts:       opts,
@@ -336,7 +352,7 @@ func (r *Resolver) probe(ctx context.Context, d digest.Digest, kind ifaces.Origi
 	reachable := reachableResponses(responses)
 
 	// Rule 1: failure short-circuit.
-	if v := findFailureShortCircuit(reachable); v != nil {
+	if v := findFailureShortCircuit(reachable, r.opts.TrustedFailureClasses); v != nil {
 		return nil, prefix(expandLabel, "rule1_failure"), ErrFailureShortCircuit
 	}
 
@@ -451,14 +467,15 @@ func reachableResponses(in []response) []response {
 	return out
 }
 
-func findFailureShortCircuit(rs []response) *response {
+func findFailureShortCircuit(rs []response, trusted []ifaces.FailureClass) *response {
 	for i := range rs {
 		if !rs[i].intent.RecentlyFailed {
 			continue
 		}
-		switch rs[i].intent.FailureClass {
-		case ifaces.FailureAuth, ifaces.FailureNotFound, ifaces.FailureRateLimited:
-			return &rs[i]
+		for _, t := range trusted {
+			if rs[i].intent.FailureClass == t {
+				return &rs[i]
+			}
 		}
 	}
 	return nil

@@ -75,6 +75,7 @@ spec:
           image: ghcr.io/vpatelsj/gantry:latest   # build.sh fills this with `git describe`
           imagePullPolicy: IfNotPresent
           args:
+            - agent
             - --config=/etc/gantry/config.yaml
           env:
             # NODE_NAME → membership informer's "self" lookup (§7.3).

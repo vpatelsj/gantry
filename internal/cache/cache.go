@@ -206,7 +206,10 @@ func DefaultDiskFree(dir string) func() (uint64, error) {
 
 // Open returns a Cache rooted at dir with the given byte budget. The
 // directory is created if needed. Existing content is enrolled into the
-// in-memory LRU; corrupted entries (wrong digest or filename) are removed.
+// in-memory LRU; files whose names are not valid sha256 hex digests
+// are removed. NOTE: scan() does NOT re-hash file contents — bit-rot
+// detection happens implicitly the next time a blob is read and
+// verified, not at startup.
 func Open(dir string, budgetBytes int64, opts ...Option) (*Cache, error) {
 	if dir == "" {
 		return nil, errors.New("cache: empty cache_dir")

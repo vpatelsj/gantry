@@ -288,16 +288,17 @@ func runAgent(args []string) error {
 	if hasMultiNodeMembership(memberView) {
 		selfZone := lookupSelfZone(memberView)
 		realResolver := coldstart.New(coldstart.Options{
-			Members:              memberView,
-			Discovery:            disco,
-			Coord:                coordClient,
-			Inflight:             inflightMap,
-			Logger:               logger,
-			HrwK:                 c.HRWK,
-			HrwScope:             hrw.ParseScope(c.HRWTopologyScope),
-			SelfZone:             selfZone,
-			TransientCooldownCap: c.OriginFailureHonorWindowCap,
-			TopKExpansionFactor:  c.TopKExpansionFactorDegraded,
+			Members:               memberView,
+			Discovery:             disco,
+			Coord:                 coordClient,
+			Inflight:              inflightMap,
+			Logger:                logger,
+			HrwK:                  c.HRWK,
+			HrwScope:              hrw.ParseScope(c.HRWTopologyScope),
+			SelfZone:              selfZone,
+			TransientCooldownCap:  c.OriginFailureHonorWindowCap,
+			TopKExpansionFactor:   c.TopKExpansionFactorDegraded,
+			TrustedFailureClasses: parseTrustedFailureClasses(c.OriginFailureClassesTrustedClusterWide, logger),
 			Metrics: coldstart.MetricsHooks{
 				OnRankMismatch: func(kindLabel string, _ ifaces.NodeID) {
 					p3.hrwRankMismatch.WithLabelValues(kindLabel).Inc()
@@ -896,6 +897,37 @@ func lookupSelfZone(m ifaces.Members) string {
 		}
 	}
 	return ""
+}
+
+// parseTrustedFailureClasses converts the string-form config slice
+// (`origin_failure_classes_trusted_cluster_wide`) to the typed
+// ifaces.FailureClass values consumed by the cold-start rule-1
+// short-circuit. Unknown class names are logged and dropped; an
+// empty / all-unknown result lets coldstart.New fall back to its
+// default {auth, not_found, rate_limited}.
+func parseTrustedFailureClasses(raw []string, logger *slog.Logger) []ifaces.FailureClass {
+	if len(raw) == 0 {
+		return nil
+	}
+	known := map[string]ifaces.FailureClass{
+		string(ifaces.FailureAuth):        ifaces.FailureAuth,
+		string(ifaces.FailureNotFound):    ifaces.FailureNotFound,
+		string(ifaces.FailureRateLimited): ifaces.FailureRateLimited,
+		string(ifaces.FailureTransient):   ifaces.FailureTransient,
+	}
+	out := make([]ifaces.FailureClass, 0, len(raw))
+	for _, s := range raw {
+		if fc, ok := known[s]; ok {
+			out = append(out, fc)
+			continue
+		}
+		if logger != nil {
+			logger.Warn("config: unknown origin_failure_classes_trusted_cluster_wide entry; dropped",
+				slog.String("value", s),
+			)
+		}
+	}
+	return out
 }
 
 // coldStartAdapter bridges *coldstart.Resolver to mirror.ColdStartResolver

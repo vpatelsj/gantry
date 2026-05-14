@@ -54,7 +54,7 @@ make lint         # golangci-lint (requires `make tools` first)
 ## Running locally
 
 ```sh
-./bin/gantry \
+./bin/gantry agent \
   --mirror-listen 127.0.0.1:5000 \
   --transfer-listen 0.0.0.0:5001 \
   --metrics-listen 127.0.0.1:9095 \
@@ -64,7 +64,7 @@ make lint         # golangci-lint (requires `make tools` first)
 A YAML config file matching `internal/config/config.go` is supported:
 
 ```sh
-./bin/gantry --config /etc/gantry/config.yaml
+./bin/gantry agent --config /etc/gantry/config.yaml
 ```
 
 All flags can be set via uppercase env vars too (e.g. `GANTRY_MIRROR_LISTEN`).
