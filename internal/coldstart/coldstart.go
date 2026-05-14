@@ -115,6 +115,15 @@ type Options struct {
 // Resolver runs the §5.2 cascade.
 type Resolver struct {
 	opts Options
+
+	// honorMu guards honorUntil. honorUntil records the §5.8 requester-
+	// side local honor window per digest: when a transient cooldown
+	// was last observed, the requester suppresses please_pull (and
+	// in fact the whole probe pass) for `min(cooldown_until - now,
+	// TransientCooldownCap)`. Evicted on access once the deadline
+	// passes; see suppressedByHonorWindow.
+	honorMu    sync.Mutex
+	honorUntil map[digest.Digest]time.Time
 }
 
 // New builds a Resolver. Required fields: Members, Discovery, Coord,
@@ -142,7 +151,10 @@ func New(opts Options) *Resolver {
 	if opts.TransientCooldownCap <= 0 {
 		opts.TransientCooldownCap = 30 * time.Second
 	}
-	return &Resolver{opts: opts}
+	return &Resolver{
+		opts:       opts,
+		honorUntil: make(map[digest.Digest]time.Time),
+	}
 }
 
 // Resolution carries the orchestrator's verdict.
@@ -170,6 +182,16 @@ func (r *Resolver) Resolve(ctx context.Context, d digest.Digest, kind ifaces.Ori
 	defer func() {
 		// outcome is set by the named return wrapper below.
 	}()
+
+	// §5.8 requester-side honor window: if we recently observed a
+	// transient cooldown for this digest and the capped window has
+	// not yet elapsed, short-circuit without probing the top-K. This
+	// matches the design's "apply a local honor window" rule and
+	// suppresses redundant probe traffic across kubelet retries.
+	if r.suppressedByHonorWindow(d) {
+		r.bumpDuration(kindLabel, "rule4_cooldown_honored", start)
+		return nil, ErrCooldownActive
+	}
 
 	// Step 1 + 2: top-K + parallel pull_intent_query.
 	cluster := r.opts.Members.Snapshot()
@@ -303,8 +325,12 @@ func (r *Resolver) probe(ctx context.Context, d digest.Digest, kind ifaces.Origi
 		return &Resolution{Providers: providers, Outcome: prefix(expandLabel, "rule3_inflight")}, prefix(expandLabel, "rule3_inflight"), nil
 	}
 
-	// Rule 4: transient cooldown.
-	if findTransientCooldown(reachable) {
+	// Rule 4: transient cooldown. Capture the latest cooldown_until so
+	// the requester's local honor window can be set, bounded by
+	// TransientCooldownCap (§5.8 "apply a local honor window of
+	// min(cooldown_until - now, cap)").
+	if hit, cooldownUntil := findTransientCooldown(reachable); hit {
+		r.recordHonorWindow(d, cooldownUntil)
 		return nil, prefix(expandLabel, "rule4_cooldown"), ErrCooldownActive
 	}
 
@@ -432,13 +458,23 @@ func findInFlight(rs []response, infl *inflight.Map, kind ifaces.OriginRefKind, 
 	return nil
 }
 
-func findTransientCooldown(rs []response) bool {
+func findTransientCooldown(rs []response) (bool, time.Time) {
+	// Returns whether any reachable response reports a transient
+	// cooldown and, if so, the latest cooldown_until across all such
+	// responses. Picking the latest is conservative: it gives the
+	// requester the longest honor window any puller is asking for.
+	hit := false
+	var until time.Time
 	for _, r := range rs {
-		if r.intent.RecentlyFailed && r.intent.FailureClass == ifaces.FailureTransient {
-			return true
+		if !r.intent.RecentlyFailed || r.intent.FailureClass != ifaces.FailureTransient {
+			continue
+		}
+		hit = true
+		if r.intent.CooldownUntil.After(until) {
+			until = r.intent.CooldownUntil
 		}
 	}
-	return false
+	return hit, until
 }
 
 func lowestRankReachable(rs []response) *response {
@@ -563,6 +599,48 @@ func (r *Resolver) bumpDuration(kindLabel, outcome string, start time.Time) {
 		return
 	}
 	r.opts.Metrics.OnColdStartDuration(kindLabel, outcome, r.opts.Now().Sub(start))
+}
+
+// suppressedByHonorWindow reports whether d is currently in this
+// requester's local §5.8 transient honor window. Evicts the entry on
+// access if the window has elapsed (lazy GC keeps the map bounded
+// without a background goroutine).
+func (r *Resolver) suppressedByHonorWindow(d digest.Digest) bool {
+	r.honorMu.Lock()
+	defer r.honorMu.Unlock()
+	until, ok := r.honorUntil[d]
+	if !ok {
+		return false
+	}
+	now := r.opts.Now()
+	if !now.Before(until) {
+		delete(r.honorUntil, d)
+		return false
+	}
+	return true
+}
+
+// recordHonorWindow stores a new honor-window deadline for d derived
+// from the puller's advertised cooldown_until, capped at
+// TransientCooldownCap. A non-positive remaining duration (the
+// puller's cooldown already elapsed) is dropped so the next request
+// re-probes immediately.
+func (r *Resolver) recordHonorWindow(d digest.Digest, cooldownUntil time.Time) {
+	maxWindow := r.opts.TransientCooldownCap
+	if maxWindow <= 0 {
+		return
+	}
+	now := r.opts.Now()
+	remaining := cooldownUntil.Sub(now)
+	if remaining <= 0 {
+		return
+	}
+	if remaining > maxWindow {
+		remaining = maxWindow
+	}
+	r.honorMu.Lock()
+	r.honorUntil[d] = now.Add(remaining)
+	r.honorMu.Unlock()
 }
 
 func kindLabel(k ifaces.OriginRefKind) string {

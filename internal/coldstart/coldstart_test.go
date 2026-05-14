@@ -20,6 +20,7 @@ type stubCoord struct {
 	mu              sync.Mutex
 	intents         map[ifaces.NodeID]ifaces.PullIntent
 	intentErrs      map[ifaces.NodeID]error
+	intentCalls     int
 	pleasePullCalls []ifaces.NodeID
 	pleasePullRegs  []string
 	pleasePullRepos []string
@@ -29,6 +30,7 @@ type stubCoord struct {
 func (s *stubCoord) PullIntentQuery(_ context.Context, id ifaces.NodeID, _ digest.Digest) (ifaces.PullIntent, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.intentCalls++
 	if err, ok := s.intentErrs[id]; ok {
 		return ifaces.PullIntent{}, err
 	}
@@ -313,6 +315,112 @@ func TestRule4_TransientCooldown(t *testing.T) {
 	_, err := r.Resolve(context.Background(), d, ifaces.KindManifest, "reg.example.com", "test/repo", 0)
 	if !errors.Is(err, coldstart.ErrCooldownActive) {
 		t.Fatalf("err = %v; want ErrCooldownActive", err)
+	}
+}
+
+// TestRule4_HonorWindowSuppressesReprobe asserts §5.8: once the
+// requester has observed a transient cooldown for a digest, the
+// next Resolve within the honor window short-circuits without
+// hitting any top-K node (i.e., no probe traffic).
+func TestRule4_HonorWindowSuppressesReprobe(t *testing.T) {
+	d := digest.MustParse("sha256:" + rep('e', 64))
+	nodes := clusterNodes()
+	top := hrw.TopK(nodes, d, 3)
+
+	clock := time.Now()
+	clockFn := func() time.Time { return clock }
+	coord := &stubCoord{intents: map[ifaces.NodeID]ifaces.PullIntent{
+		top[0].Node.ID: {RecentlyFailed: true, FailureClass: ifaces.FailureTransient, CooldownUntil: clock.Add(20 * time.Second)},
+	}}
+	disco := &stubDisco{}
+	r := buildResolver(t, coord, disco, "self", nodes, coldstart.MetricsHooks{}, clockFn)
+
+	// First call: observe transient, install honor window.
+	if _, err := r.Resolve(context.Background(), d, ifaces.KindManifest, "reg.example.com", "test/repo", 0); !errors.Is(err, coldstart.ErrCooldownActive) {
+		t.Fatalf("first Resolve err = %v; want ErrCooldownActive", err)
+	}
+	firstCalls := coord.intentCalls
+	if firstCalls == 0 {
+		t.Fatalf("expected probe traffic on first Resolve, got 0 intent calls")
+	}
+
+	// Advance the clock a tick — still well inside the honor window.
+	clock = clock.Add(1 * time.Second)
+
+	// Second call: must short-circuit without re-probing.
+	if _, err := r.Resolve(context.Background(), d, ifaces.KindManifest, "reg.example.com", "test/repo", 0); !errors.Is(err, coldstart.ErrCooldownActive) {
+		t.Fatalf("second Resolve err = %v; want ErrCooldownActive", err)
+	}
+	if coord.intentCalls != firstCalls {
+		t.Fatalf("honor window did not suppress probe: intent calls went %d -> %d", firstCalls, coord.intentCalls)
+	}
+}
+
+// TestRule4_HonorWindowExpires asserts that once the honor window
+// has elapsed, the requester re-probes the top-K (the puller may
+// have cleared its cooldown in the meantime).
+func TestRule4_HonorWindowExpires(t *testing.T) {
+	d := digest.MustParse("sha256:" + rep('e', 64))
+	nodes := clusterNodes()
+	top := hrw.TopK(nodes, d, 3)
+
+	clock := time.Now()
+	clockFn := func() time.Time { return clock }
+	// Puller advertises a 20s cooldown; honor cap defaults to 30s so
+	// the window is bounded by the puller's value (20s).
+	coord := &stubCoord{intents: map[ifaces.NodeID]ifaces.PullIntent{
+		top[0].Node.ID: {RecentlyFailed: true, FailureClass: ifaces.FailureTransient, CooldownUntil: clock.Add(20 * time.Second)},
+	}}
+	disco := &stubDisco{}
+	r := buildResolver(t, coord, disco, "self", nodes, coldstart.MetricsHooks{}, clockFn)
+
+	if _, err := r.Resolve(context.Background(), d, ifaces.KindManifest, "reg.example.com", "test/repo", 0); !errors.Is(err, coldstart.ErrCooldownActive) {
+		t.Fatalf("first Resolve err = %v; want ErrCooldownActive", err)
+	}
+	firstCalls := coord.intentCalls
+
+	// Advance past the honor window (puller's 20s).
+	clock = clock.Add(25 * time.Second)
+
+	if _, err := r.Resolve(context.Background(), d, ifaces.KindManifest, "reg.example.com", "test/repo", 0); !errors.Is(err, coldstart.ErrCooldownActive) {
+		t.Fatalf("second Resolve err = %v; want ErrCooldownActive (puller still reports transient)", err)
+	}
+	if coord.intentCalls == firstCalls {
+		t.Fatalf("expected re-probe after honor window expired; intent calls still %d", coord.intentCalls)
+	}
+}
+
+// TestRule4_HonorWindowCapEnforced asserts that a puller advertising
+// an unreasonably long cooldown (10 min) does not extend the
+// requester's local honor window past TransientCooldownCap (30s
+// default in buildResolver).
+func TestRule4_HonorWindowCapEnforced(t *testing.T) {
+	d := digest.MustParse("sha256:" + rep('e', 64))
+	nodes := clusterNodes()
+	top := hrw.TopK(nodes, d, 3)
+
+	clock := time.Now()
+	clockFn := func() time.Time { return clock }
+	coord := &stubCoord{intents: map[ifaces.NodeID]ifaces.PullIntent{
+		top[0].Node.ID: {RecentlyFailed: true, FailureClass: ifaces.FailureTransient, CooldownUntil: clock.Add(10 * time.Minute)},
+	}}
+	disco := &stubDisco{}
+	r := buildResolver(t, coord, disco, "self", nodes, coldstart.MetricsHooks{}, clockFn)
+
+	if _, err := r.Resolve(context.Background(), d, ifaces.KindManifest, "reg.example.com", "test/repo", 0); !errors.Is(err, coldstart.ErrCooldownActive) {
+		t.Fatalf("first Resolve err = %v; want ErrCooldownActive", err)
+	}
+	firstCalls := coord.intentCalls
+
+	// Advance past the 30s cap but well inside the puller's 10min
+	// cooldown — the cap should let the requester re-probe.
+	clock = clock.Add(31 * time.Second)
+
+	if _, err := r.Resolve(context.Background(), d, ifaces.KindManifest, "reg.example.com", "test/repo", 0); !errors.Is(err, coldstart.ErrCooldownActive) {
+		t.Fatalf("second Resolve err = %v; want ErrCooldownActive (puller still reports transient)", err)
+	}
+	if coord.intentCalls == firstCalls {
+		t.Fatalf("cap not enforced: requester remained suppressed past TransientCooldownCap")
 	}
 }
 
