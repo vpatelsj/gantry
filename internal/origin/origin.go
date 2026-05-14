@@ -278,11 +278,11 @@ func (r *registry) do(ctx context.Context, method, urlStr string) (*http.Respons
 		// No bearer challenge — return 401 verbatim so classify() reports auth.
 		return r.repeatWithoutToken(ctx, method, urlStr)
 	}
-	tok, err := r.fetchBearerToken(ctx, challenge)
+	tok, ttl, err := r.fetchBearerToken(ctx, challenge)
 	if err != nil {
 		return nil, err
 	}
-	r.setToken(tok)
+	r.setToken(tok, ttl)
 	req2, err := build(tok)
 	if err != nil {
 		return nil, err
@@ -305,11 +305,13 @@ func (r *registry) repeatWithoutToken(ctx context.Context, method, urlStr string
 }
 
 // fetchBearerToken parses a Bearer challenge and exchanges it for a token.
-func (r *registry) fetchBearerToken(ctx context.Context, challenge string) (string, error) {
+// Returns the token and the server-advertised TTL (or 0 if the response
+// omitted expires_in, in which case the caller picks a default).
+func (r *registry) fetchBearerToken(ctx context.Context, challenge string) (string, time.Duration, error) {
 	params := parseChallenge(challenge)
 	realm := params["realm"]
 	if realm == "" {
-		return "", fmt.Errorf("bearer challenge missing realm: %q", challenge)
+		return "", 0, fmt.Errorf("bearer challenge missing realm: %q", challenge)
 	}
 	scope := params["scope"]
 	q := url.Values{}
@@ -329,18 +331,18 @@ func (r *registry) fetchBearerToken(ctx context.Context, challenge string) (stri
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, tokenURL, nil)
 	if err != nil {
-		return "", err
+		return "", 0, err
 	}
 	if r.username != "" {
 		req.SetBasicAuth(r.username, r.password)
 	}
 	resp, err := r.hc.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("token request: %w", err)
+		return "", 0, fmt.Errorf("token request: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("token endpoint returned %s", resp.Status)
+		return "", 0, fmt.Errorf("token endpoint returned %s", resp.Status)
 	}
 	var body struct {
 		Token       string `json:"token"`
@@ -348,16 +350,20 @@ func (r *registry) fetchBearerToken(ctx context.Context, challenge string) (stri
 		ExpiresIn   int    `json:"expires_in"`
 	}
 	if err := decodeJSON(resp.Body, &body); err != nil {
-		return "", err
+		return "", 0, err
 	}
 	tok := body.Token
 	if tok == "" {
 		tok = body.AccessToken
 	}
 	if tok == "" {
-		return "", errors.New("token endpoint returned no token")
+		return "", 0, errors.New("token endpoint returned no token")
 	}
-	return tok, nil
+	var ttl time.Duration
+	if body.ExpiresIn > 0 {
+		ttl = time.Duration(body.ExpiresIn) * time.Second
+	}
+	return tok, ttl, nil
 }
 
 func (r *registry) cachedToken() string {
@@ -373,10 +379,29 @@ func (r *registry) cachedToken() string {
 	return r.token.value
 }
 
-func (r *registry) setToken(value string) {
+func (r *registry) setToken(value string, ttl time.Duration) {
 	r.tokMu.Lock()
 	defer r.tokMu.Unlock()
-	r.token = &cachedToken{value: value, expiresAt: time.Now().Add(5 * time.Minute)}
+	// Honor the server-advertised TTL (Docker token endpoints emit
+	// expires_in as seconds; OAuth2 §5.1). Apply a 30s safety margin
+	// so requests in flight don't get caught by a token expiring
+	// between cachedToken() and the registry receiving the bearer.
+	// Floor at 60s for tokens with absurdly small TTLs and fall back
+	// to the historical 5-minute default when the server omits
+	// expires_in entirely (DTR, Harbor in some configurations).
+	const (
+		safetyMargin = 30 * time.Second
+		minTTL       = 60 * time.Second
+		defaultTTL   = 5 * time.Minute
+	)
+	effective := ttl - safetyMargin
+	switch {
+	case ttl <= 0:
+		effective = defaultTTL
+	case effective < minTTL:
+		effective = minTTL
+	}
+	r.token = &cachedToken{value: value, expiresAt: time.Now().Add(effective)}
 }
 
 func (r *registry) clearToken() {

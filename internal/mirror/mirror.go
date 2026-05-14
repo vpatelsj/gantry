@@ -36,6 +36,7 @@ import (
 
 	"github.com/gantry/gantry/internal/config"
 	"github.com/gantry/gantry/internal/digest"
+	"github.com/gantry/gantry/internal/digestpipe"
 	"github.com/gantry/gantry/internal/ifaces"
 )
 
@@ -417,11 +418,22 @@ func (s *Server) serveDigest(w http.ResponseWriter, r *http.Request, upstream, r
 
 	cw, cwerr := s.cache.Writer(ctx, d)
 	var dest io.Writer = w
+	var directVerifier *digestpipe.Writer // non-nil only when caching is unavailable
 	if cwerr == nil {
 		defer func() { _ = cw.Abort(ctx) }() // no-op after Commit
 		dest = io.MultiWriter(w, cw)
 	} else {
 		logger.Warn("mirror: cache writer unavailable; serving without caching", slog.Any("err", cwerr))
+		// F7 says the cache layer is what enforces digest verification
+		// on origin pulls — and cache.Writer wraps the stream in a
+		// digestpipe internally before Commit. When that path is
+		// unavailable we still need to verify, otherwise an origin
+		// returning corrupted bytes (truncation, content-injection
+		// proxy, etc.) leaks straight to the client with no detection.
+		// We can't unsend the bytes, but logging a digest mismatch
+		// here is the only signal operators get that the origin lied.
+		directVerifier = digestpipe.New(w)
+		dest = directVerifier
 	}
 
 	writeBlobHeaders(w, d, psize, kind)
@@ -433,6 +445,15 @@ func (s *Server) serveDigest(w http.ResponseWriter, r *http.Request, upstream, r
 		// Bytes already sent; we can't undo. Cache will be aborted by defer.
 		logger.Debug("mirror: copy stalled", slog.Int64("written", written), slog.Any("err", err))
 		return
+	}
+	if directVerifier != nil {
+		if verr := directVerifier.Verify(d); verr != nil {
+			logger.Error("mirror: origin direct-stream digest mismatch — corrupted bytes were already served to client",
+				slog.String("digest", d.String()),
+				slog.Int64("written", written),
+				slog.Any("err", verr),
+			)
+		}
 	}
 	if cwerr == nil {
 		if err := cw.Commit(ctx); err != nil {
