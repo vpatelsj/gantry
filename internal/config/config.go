@@ -74,6 +74,12 @@ type Config struct {
 	// zone resolution.
 	NodeName string `yaml:"node_name"`
 
+	// PodName is the Kubernetes pod name of this agent. Sourced via the
+	// Downward API (env metadata.name) into GANTRY_POD_NAME. Used to
+	// self-patch pod annotations with the libp2p peer.ID and transfer
+	// addr so other agents can discover this peer (§7.2, §7.3).
+	PodName string `yaml:"pod_name"`
+
 	// MembersNamespace restricts the Pod informer to a single namespace.
 	// Empty means cluster-wide (typical for Gantry as a privileged DaemonSet).
 	MembersNamespace string `yaml:"members_namespace"`
@@ -217,6 +223,7 @@ func NewDefault() *Config {
 		Libp2pIdentityPath: "/var/lib/gantry/libp2p.key",
 
 		NodeName:             "",
+		PodName:              "",
 		MembersNamespace:     "",
 		MembersLabelSelector: "app.kubernetes.io/name=gantry",
 		MembersKubeconfig:    "",
@@ -312,6 +319,7 @@ func (c *Config) LoadEnv(env func(string) string) error {
 	setStr("LIBP2P_IDENTITY_PATH", &c.Libp2pIdentityPath)
 
 	setStr("NODE_NAME", &c.NodeName)
+	setStr("POD_NAME", &c.PodName)
 	setStr("MEMBERS_NAMESPACE", &c.MembersNamespace)
 	setStr("MEMBERS_LABEL_SELECTOR", &c.MembersLabelSelector)
 	setStr("MEMBERS_KUBECONFIG", &c.MembersKubeconfig)
@@ -354,6 +362,7 @@ func (c *Config) BindFlags(fs *flag.FlagSet) {
 	fs.StringVar(&c.Libp2pIdentityPath, "libp2p-identity-path", c.Libp2pIdentityPath, "path to the persisted libp2p identity key")
 
 	fs.StringVar(&c.NodeName, "node-name", c.NodeName, "Kubernetes node name this agent runs on (Downward API spec.nodeName)")
+	fs.StringVar(&c.PodName, "pod-name", c.PodName, "Kubernetes pod name of this agent (Downward API metadata.name)")
 	fs.StringVar(&c.MembersNamespace, "members-namespace", c.MembersNamespace, "namespace to scope the pod informer (empty = cluster-wide)")
 	fs.StringVar(&c.MembersLabelSelector, "members-label-selector", c.MembersLabelSelector, "label selector identifying Gantry DaemonSet pods")
 	fs.StringVar(&c.MembersKubeconfig, "members-kubeconfig", c.MembersKubeconfig, "optional path to a kubeconfig file (empty = in-cluster)")

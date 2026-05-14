@@ -16,15 +16,18 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"runtime"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
 
+	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/gantry/gantry/internal/cache"
@@ -216,6 +219,16 @@ func runAgent(args []string) error {
 	memberView, membersStop := buildMembers(ctx, c, disco, logger)
 	defer membersStop()
 
+	// Phase 3 (cont.) — self-announce: write libp2p peer.ID, listen
+	// multiaddrs, and the transfer endpoint into our own Pod's
+	// annotations so peer agents can discover this node without
+	// operator-supplied bootstrap_peers. Fire-and-forget so a missing
+	// `pods/patch` RBAC permission only degrades discovery, not the
+	// agent. Only attempted when the real informer is in use.
+	if mgr, ok := memberView.(*members.Manager); ok && c.PodName != "" {
+		go announceSelfAndBootstrap(ctx, mgr, disco, c, logger)
+	}
+
 	// Phase 5 — wire the routing-table target now that memberView is
 	// online. §7.7 defines target = min(informer_node_count,
 	// kademlia_max_routing_table_size); the constant cap of 256 is
@@ -258,6 +271,12 @@ func runAgent(args []string) error {
 
 	coordClient := coord.NewClient(disco.LibP2P(),
 		coord.WithClientLogger(logger),
+		// Resolve NodeID → peer.ID via the live membership snapshot:
+		// each peer publishes its libp2p peer.ID into a pod
+		// annotation (§7.3) which Members reads in Snapshot. This
+		// lets the cluster use stable K8s node names as NodeIDs
+		// while still dialing libp2p RPCs to the right peer.
+		coord.WithPeerIDResolver(membershipPeerIDResolver(memberView, logger)),
 	)
 	// pullerPump bridges inbound please_pull RPCs to the local origin
 	// puller (§5.2 step 7). The pump itself MUST NOT block the coord
@@ -838,6 +857,7 @@ func buildMembers(ctx context.Context, c *config.Config, disco *discovery.Host, 
 		LabelSelector: c.MembersLabelSelector,
 		ZoneLabelKey:  c.ZoneLabelKey,
 		Kubeconfig:    c.MembersKubeconfig,
+		TransferPort:  transferPortFromListen(c.TransferListen),
 	})
 	if err != nil {
 		logger.Warn("members.New failed; falling back to single-self stub", slog.Any("err", err))
@@ -928,6 +948,123 @@ func parseTrustedFailureClasses(raw []string, logger *slog.Logger) []ifaces.Fail
 		}
 	}
 	return out
+}
+
+// transferPortFromListen parses the port number out of a `host:port`
+// listen spec such as "0.0.0.0:5001" or ":5001". Returns 0 when the
+// spec is empty or malformed; members.Snapshot then falls back to a
+// bare pod-IP address.
+func transferPortFromListen(listen string) int {
+	if listen == "" {
+		return 0
+	}
+	_, port, err := net.SplitHostPort(listen)
+	if err != nil {
+		return 0
+	}
+	n, err := strconv.Atoi(port)
+	if err != nil {
+		return 0
+	}
+	return n
+}
+
+// membershipPeerIDResolver returns a coord.WithPeerIDResolver callback
+// that consults the live members snapshot. NodeID → Node.PeerID is the
+// fast path; on miss the resolver returns (_, false) so coord.Client
+// falls through to its static teach-cache and finally to
+// peer.Decode(NodeID). The membership view is read on every call (cheap
+// in-memory copy) so newly-joined peers are picked up without restart.
+func membershipPeerIDResolver(mv ifaces.Members, logger *slog.Logger) func(ifaces.NodeID) (peer.ID, bool) {
+	return func(id ifaces.NodeID) (peer.ID, bool) {
+		for _, n := range mv.Snapshot() {
+			if n.ID != id || n.PeerID == "" {
+				continue
+			}
+			pid, err := peer.Decode(n.PeerID)
+			if err != nil {
+				if logger != nil {
+					logger.Debug("membership peer-id decode failed",
+						slog.String("node_id", string(id)),
+						slog.String("peer_id", n.PeerID),
+						slog.Any("err", err),
+					)
+				}
+				return "", false
+			}
+			return pid, true
+		}
+		return "", false
+	}
+}
+
+// announceSelfAndBootstrap publishes this agent's libp2p identity into
+// its own Pod's annotations, then dials every peer announcement in the
+// initial membership snapshot to seed the kad-dht routing table. The
+// announcement is retried with exponential backoff on transient API
+// errors; bootstrap dials run once after the informer's initial sync
+// (kad-dht re-bootstraps periodically on its own thereafter).
+func announceSelfAndBootstrap(ctx context.Context, mgr *members.Manager, disco *discovery.Host, c *config.Config, logger *slog.Logger) {
+	// Build the announcement.
+	listenAddrs := disco.Addrs()
+	peerID := disco.PeerID()
+	multiaddrs := make([]string, 0, len(listenAddrs))
+	for _, la := range listenAddrs {
+		// Format /ip4/.../tcp/.../p2p/<peerID> so peers can dial
+		// directly without a separate ID resolution step.
+		multiaddrs = append(multiaddrs, la.String()+"/p2p/"+peerID.String())
+	}
+	ann := members.SelfAnnouncement{
+		PeerID:       peerID.String(),
+		P2PAddrs:     multiaddrs,
+		TransferAddr: c.TransferListen,
+	}
+
+	// Retry the patch with capped exponential backoff. The pod
+	// informer is independent of this call so a missing `pods/patch`
+	// permission only degrades discovery — the agent still serves.
+	backoff := 1 * time.Second
+	const maxBackoff = 30 * time.Second
+	for attempt := 0; attempt < 5; attempt++ {
+		err := mgr.AnnounceSelf(ctx, c.PodName, ann)
+		if err == nil {
+			logger.Info("members: self-announce ok",
+				slog.String("pod", c.PodName),
+				slog.String("peer_id", peerID.String()),
+				slog.Int("p2p_addrs", len(multiaddrs)),
+			)
+			break
+		}
+		logger.Warn("members: self-announce failed; will retry",
+			slog.Int("attempt", attempt+1),
+			slog.Any("err", err),
+		)
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(backoff):
+		}
+		backoff *= 2
+		if backoff > maxBackoff {
+			backoff = maxBackoff
+		}
+	}
+
+	// Seed libp2p bootstrap from the membership snapshot so DHT
+	// converges without operator-supplied bootstrap_peers config.
+	peerAddrs := make([]string, 0)
+	for _, n := range mgr.Snapshot() {
+		if n.ID == mgr.Self() || len(n.P2PAddrs) == 0 {
+			continue
+		}
+		peerAddrs = append(peerAddrs, n.P2PAddrs...)
+	}
+	if connected := disco.ConnectPeers(ctx, peerAddrs); connected > 0 {
+		logger.Info("members: bootstrap dial seeded from snapshot",
+			slog.Int("connected", connected),
+			slog.Int("candidates", len(peerAddrs)),
+		)
+	}
 }
 
 // coldStartAdapter bridges *coldstart.Resolver to mirror.ColdStartResolver

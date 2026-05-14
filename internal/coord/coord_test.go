@@ -374,6 +374,44 @@ func TestClient_ResolvePeerIDCache(t *testing.T) {
 	}
 }
 
+// TestClient_PeerIDResolverCallback verifies that
+// WithPeerIDResolver is consulted before ResolvePeerID's static cache
+// and before peer.Decode fallback — so a NodeID that is neither in the
+// cache nor a valid peer.ID string is still routable when the resolver
+// returns a hit.
+func TestClient_PeerIDResolverCallback(t *testing.T) {
+	hClient, hServer := makeHostPair(t)
+	c, err := cache.Open(t.TempDir(), 1<<30)
+	if err != nil {
+		t.Fatalf("cache.Open: %v", err)
+	}
+	members := fakes.NewMembers(ifaces.NodeID(hServer.ID().String()))
+	infl := inflight.New(inflight.DefaultStalls(), nil)
+	srv := coord.NewServer(c, members, infl)
+	srv.Bind(hServer)
+
+	var calls int32
+	cli := coord.NewClient(hClient,
+		coord.WithPeerIDResolver(func(id ifaces.NodeID) (peer.ID, bool) {
+			atomic.AddInt32(&calls, 1)
+			if id == "k8s-node-name" {
+				return hServer.ID(), true
+			}
+			return "", false
+		}),
+	)
+
+	d := digest.MustParse("sha256:" + rep('f', 64))
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := cli.PullIntentQuery(ctx, "k8s-node-name", d); err != nil {
+		t.Fatalf("resolver-routed call: %v", err)
+	}
+	if atomic.LoadInt32(&calls) == 0 {
+		t.Fatal("resolver fn was not consulted")
+	}
+}
+
 // silence "imported and not used" for peer in some build matrices.
 var _ peer.ID
 

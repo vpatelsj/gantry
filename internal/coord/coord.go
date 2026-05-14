@@ -395,6 +395,12 @@ type Client struct {
 	logger       *slog.Logger
 	resolveMu    sync.RWMutex
 	resolveCache map[ifaces.NodeID]peer.ID
+	// resolveFn is consulted before the static cache. It lets higher
+	// layers (members) supply a live NodeID → peer.ID mapping derived
+	// from pod-annotation announcements without polling. Returns
+	// (peer.ID, true) on hit; (_, false) lets the lookup fall through
+	// to resolveCache and finally peer.Decode(string(NodeID)).
+	resolveFn func(ifaces.NodeID) (peer.ID, bool)
 }
 
 // ClientOption configures a Client.
@@ -423,6 +429,20 @@ func WithClientLogger(l *slog.Logger) ClientOption {
 	return func(c *Client) {
 		if l != nil {
 			c.logger = l.With(slog.String("subsystem", "coord-client"))
+		}
+	}
+}
+
+// WithPeerIDResolver installs a function that maps a NodeID to a
+// libp2p peer.ID at dial time. The resolver is consulted before the
+// static teach-cache populated by ResolvePeerID; returning (_, false)
+// falls through to the cache and then to peer.Decode(NodeID). Used by
+// main.go to bridge K8s node names → libp2p peer.IDs published via
+// members' pod-annotation announcements (§7.3).
+func WithPeerIDResolver(fn func(ifaces.NodeID) (peer.ID, bool)) ClientOption {
+	return func(c *Client) {
+		if fn != nil {
+			c.resolveFn = fn
 		}
 	}
 }
@@ -517,6 +537,11 @@ func (c *Client) ResolvePeerID(id ifaces.NodeID, pid peer.ID) {
 }
 
 func (c *Client) lookupPeerID(id ifaces.NodeID) (peer.ID, error) {
+	if c.resolveFn != nil {
+		if pid, ok := c.resolveFn(id); ok {
+			return pid, nil
+		}
+	}
 	c.resolveMu.RLock()
 	if pid, ok := c.resolveCache[id]; ok {
 		c.resolveMu.RUnlock()

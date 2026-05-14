@@ -214,6 +214,42 @@ func (h *Host) Addrs() []multiaddr.Multiaddr { return h.h.Addrs() }
 // coord-stream wiring.
 func (h *Host) LibP2P() host.Host { return h.h }
 
+// ConnectPeers dials a set of multiaddr strings in parallel with a 5s
+// per-peer timeout. Used by main.go to seed the DHT routing table from
+// the membership view (§7.2): after members.WaitForSync, every Ready
+// peer with a published p2p multiaddr is fed back into the libp2p host
+// so kad-dht has direct-connect seeds even without operator-supplied
+// bootstrap_peers config.
+//
+// Returns the number of peers that successfully connected. Failures are
+// logged at DEBUG and do not fail the call.
+func (h *Host) ConnectPeers(ctx context.Context, multiaddrs []string) int {
+	if len(multiaddrs) == 0 {
+		return 0
+	}
+	pool := make([]peer.AddrInfo, 0, len(multiaddrs))
+	for _, p := range multiaddrs {
+		ai, err := peer.AddrInfoFromString(p)
+		if err != nil {
+			h.logger.Debug("ConnectPeers: parse failed",
+				slog.String("multiaddr", p),
+				slog.Any("err", err),
+			)
+			continue
+		}
+		// Filter out self — connecting to our own host is a no-op
+		// at best and a confused-state log at worst.
+		if ai.ID == h.h.ID() {
+			continue
+		}
+		pool = append(pool, *ai)
+	}
+	if len(pool) == 0 {
+		return 0
+	}
+	return h.dialBatch(ctx, pool)
+}
+
 // RoutingTableSize returns the current kad-dht routing-table size.
 // Used by readiness probes (§Phase 6) and the §7.7 health score.
 func (h *Host) RoutingTableSize() int { return h.d.RoutingTable().Size() }

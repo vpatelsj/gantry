@@ -30,6 +30,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -74,6 +75,13 @@ type Options struct {
 	// ResyncPeriod is the informer resync interval. Zero means "no resync"
 	// (rely on watch events). Default 30s when zero.
 	ResyncPeriod time.Duration
+
+	// TransferPort is the TCP port each agent's transfer endpoint
+	// listens on (§7.2). When non-zero, Snapshot fills Node.Addr as
+	// "podIP:TransferPort"; when zero, Snapshot returns the bare pod
+	// IP (back-compat). Production deployments MUST set this so
+	// peer-fetch URLs are reachable.
+	TransferPort int
 }
 
 // Manager owns the Pod+Node informers and exposes ifaces.Members.
@@ -81,6 +89,9 @@ type Manager struct {
 	self         ifaces.NodeID
 	zoneLabelKey string
 	selector     labels.Selector
+	transferPort int
+	clientset    kubernetes.Interface
+	namespace    string
 
 	podFactory  informers.SharedInformerFactory
 	nodeFactory informers.SharedInformerFactory
@@ -141,6 +152,9 @@ func New(opts Options) (*Manager, error) {
 		self:         ifaces.NodeID(opts.NodeName),
 		zoneLabelKey: zoneKey,
 		selector:     sel,
+		transferPort: opts.TransferPort,
+		clientset:    cs,
+		namespace:    opts.Namespace,
 		podFactory:   podFactory,
 		nodeFactory:  nodeFactory,
 		podInf:       podFactory.Core().V1().Pods().Informer(),
@@ -177,9 +191,25 @@ func (m *Manager) WaitForSync(ctx context.Context) error {
 	return nil
 }
 
+// Annotation keys agents publish on their own pod so peers can discover
+// libp2p identity and the transfer endpoint without operator-supplied
+// bootstrap config.
+const (
+	AnnotationPeerID       = "gantry.io/peer-id"
+	AnnotationP2PAddrs     = "gantry.io/p2p-addrs"     // comma-separated multiaddrs
+	AnnotationTransferAddr = "gantry.io/transfer-addr" // host:port
+)
+
 // Snapshot returns the current peer view: one Node per Ready pod matching
 // the selector, joined on spec.nodeName for zone labels. The returned slice
 // is sorted by NodeID for deterministic HRW input.
+//
+// PeerID, P2PAddrs and a transfer-addr override are read from pod
+// annotations (gantry.io/peer-id, gantry.io/p2p-addrs,
+// gantry.io/transfer-addr) populated by each agent's AnnounceSelf call
+// at startup. Pods that have not yet published these annotations still
+// appear in the snapshot — Addr falls back to podIP[:TransferPort],
+// PeerID/P2PAddrs are empty until the announcement arrives.
 func (m *Manager) Snapshot() []ifaces.Node {
 	out := []ifaces.Node{}
 	for _, obj := range m.podInf.GetStore().List() {
@@ -193,9 +223,20 @@ func (m *Manager) Snapshot() []ifaces.Node {
 		if p.Spec.NodeName == "" || p.Status.PodIP == "" {
 			continue
 		}
+		addr := p.Status.PodIP
+		if m.transferPort > 0 {
+			addr = fmt.Sprintf("%s:%d", p.Status.PodIP, m.transferPort)
+		}
+		// Annotation override wins so operators can publish a
+		// non-default transfer endpoint (NodePort, separate listener).
+		if a := p.Annotations[AnnotationTransferAddr]; a != "" {
+			addr = a
+		}
 		node := ifaces.Node{
-			ID:   ifaces.NodeID(p.Spec.NodeName),
-			Addr: p.Status.PodIP,
+			ID:       ifaces.NodeID(p.Spec.NodeName),
+			Addr:     addr,
+			PeerID:   p.Annotations[AnnotationPeerID],
+			P2PAddrs: splitAnnotation(p.Annotations[AnnotationP2PAddrs]),
 		}
 		if obj, exists, err := m.nodeInf.GetStore().GetByKey(p.Spec.NodeName); err == nil && exists {
 			if n, ok := obj.(*corev1.Node); ok {
@@ -205,6 +246,28 @@ func (m *Manager) Snapshot() []ifaces.Node {
 		out = append(out, node)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out
+}
+
+// splitAnnotation parses a comma-separated annotation value, trimming
+// whitespace around each entry and dropping empty fields. Returns nil
+// when no entries remain so callers can range over the result without
+// special-casing the empty-annotation path.
+func splitAnnotation(v string) []string {
+	if v == "" {
+		return nil
+	}
+	parts := strings.Split(v, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
 	return out
 }
 

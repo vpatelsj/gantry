@@ -71,14 +71,28 @@ type NodeID string
 type Node struct {
 	ID NodeID
 
-	// Addr is the network address to reach this node's peer-facing services:
-	// the libp2p host for coordination RPCs and the :5001 HTTP/2 transfer
-	// endpoint. Empty if the node has not yet announced an address.
+	// Addr is the network address to reach this node's transfer
+	// endpoint (HTTP/2 on the configured transfer port). When the
+	// transfer port is known (production deploy), Addr is "ip:port";
+	// for back-compat with older snapshots it may be a bare IP and
+	// callers must append the port.
 	Addr string
 
 	// Zone is the optional topology label `topology.kubernetes.io/zone`.
 	// Empty when not topology-aware (§4.3).
 	Zone string
+
+	// PeerID is the libp2p peer.ID (CID-encoded string form) the node
+	// publishes via its pod annotation. Empty until the peer announces.
+	// coord.Client uses this to dial via libp2p without requiring that
+	// NodeID itself be a peer.ID string.
+	PeerID string
+
+	// P2PAddrs lists the node's libp2p listen multiaddrs published via
+	// pod annotation. Empty until the peer announces. main.go reads
+	// this on startup to seed disco.Connect for DHT bootstrap (§7.2)
+	// without needing operator-supplied bootstrap_peers.
+	P2PAddrs []string
 }
 
 // Members is the live cluster-membership view.

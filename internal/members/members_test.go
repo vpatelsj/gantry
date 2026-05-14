@@ -229,3 +229,145 @@ func TestWaitForSync_RespectsCtx(t *testing.T) {
 		t.Fatal("expected wait error from ctx deadline / sync failure")
 	}
 }
+
+func TestSnapshot_TransferPortComposesAddr(t *testing.T) {
+	cs := fake.NewSimpleClientset(
+		newPod("p", "ns", "node-x", "10.0.0.7", true, map[string]string{"app": "gantry"}),
+		newNode("node-x", "us-east-1a"),
+	)
+	m, err := New(Options{
+		NodeName:      "node-x",
+		LabelSelector: "app=gantry",
+		TransferPort:  5001,
+		Clientset:     cs,
+		ResyncPeriod:  10 * time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(m.Stop)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := m.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	got := m.Snapshot()
+	if len(got) != 1 || got[0].Addr != "10.0.0.7:5001" {
+		t.Errorf("Addr = %q, want 10.0.0.7:5001", got[0].Addr)
+	}
+}
+
+func TestSnapshot_AnnotationsPopulateFields(t *testing.T) {
+	p := newPod("p", "ns", "node-x", "10.0.0.7", true, map[string]string{"app": "gantry"})
+	p.Annotations = map[string]string{
+		AnnotationPeerID:       "12D3KooWAbc",
+		AnnotationP2PAddrs:     "/ip4/10.0.0.7/tcp/4001/p2p/12D3KooWAbc, /ip4/1.2.3.4/tcp/4001/p2p/12D3KooWAbc",
+		AnnotationTransferAddr: "1.2.3.4:5099",
+	}
+	cs := fake.NewSimpleClientset(p, newNode("node-x", "us-east-1a"))
+	m, err := New(Options{
+		NodeName:      "node-x",
+		LabelSelector: "app=gantry",
+		TransferPort:  5001, // overridden by annotation
+		Clientset:     cs,
+		ResyncPeriod:  10 * time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(m.Stop)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := m.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	got := m.Snapshot()
+	if len(got) != 1 {
+		t.Fatalf("Snapshot = %+v, want 1", got)
+	}
+	n := got[0]
+	if n.PeerID != "12D3KooWAbc" {
+		t.Errorf("PeerID = %q, want 12D3KooWAbc", n.PeerID)
+	}
+	if len(n.P2PAddrs) != 2 ||
+		n.P2PAddrs[0] != "/ip4/10.0.0.7/tcp/4001/p2p/12D3KooWAbc" ||
+		n.P2PAddrs[1] != "/ip4/1.2.3.4/tcp/4001/p2p/12D3KooWAbc" {
+		t.Errorf("P2PAddrs = %v, want two trimmed entries", n.P2PAddrs)
+	}
+	if n.Addr != "1.2.3.4:5099" {
+		t.Errorf("Addr = %q, want annotation override 1.2.3.4:5099", n.Addr)
+	}
+}
+
+func TestAnnounceSelf_PatchesPod(t *testing.T) {
+	p := newPod("self", "ns", "node-x", "10.0.0.7", true, map[string]string{"app": "gantry"})
+	cs := fake.NewSimpleClientset(p, newNode("node-x", "us-east-1a"))
+	m, err := New(Options{
+		NodeName:      "node-x",
+		Namespace:     "ns",
+		LabelSelector: "app=gantry",
+		Clientset:     cs,
+		ResyncPeriod:  10 * time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(m.Stop)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	err = m.AnnounceSelf(ctx, "self", SelfAnnouncement{
+		PeerID:       "12D3KooWAbc",
+		P2PAddrs:     []string{"/ip4/10.0.0.7/tcp/4001/p2p/12D3KooWAbc"},
+		TransferAddr: "10.0.0.7:5001",
+	})
+	if err != nil {
+		t.Fatalf("AnnounceSelf: %v", err)
+	}
+	got, err := cs.CoreV1().Pods("ns").Get(ctx, "self", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("Get pod: %v", err)
+	}
+	if got.Annotations[AnnotationPeerID] != "12D3KooWAbc" {
+		t.Errorf("PeerID annotation = %q", got.Annotations[AnnotationPeerID])
+	}
+	if got.Annotations[AnnotationP2PAddrs] != "/ip4/10.0.0.7/tcp/4001/p2p/12D3KooWAbc" {
+		t.Errorf("P2PAddrs annotation = %q", got.Annotations[AnnotationP2PAddrs])
+	}
+	if got.Annotations[AnnotationTransferAddr] != "10.0.0.7:5001" {
+		t.Errorf("TransferAddr annotation = %q", got.Annotations[AnnotationTransferAddr])
+	}
+}
+
+func TestAnnounceSelf_RequiresPodName(t *testing.T) {
+	cs := fake.NewSimpleClientset(newNode("n", ""))
+	m, err := New(Options{
+		NodeName:      "n",
+		Namespace:     "ns",
+		LabelSelector: "app=gantry",
+		Clientset:     cs,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(m.Stop)
+	if err := m.AnnounceSelf(context.Background(), "", SelfAnnouncement{}); err == nil {
+		t.Fatal("expected error when PodName empty")
+	}
+}
+
+func TestAnnounceSelf_RequiresNamespace(t *testing.T) {
+	cs := fake.NewSimpleClientset(newNode("n", ""))
+	m, err := New(Options{
+		NodeName:      "n",
+		LabelSelector: "app=gantry",
+		Clientset:     cs,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(m.Stop)
+	if err := m.AnnounceSelf(context.Background(), "self", SelfAnnouncement{}); err == nil {
+		t.Fatal("expected error when Namespace empty (cluster-wide informer)")
+	}
+}
