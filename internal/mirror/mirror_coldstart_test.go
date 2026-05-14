@@ -338,6 +338,92 @@ func buildColdStartMirrorExposingDHT(t *testing.T, originBlobs map[digest.Digest
 	return srv, dht, &originHits, &peerFetches
 }
 
+// TestMirror_DHTLookupError_ConsultsColdStart guards the residual half
+// of finding 7 from the May-2026 review: when FindProviders returns an
+// *error* (timeout / network glitch — distinct from "returned no
+// providers"), the mirror must still consult cold-start instead of
+// short-circuiting straight to a direct origin pull. Cold-start has
+// independent provider sources (HRW membership + in-flight dedup +
+// local cache) that don't depend on the DHT, so it can still produce a
+// useful answer; falling straight to origin would bypass NF5
+// rate-limiting and stampede the registry during a DHT outage.
+func TestMirror_DHTLookupError_ConsultsColdStart(t *testing.T) {
+	body := []byte("served via cold-start after DHT error")
+	d := digestOf(body)
+
+	peerCache := fakes.NewCache()
+	peerCache.Put(d, body)
+	peerAddr := startPeerTransfer(t, peerCache)
+
+	cs := &stubColdStart{
+		providers: []ifaces.Provider{{NodeID: "cs-peer", Addr: peerAddr}},
+	}
+
+	srv, dht, originHits, peerFetches := buildColdStartMirrorExposingDHT(t,
+		map[digest.Digest][]byte{d: body}, nil, cs)
+
+	// Program the DHT to error on FindProviders (simulates a timeout
+	// or transport hiccup, not an empty result set).
+	dht.SetFindProvidersError(errors.New("dht: bootstrap incomplete"))
+
+	resp, err := http.Get(srv.URL + "/v2/r/blobs/" + d.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != 200 {
+		got, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, body = %q; want 200 (cold-start should have surfaced peer despite DHT error)", resp.StatusCode, got)
+	}
+	if atomic.LoadInt32(originHits) != 0 {
+		t.Errorf("origin hits = %d, want 0 (cold-start returned a peer, no origin pull expected)", *originHits)
+	}
+	if atomic.LoadInt32(peerFetches) != 1 {
+		t.Errorf("peer hits = %d, want 1", *peerFetches)
+	}
+	if atomic.LoadInt32(&cs.calls) != 1 {
+		t.Errorf("cold-start invocations = %d, want 1 (DHT error must route through cold-start)", cs.calls)
+	}
+}
+
+// TestMirror_DHTLookupError_ColdStartExhausted_ReturnsExhausted guards
+// the NF5-eligibility half of the same fix: when cold-start returns
+// ErrColdStartExhausted after a DHT error, the mirror must surface the
+// ColdExhausted result so NF5 can gate a direct-origin pull instead of
+// short-circuiting to an ungated origin fetch.
+func TestMirror_DHTLookupError_ColdStartExhausted_NF5Eligible(t *testing.T) {
+	body := []byte("would be served via NF5")
+	d := digestOf(body)
+
+	// Cold-start returns the exhaustion sentinel so the path is
+	// NF5-eligible; the mirror responds 503 here because no NF5 is
+	// wired in this fixture (matching how stubColdStart sentinel-err
+	// tests already work above).
+	cs := &stubColdStart{err: mirror.ErrColdStartExhausted}
+
+	srv, dht, originHits, peerFetches := buildColdStartMirrorExposingDHT(t,
+		map[digest.Digest][]byte{d: body}, nil, cs)
+	dht.SetFindProvidersError(errors.New("dht: lookup timeout"))
+
+	resp, err := http.Get(srv.URL + "/v2/r/blobs/" + d.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 (cold-start exhausted, NF5 unwired)", resp.StatusCode)
+	}
+	if atomic.LoadInt32(originHits) != 0 {
+		t.Errorf("origin hits = %d, want 0 (NF5 unwired, must NOT bypass to origin)", *originHits)
+	}
+	if atomic.LoadInt32(peerFetches) != 0 {
+		t.Errorf("peer hits = %d, want 0", *peerFetches)
+	}
+	if atomic.LoadInt32(&cs.calls) != 1 {
+		t.Errorf("cold-start invocations = %d, want 1", cs.calls)
+	}
+}
+
 // minimal lastIndex helper (avoids importing strings just for this).
 func stringsLastIndex(s, sub string) int {
 	for i := len(s) - len(sub); i >= 0; i-- {

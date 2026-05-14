@@ -223,6 +223,7 @@ type DHT struct {
 	providers   map[string][]ifaces.Provider
 	health      float64
 	provideCall map[string]int
+	findErr     error
 }
 
 func NewDHT() *DHT {
@@ -237,6 +238,15 @@ func (d *DHT) SetHealth(score float64) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.health = score
+}
+
+// SetFindProvidersError programs the next (and all subsequent)
+// FindProviders calls to return err. Pass nil to clear. Useful for
+// regression tests that exercise the DHT-error fallback path.
+func (d *DHT) SetFindProvidersError(err error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.findErr = err
 }
 
 func (d *DHT) Health() float64 {
@@ -270,6 +280,9 @@ func (d *DHT) Inject(dg digest.Digest, providers ...ifaces.Provider) {
 func (d *DHT) FindProviders(_ context.Context, dg digest.Digest) ([]ifaces.Provider, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	if d.findErr != nil {
+		return nil, d.findErr
+	}
 	src := d.providers[dg.String()]
 	out := make([]ifaces.Provider, len(src))
 	copy(out, src)

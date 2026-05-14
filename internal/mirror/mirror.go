@@ -551,45 +551,47 @@ func (s *Server) tryPeerFallback(ctx context.Context, w http.ResponseWriter, r *
 	lookupDur := time.Since(lookupStart)
 	lookupCtxErr := lookupCtx.Err()
 	cancel()
-	if err != nil {
+	switch {
+	case err != nil:
 		outcome := "error"
 		if errors.Is(lookupCtxErr, context.DeadlineExceeded) {
 			outcome = "timeout"
 		}
 		s.bumpDhtLookup(outcome, lookupDur)
 		logger.Debug("mirror: FindProviders error", slog.Any("err", err))
-		return peerFallbackUnused
-	}
-	if len(providers) == 0 {
+	case len(providers) == 0:
 		s.bumpDhtLookup("miss", lookupDur)
-		// Phase 3: consult the cold-start orchestrator. If it produces
-		// providers (rules 2/3/7), feed them into the peer-fetch loop;
-		// if it returns a sentinel error (rules 1/4 or expansion
-		// exhaustion), return Exhausted so the mirror responds 5xx.
-		// If the orchestrator is unwired, fall through to origin (Phase
-		// 1 behavior).
-		if s.coldStart != nil {
-			res, csErr := s.coldStart.Resolve(ctx, d, kind, upstream, repo, 0)
-			if csErr != nil {
-				logger.Debug("mirror: cold-start exhausted",
-					slog.Any("err", csErr),
-				)
-				// Only ErrColdStartExhausted (rule-7 cascade truly
-				// exhausted) makes the request eligible for NF5
-				// direct-origin fallback. Failure short-circuit and
-				// transient cooldown intentionally short-circuit to
-				// 5xx without an origin escape valve.
-				if errors.Is(csErr, ErrColdStartExhausted) {
-					return peerFallbackColdExhausted
-				}
-				return peerFallbackExhausted
-			}
-			providers = res.Providers
-		} else {
+	default:
+		s.bumpDhtLookup("hit", lookupDur)
+	}
+	// §7.7 rule-7: when DHT yields no usable provider list — either it
+	// errored (timeout / network glitch) or returned an empty set —
+	// consult cold-start so the request still flows through NF5
+	// rate-limiting rather than stampeding the origin. Cold-start has
+	// independent provider sources (HRW + membership informer,
+	// in-flight dedup, local cache) that don't depend on DHT, so it can
+	// still produce a useful answer even when the DHT layer is down.
+	if err != nil || len(providers) == 0 {
+		if s.coldStart == nil {
 			return peerFallbackUnused
 		}
-	} else {
-		s.bumpDhtLookup("hit", lookupDur)
+		res, csErr := s.coldStart.Resolve(ctx, d, kind, upstream, repo, 0)
+		if csErr != nil {
+			logger.Debug("mirror: cold-start exhausted",
+				slog.Bool("after_dht_error", err != nil),
+				slog.Any("err", csErr),
+			)
+			// Only ErrColdStartExhausted (rule-7 cascade truly
+			// exhausted) makes the request eligible for NF5
+			// direct-origin fallback. Failure short-circuit and
+			// transient cooldown intentionally short-circuit to
+			// 5xx without an origin escape valve.
+			if errors.Is(csErr, ErrColdStartExhausted) {
+				return peerFallbackColdExhausted
+			}
+			return peerFallbackExhausted
+		}
+		providers = res.Providers
 	}
 
 	tried := 0
