@@ -143,7 +143,7 @@ func WithPeerBudgets(lookup, fetch time.Duration, maxAttempts int) Option {
 // needs. Kept narrow for testability — production wires the concrete
 // resolver via WithColdStart.
 type ColdStartResolver interface {
-	Resolve(ctx context.Context, d digest.Digest, kind ifaces.OriginRefKind, expectedSize int64) (*ColdStartResolution, error)
+	Resolve(ctx context.Context, d digest.Digest, kind ifaces.OriginRefKind, registry, repository string, expectedSize int64) (*ColdStartResolution, error)
 }
 
 // ColdStartResolution mirrors *coldstart.Resolution at this boundary
@@ -413,7 +413,7 @@ func (s *Server) tryPeerFallback(ctx context.Context, w http.ResponseWriter, r *
 		// If the orchestrator is unwired, fall through to origin (Phase
 		// 1 behavior).
 		if s.coldStart != nil {
-			res, csErr := s.coldStart.Resolve(ctx, d, kind, 0)
+			res, csErr := s.coldStart.Resolve(ctx, d, kind, upstream, repo, 0)
 			if csErr != nil {
 				logger.Debug("mirror: cold-start exhausted",
 					slog.Any("err", csErr),

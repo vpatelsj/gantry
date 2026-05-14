@@ -14,6 +14,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -201,6 +202,11 @@ func runAgent(args []string) error {
 	coordClient := coord.NewClient(disco.LibP2P(),
 		coord.WithClientLogger(logger),
 	)
+	// pullerPump bridges inbound please_pull RPCs to the local origin
+	// puller (§5.2 step 7). The pump itself MUST NOT block the coord
+	// stream handler; the actual origin fetch + cache write + dht
+	// Provide all happen in a detached goroutine.
+	pullerPump := newPullerPump(inflightMap, originClient, cstore, disco, logger)
 	coordServer := coord.NewServer(cstore, memberView, inflightMap,
 		coord.WithLogger(logger),
 		coord.WithMetrics(coord.MetricsHooks{
@@ -209,6 +215,7 @@ func runAgent(args []string) error {
 			OnPleasePullStarted: func() { p3.coordPleasePullStarted.Inc() },
 			OnStreamError:       func() { p3.coordStreamError.Inc() },
 		}),
+		coord.WithPullerPump(pullerPump),
 	)
 	coordServer.Bind(disco.LibP2P())
 
@@ -660,10 +667,112 @@ func lookupSelfZone(m ifaces.Members) string {
 // without forcing the mirror package to import internal/coldstart.
 type coldStartAdapter struct{ r *coldstart.Resolver }
 
-func (a coldStartAdapter) Resolve(ctx context.Context, d digest.Digest, kind ifaces.OriginRefKind, expectedSize int64) (*mirror.ColdStartResolution, error) {
-	res, err := a.r.Resolve(ctx, d, kind, expectedSize)
+func (a coldStartAdapter) Resolve(ctx context.Context, d digest.Digest, kind ifaces.OriginRefKind, registry, repository string, expectedSize int64) (*mirror.ColdStartResolution, error) {
+	res, err := a.r.Resolve(ctx, d, kind, registry, repository, expectedSize)
 	if err != nil {
 		return nil, err
 	}
 	return &mirror.ColdStartResolution{Providers: res.Providers, Outcome: res.Outcome}, nil
+}
+
+// newPullerPump returns the coord.PullerPump that backs inbound
+// please_pull RPCs. Per §5.2 step 7, the pump's job is to dedupe via
+// the in-flight map, kick off the origin pull on a background
+// goroutine, and return promptly so the coord stream handler can
+// reply with OUTCOME_STARTED or OUTCOME_ALREADY_PULLING.
+//
+// On success, the pulled bytes land in the local cache (digest-
+// verifying writer) and are then advertised via dht.Provide so peer
+// requesters can discover them through the warm path. Failures during
+// the background fetch are logged; Phase 4 will plumb them into the
+// negative cache (§5.8).
+func newPullerPump(infl *inflight.Map, originClient ifaces.OriginPuller, cstore ifaces.Cache, disco *discovery.Host, logger *slog.Logger) coord.PullerPump {
+	lg := logger.With(slog.String("subsystem", "puller-pump"))
+	return func(_ context.Context, registry, repository string, d digest.Digest, kind ifaces.OriginRefKind) (time.Time, bool, *coord.NegativeEntry) {
+		// Dedupe at this node: if a pull is already running, the
+		// stream handler must report ALREADY_PULLING with the existing
+		// start time so the requester can run the §5.6 stall check.
+		h, existing, already := infl.Start(d, kind, 0)
+		if already {
+			return existing.StartedAt, true, nil
+		}
+		// Detach the actual fetch from the stream handler. The pump
+		// returns immediately; the goroutine owns the inflight handle.
+		startedAt := existing.StartedAt
+		go runOriginPull(originClient, cstore, disco, lg, h, registry, repository, d, kind)
+		return startedAt, false, nil
+	}
+}
+
+// runOriginPull executes an origin pull → cache write → dht.Provide
+// pipeline for d. Caller owns the inflight handle and must arrange for
+// Done() to be called exactly once; we do that here on every exit path.
+func runOriginPull(originClient ifaces.OriginPuller, cstore ifaces.Cache, disco *discovery.Host, lg *slog.Logger, h *inflight.Handle, registry, repository string, d digest.Digest, kind ifaces.OriginRefKind) {
+	defer h.Done()
+
+	// Background context: the requesting peer's stream is already
+	// closed by the time we get here. We bound the pull by a generous
+	// ceiling so a hung origin can't leak the in-flight slot forever.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	ref := ifaces.OriginRef{
+		Registry:   registry,
+		Repository: repository,
+		Digest:     d,
+		Kind:       kind,
+	}
+	rc, _, err := originClient.Pull(ctx, ref)
+	if err != nil {
+		lg.Warn("origin pull failed",
+			slog.String("digest", d.String()),
+			slog.String("registry", registry),
+			slog.String("repository", repository),
+			slog.Any("err", err),
+		)
+		return
+	}
+	defer func() { _ = rc.Close() }()
+
+	w, err := cstore.Writer(ctx, d)
+	if err != nil {
+		lg.Warn("cache writer open failed",
+			slog.String("digest", d.String()),
+			slog.Any("err", err),
+		)
+		return
+	}
+	defer func() { _ = w.Abort(ctx) }()
+
+	if _, err := io.Copy(w, rc); err != nil {
+		lg.Warn("origin pull copy failed",
+			slog.String("digest", d.String()),
+			slog.Any("err", err),
+		)
+		return
+	}
+	if err := w.Commit(ctx); err != nil {
+		lg.Warn("cache commit failed (digest mismatch or io error)",
+			slog.String("digest", d.String()),
+			slog.Any("err", err),
+		)
+		return
+	}
+
+	// Advertise the new digest so peer requesters can discover us
+	// through the warm path.
+	provCtx, provCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer provCancel()
+	if err := disco.Provide(provCtx, d); err != nil {
+		lg.Debug("dht.Provide failed",
+			slog.String("digest", d.String()),
+			slog.Any("err", err),
+		)
+		return
+	}
+	lg.Info("please_pull served",
+		slog.String("digest", d.String()),
+		slog.String("registry", registry),
+		slog.String("repository", repository),
+	)
 }

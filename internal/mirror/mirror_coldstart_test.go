@@ -29,7 +29,7 @@ type stubColdStart struct {
 	calls     int32
 }
 
-func (s *stubColdStart) Resolve(_ context.Context, _ digest.Digest, _ ifaces.OriginRefKind, _ int64) (*mirror.ColdStartResolution, error) {
+func (s *stubColdStart) Resolve(_ context.Context, _ digest.Digest, _ ifaces.OriginRefKind, _, _ string, _ int64) (*mirror.ColdStartResolution, error) {
 	atomic.AddInt32(&s.calls, 1)
 	if s.err != nil {
 		return nil, s.err

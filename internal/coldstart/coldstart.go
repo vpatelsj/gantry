@@ -152,7 +152,12 @@ type Resolution struct {
 // error. expectedSize is 0 if unknown (e.g., manifest digest before
 // parsing); it is used to compute the per-§5.2a stall threshold for
 // rule 3 (in_flight) and the DHT-polling deadline overall.
-func (r *Resolver) Resolve(ctx context.Context, d digest.Digest, kind ifaces.OriginRefKind, expectedSize int64) (*Resolution, error) {
+//
+// registry+repository identify the upstream and OCI repo for the
+// please_pull RPC (§4.4 single-repo-per-batch invariant). Both must be
+// non-empty for rule 7 to fire; the orchestrator otherwise falls
+// through to ErrExhausted.
+func (r *Resolver) Resolve(ctx context.Context, d digest.Digest, kind ifaces.OriginRefKind, registry, repository string, expectedSize int64) (*Resolution, error) {
 	start := r.opts.Now()
 	kindLabel := kindLabel(kind)
 	defer func() {
@@ -172,7 +177,7 @@ func (r *Resolver) Resolve(ctx context.Context, d digest.Digest, kind ifaces.Ori
 	}
 
 	// Pass 1: top-K.
-	res, outcome, err := r.probe(ctx, d, kind, expectedSize, candidates, r.opts.HrwK, "")
+	res, outcome, err := r.probe(ctx, d, kind, registry, repository, expectedSize, candidates, r.opts.HrwK, "")
 	if err == nil {
 		r.bumpDuration(kindLabel, outcome, start)
 		return res, nil
@@ -193,7 +198,7 @@ func (r *Resolver) Resolve(ctx context.Context, d digest.Digest, kind ifaces.Ori
 		expandReason = "rule6_degraded_expand"
 	}
 	if expand {
-		res, outcome, err = r.probe(ctx, d, kind, expectedSize, candidates, r.opts.HrwK*2, expandReason)
+		res, outcome, err = r.probe(ctx, d, kind, registry, repository, expectedSize, candidates, r.opts.HrwK*2, expandReason)
 		if err == nil {
 			r.bumpDuration(kindLabel, outcome, start)
 			return res, nil
@@ -235,7 +240,7 @@ func mapTerminalErr(err error) (string, error) {
 //
 // Returns (Resolution, outcomeLabel, nil) on success; or
 // (nil, "", err) where err is one of the internal/public sentinels.
-func (r *Resolver) probe(ctx context.Context, d digest.Digest, kind ifaces.OriginRefKind, expectedSize int64, candidates []ifaces.Node, k int, expandLabel string) (*Resolution, string, error) {
+func (r *Resolver) probe(ctx context.Context, d digest.Digest, kind ifaces.OriginRefKind, registry, repository string, expectedSize int64, candidates []ifaces.Node, k int, expandLabel string) (*Resolution, string, error) {
 	top := hrw.TopK(candidates, d, k)
 	if len(top) == 0 {
 		return nil, "", errNoReachable
@@ -322,7 +327,7 @@ func (r *Resolver) probe(ctx context.Context, d digest.Digest, kind ifaces.Origi
 	}
 
 	// Cold-start: please_pull, then DHT-poll for completion.
-	if err := r.sendPleasePull(ctx, *puller, d); err != nil {
+	if err := r.sendPleasePull(ctx, *puller, d, registry, repository); err != nil {
 		return nil, prefix(expandLabel, "rule7_please_pull_failed"), ErrExhausted
 	}
 	providers, err := r.pollDHT(ctx, d, kind, expectedSize)
@@ -488,23 +493,20 @@ func (r *Resolver) providersFor(v *response, top []hrw.Scored) *Resolution {
 	return &Resolution{Providers: out, Outcome: "rule2_cache_hit"}
 }
 
-func (r *Resolver) sendPleasePull(ctx context.Context, puller response, d digest.Digest) error {
+func (r *Resolver) sendPleasePull(ctx context.Context, puller response, d digest.Digest, registry, repository string) error {
+	// §4.4 invariant: please_pull is a single repo per batch. If the
+	// caller didn't supply registry+repository, refuse to send a
+	// malformed RPC (the server would reject it) and surface a
+	// terminal error so the cascade reports rule7_please_pull_failed
+	// instead of silently succeeding.
+	if registry == "" || repository == "" {
+		return fmt.Errorf("coldstart: please_pull requires non-empty registry+repository (got %q/%q)", registry, repository)
+	}
 	// Single-digest call; batching is the orchestrator-caller's job
 	// (the mirror at the layer-fanout level groups by puller).
 	ctx, cancel := context.WithTimeout(ctx, r.opts.QueryTimeout)
 	defer cancel()
-	// §4.4 invariant: please_pull is a single repo per batch. Phase 3
-	// callers don't yet carry the registry/repository through this
-	// path; the orchestrator forwards empty strings and the puller
-	// rejects (in Phase 4 the mirror will plumb these values through).
-	// For Phase 3, please_pull effectively no-ops on the server side
-	// when registry/repository are empty; the cold-start path then
-	// degrades to DHT-polling for whatever the actual puller produces
-	// via discovery.Provide (which is still on the warm path).
-	//
-	// TODO(phase4): plumb registry+repository from the mirror request
-	// down through Resolve to here so the server can dedupe properly.
-	_, err := r.opts.Coord.PleasePull(ctx, puller.node.ID, "", "", []digest.Digest{d})
+	_, err := r.opts.Coord.PleasePull(ctx, puller.node.ID, registry, repository, []digest.Digest{d})
 	return err
 }
 

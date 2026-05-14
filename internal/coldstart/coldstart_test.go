@@ -21,6 +21,8 @@ type stubCoord struct {
 	intents         map[ifaces.NodeID]ifaces.PullIntent
 	intentErrs      map[ifaces.NodeID]error
 	pleasePullCalls []ifaces.NodeID
+	pleasePullRegs  []string
+	pleasePullRepos []string
 	pleasePullErrs  map[ifaces.NodeID]error
 }
 
@@ -33,10 +35,12 @@ func (s *stubCoord) PullIntentQuery(_ context.Context, id ifaces.NodeID, _ diges
 	return s.intents[id], nil
 }
 
-func (s *stubCoord) PleasePull(_ context.Context, id ifaces.NodeID, _, _ string, ds []digest.Digest) ([]ifaces.PleasePullOutcome, error) {
+func (s *stubCoord) PleasePull(_ context.Context, id ifaces.NodeID, registry, repository string, ds []digest.Digest) ([]ifaces.PleasePullOutcome, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.pleasePullCalls = append(s.pleasePullCalls, id)
+	s.pleasePullRegs = append(s.pleasePullRegs, registry)
+	s.pleasePullRepos = append(s.pleasePullRepos, repository)
 	if err, ok := s.pleasePullErrs[id]; ok {
 		return nil, err
 	}
@@ -138,7 +142,7 @@ func TestRule2_CacheHit(t *testing.T) {
 
 	r := buildResolver(t, coord, disco, "self", nodes, metrics, time.Now)
 
-	res, err := r.Resolve(context.Background(), d, ifaces.KindManifest, 0)
+	res, err := r.Resolve(context.Background(), d, ifaces.KindManifest, "reg.example.com", "test/repo", 0)
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
@@ -173,7 +177,7 @@ func TestRule1_FailureShortCircuitBeatsCacheHit(t *testing.T) {
 	disco := &stubDisco{}
 	r := buildResolver(t, coord, disco, "self", nodes, coldstart.MetricsHooks{}, time.Now)
 
-	_, err := r.Resolve(context.Background(), d, ifaces.KindManifest, 0)
+	_, err := r.Resolve(context.Background(), d, ifaces.KindManifest, "reg.example.com", "test/repo", 0)
 	if !errors.Is(err, coldstart.ErrFailureShortCircuit) {
 		t.Fatalf("err = %v; want ErrFailureShortCircuit", err)
 	}
@@ -198,7 +202,7 @@ func TestRule3_InFlightThenDhtProvider(t *testing.T) {
 
 	r := buildResolver(t, coord, disco, "self", nodes, coldstart.MetricsHooks{}, func() time.Time { return now })
 
-	res, err := r.Resolve(context.Background(), d, ifaces.KindManifest, 0)
+	res, err := r.Resolve(context.Background(), d, ifaces.KindManifest, "reg.example.com", "test/repo", 0)
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
@@ -231,7 +235,7 @@ func TestRule3_InFlightStaleExcluded(t *testing.T) {
 
 	r := buildResolver(t, coord, disco, "self", nodes, coldstart.MetricsHooks{}, func() time.Time { return now })
 
-	_, err := r.Resolve(context.Background(), d, ifaces.KindManifest, 0)
+	_, err := r.Resolve(context.Background(), d, ifaces.KindManifest, "reg.example.com", "test/repo", 0)
 	// Without expansion, rule 7 runs from the first pass. But the
 	// orchestrator deliberately defers rule 7 until after a potential
 	// expansion (to honor §5.2 rule 6). With health=1.0 the expansion
@@ -253,7 +257,7 @@ func TestRule4_TransientCooldown(t *testing.T) {
 	disco := &stubDisco{}
 	r := buildResolver(t, coord, disco, "self", nodes, coldstart.MetricsHooks{}, func() time.Time { return now })
 
-	_, err := r.Resolve(context.Background(), d, ifaces.KindManifest, 0)
+	_, err := r.Resolve(context.Background(), d, ifaces.KindManifest, "reg.example.com", "test/repo", 0)
 	if !errors.Is(err, coldstart.ErrCooldownActive) {
 		t.Fatalf("err = %v; want ErrCooldownActive", err)
 	}
@@ -285,7 +289,7 @@ func TestRule7_DegradedDhtExpansionThenColdStart(t *testing.T) {
 	}
 	r := buildResolver(t, coord, disco, "self", nodes, coldstart.MetricsHooks{}, time.Now)
 
-	res, err := r.Resolve(context.Background(), d, ifaces.KindManifest, 0)
+	res, err := r.Resolve(context.Background(), d, ifaces.KindManifest, "reg.example.com", "test/repo", 0)
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
@@ -294,6 +298,51 @@ func TestRule7_DegradedDhtExpansionThenColdStart(t *testing.T) {
 	}
 	if len(coord.pleasePullCalls) != 1 {
 		t.Errorf("pleasePullCalls = %d; want 1", len(coord.pleasePullCalls))
+	}
+	if len(coord.pleasePullRegs) != 1 || coord.pleasePullRegs[0] != "reg.example.com" {
+		t.Errorf("pleasePullRegs = %v; want [reg.example.com]", coord.pleasePullRegs)
+	}
+	if len(coord.pleasePullRepos) != 1 || coord.pleasePullRepos[0] != "test/repo" {
+		t.Errorf("pleasePullRepos = %v; want [test/repo]", coord.pleasePullRepos)
+	}
+}
+
+// Rule 7 must refuse to send please_pull with empty registry/repository
+// per §4.4 (single-repo-per-batch). The orchestrator surfaces this as
+// ErrExhausted so the mirror returns 5xx instead of silently never
+// triggering the puller.
+func TestRule7_EmptyRegistryRejected(t *testing.T) {
+	d := digest.MustParse("sha256:" + rep('e', 64))
+	nodes := []ifaces.Node{
+		{ID: "n0", Addr: "n0:5001"},
+		{ID: "n1", Addr: "n1:5001"},
+		{ID: "n2", Addr: "n2:5001"},
+		{ID: "n3", Addr: "n3:5001"},
+		{ID: "n4", Addr: "n4:5001"},
+		{ID: "n5", Addr: "n5:5001"},
+		{ID: "n6", Addr: "n6:5001"},
+		{ID: "n7", Addr: "n7:5001"},
+	}
+	intents := map[ifaces.NodeID]ifaces.PullIntent{}
+	for _, n := range nodes {
+		intents[n.ID] = ifaces.PullIntent{}
+	}
+	coord := &stubCoord{intents: intents}
+	// Degraded DHT so rule 6 expansion fires and the expanded pass
+	// reaches rule 7. Without registry/repository the orchestrator
+	// must refuse to send please_pull and surface ErrExhausted.
+	disco := &stubDisco{
+		health:    0.4,
+		providers: [][]ifaces.Provider{nil, nil},
+	}
+	r := buildResolver(t, coord, disco, "self", nodes, coldstart.MetricsHooks{}, time.Now)
+
+	_, err := r.Resolve(context.Background(), d, ifaces.KindManifest, "", "", 0)
+	if !errors.Is(err, coldstart.ErrExhausted) {
+		t.Fatalf("Resolve err = %v; want ErrExhausted (empty registry must short-circuit rule 7)", err)
+	}
+	if len(coord.pleasePullCalls) != 0 {
+		t.Errorf("pleasePullCalls = %d; want 0 (must not dial puller with empty registry)", len(coord.pleasePullCalls))
 	}
 }
 
@@ -330,7 +379,7 @@ func TestRule5_NoReachableExpands(t *testing.T) {
 	}
 	r := buildResolver(t, coord, disco, "self", nodes, coldstart.MetricsHooks{}, time.Now)
 
-	res, err := r.Resolve(context.Background(), d, ifaces.KindManifest, 0)
+	res, err := r.Resolve(context.Background(), d, ifaces.KindManifest, "reg.example.com", "test/repo", 0)
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
@@ -373,7 +422,7 @@ func TestPollDHTTimeoutReturnsExhausted(t *testing.T) {
 		PollLayer:    100 * time.Millisecond,
 	})
 
-	_, err := r.Resolve(context.Background(), d, ifaces.KindManifest, 0)
+	_, err := r.Resolve(context.Background(), d, ifaces.KindManifest, "reg.example.com", "test/repo", 0)
 	if !errors.Is(err, coldstart.ErrExhausted) {
 		t.Fatalf("err = %v; want ErrExhausted", err)
 	}
@@ -403,7 +452,7 @@ func TestRankMismatchEmitsMetric(t *testing.T) {
 		},
 	}
 	r := buildResolver(t, coord, disco, "self", nodes, metrics, time.Now)
-	_, _ = r.Resolve(context.Background(), d, ifaces.KindManifest, 0)
+	_, _ = r.Resolve(context.Background(), d, ifaces.KindManifest, "reg.example.com", "test/repo", 0)
 	if len(mismatches) != 1 || mismatches[0] != top[0].Node.ID {
 		t.Errorf("mismatches = %v; want [%s]", mismatches, top[0].Node.ID)
 	}
