@@ -69,13 +69,35 @@ spec:
         - protocol: TCP
           port: 53
     # Kubernetes API server (informer; §7.3).
+    #
+    # The default "kubernetes" Service in the default namespace is
+    # endpoint-backed by the actual apiserver address(es), not by
+    # pods labeled in that namespace, so a namespaceSelector rule
+    # never matches the real traffic on managed control planes
+    # (EKS / GKE / AKS) or on self-hosted clusters where the
+    # apiserver runs as a static pod or off-cluster.
+    #
+    # Operators MUST replace the placeholder ipBlock below with the
+    # actual apiserver CIDR(s) for their cluster:
+    #   kubectl get endpoints kubernetes -n default -o jsonpath='{.subsets[*].addresses[*].ip}'
+    # The 0.0.0.0/0 placeholder is intentionally broad so the agent
+    # works out-of-the-box; tighten before going to production.
     - to:
-        - namespaceSelector:
-            matchLabels:
-              kubernetes.io/metadata.name: default
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              # Block egress to the pod and service CIDRs through this
+              # rule — apiserver traffic should go through the explicit
+              # ipBlock, peer traffic through the gantry-agent rule
+              # below. Operators substitute their cluster's CIDRs.
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
       ports:
         - protocol: TCP
           port: 443
+        - protocol: TCP
+          port: 6443
     # Peer transfer + libp2p ports on other gantry agents.
     - to:
         - podSelector:

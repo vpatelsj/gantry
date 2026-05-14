@@ -16,7 +16,17 @@ metadata:
 data:
   config.yaml: |
     # ---------- Listeners ----------
-    mirror_listen: "127.0.0.1:5000"
+    # mirror_listen binds 0.0.0.0:5000 inside the pod because the
+    # DaemonSet exposes the mirror via hostPort with hostIP: 127.0.0.1
+    # (deploy/daemonset.yaml). kube-proxy / portmap DNATs the host's
+    # 127.0.0.1:5000 to <podIP>:5000 in the pod's network namespace —
+    # a listener on the pod's loopback (127.0.0.1 inside the pod) is
+    # unreachable through that path. The hostIP=127.0.0.1 binding on
+    # the hostPort, plus the NetworkPolicy below, keeps the endpoint
+    # node-local. mirror_bind_allow_non_loopback is the explicit
+    # operator opt-in required by Config.Validate (§7.5).
+    mirror_listen: "0.0.0.0:5000"
+    mirror_bind_allow_non_loopback: true
     transfer_listen: "0.0.0.0:5001"
     metrics_listen: "0.0.0.0:9095"
 

@@ -14,9 +14,14 @@
 #       /var/lib/gantry/libp2p  — persistent libp2p identity key, so
 #                                  the same peer ID survives restarts
 #                                  and DHT routing tables don't churn.
-#   - Mirror port (5000) binds 127.0.0.1 only and is reached by
-#     containerd through the hosts.toml entry; nothing outside the
-#     node should ever talk to it.
+#   - Mirror port (5000) is exposed via a hostPort with
+#     hostIP: 127.0.0.1, so the host-side endpoint is loopback-only;
+#     containerd reaches it through the hosts.toml entry. Inside the
+#     pod the agent binds 0.0.0.0:5000 (configmap.yaml has
+#     mirror_bind_allow_non_loopback: true) because kube-proxy /
+#     portmap DNAT delivers the traffic to <podIP>:5000, not the
+#     pod's loopback. The NetworkPolicy denies ingress on 5000 from
+#     anywhere except the host.
 #   - Resource requests are placeholders (NF6 validation pending).
 #     Operators should size them after observing
 #     p2p_in_flight_pulls / cache_budget under their workload.
@@ -70,6 +75,46 @@ spec:
       tolerations:
         - operator: Exists
       terminationGracePeriodSeconds: 30
+      # initContainer: hostPath volumes are created as root:root by the
+      # kubelet (DirectoryOrCreate) and we run the agent as a non-root
+      # user (UID/GID 65532). Without this step the agent fails on its
+      # first write to /var/lib/gantry/cache or /var/lib/gantry/libp2p.
+      # fsGroup doesn't help here because hostPath volumes don't honour
+      # it, so we chown explicitly.
+      initContainers:
+        - name: chown-hostpaths
+          image: ghcr.io/vpatelsj/gantry:latest
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -c
+            - |
+              set -eu
+              chown -R 65532:65532 /var/lib/gantry/cache /var/lib/gantry/libp2p
+              chmod 0700 /var/lib/gantry/libp2p
+          securityContext:
+            runAsNonRoot: false
+            runAsUser: 0
+            runAsGroup: 0
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+              add: ["CHOWN", "FOWNER", "DAC_OVERRIDE"]
+            seccompProfile:
+              type: RuntimeDefault
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 100m
+              memory: 32Mi
+          volumeMounts:
+            - name: cache
+              mountPath: /var/lib/gantry/cache
+            - name: libp2p
+              mountPath: /var/lib/gantry/libp2p
       containers:
         - name: gantry
           image: ghcr.io/vpatelsj/gantry:latest   # build.sh fills this with `git describe`

@@ -37,6 +37,21 @@ func TestValidate_MirrorListenMustBeLoopback(t *testing.T) {
 	}
 }
 
+// MirrorBindAllowNonLoopback is the operator opt-in for deployments that
+// rely on hostPort + hostIP=127.0.0.1 to keep the mirror node-local while
+// still binding 0.0.0.0 inside the pod (so kube-proxy's DNAT into the pod
+// network reaches the listener). When set, validation must accept the
+// non-loopback bind.
+func TestValidate_MirrorListenAllowNonLoopbackOptIn(t *testing.T) {
+	c := NewDefault()
+	c.UpstreamRegistries = []UpstreamRegistry{{Name: "r", Endpoint: "https://r"}}
+	c.MirrorListen = "0.0.0.0:5000"
+	c.MirrorBindAllowNonLoopback = true
+	if err := c.Validate(); err != nil {
+		t.Fatalf("validate (opt-in): %v", err)
+	}
+}
+
 func TestValidate_DuplicateUpstreamName(t *testing.T) {
 	c := NewDefault()
 	c.UpstreamRegistries = []UpstreamRegistry{

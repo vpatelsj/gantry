@@ -42,8 +42,18 @@ type Config struct {
 	// ---------- Listeners ----------
 
 	// MirrorListen is the loopback address for containerd's mirror endpoint
-	// (detailed-design.md §4.1, §7.1). MUST be loopback-only.
+	// (detailed-design.md §4.1, §7.1). MUST be loopback-only unless
+	// MirrorBindAllowNonLoopback is true (operator opt-in: e.g. when the
+	// pod is reached via a hostPort with hostIP=127.0.0.1 DNAT'ing into
+	// the pod network — see deploy/daemonset.yaml).
 	MirrorListen string `yaml:"mirror_listen"`
+
+	// MirrorBindAllowNonLoopback relaxes the loopback-only validation on
+	// MirrorListen. Set to true ONLY when the deployment guarantees the
+	// mirror is unreachable from off-node by some other mechanism
+	// (hostPort + hostIP=127.0.0.1, NetworkPolicy, etc.). The default
+	// (false) is the safe value for any non-Kubernetes deployment.
+	MirrorBindAllowNonLoopback bool `yaml:"mirror_bind_allow_non_loopback"`
 
 	// TransferListen is the peer-facing HTTP/2 endpoint (§4.4). NetworkPolicy
 	// restricts inter-node visibility; the agent itself binds 0.0.0.0.
@@ -216,11 +226,12 @@ type UpstreamRegistry struct {
 // All fields are set; Validate() against this MUST pass.
 func NewDefault() *Config {
 	return &Config{
-		MirrorListen:       "127.0.0.1:5000",
-		TransferListen:     "0.0.0.0:5001",
-		MetricsListen:      "127.0.0.1:9095",
-		Libp2pListen:       nil,
-		Libp2pIdentityPath: "/var/lib/gantry/libp2p.key",
+		MirrorListen:               "127.0.0.1:5000",
+		MirrorBindAllowNonLoopback: false,
+		TransferListen:             "0.0.0.0:5001",
+		MetricsListen:              "127.0.0.1:9095",
+		Libp2pListen:               nil,
+		Libp2pIdentityPath:         "/var/lib/gantry/libp2p.key",
 
 		NodeName:             "",
 		PodName:              "",
@@ -312,8 +323,19 @@ func (c *Config) LoadEnv(env func(string) string) error {
 			*dst = d
 		}
 	}
+	setBool := func(key string, dst *bool) {
+		if v, ok := lookup(env, key); ok {
+			b, err := strconv.ParseBool(v)
+			if err != nil {
+				errs = append(errs, fmt.Errorf("env GANTRY_%s: %w", key, err))
+				return
+			}
+			*dst = b
+		}
+	}
 
 	setStr("MIRROR_LISTEN", &c.MirrorListen)
+	setBool("MIRROR_BIND_ALLOW_NON_LOOPBACK", &c.MirrorBindAllowNonLoopback)
 	setStr("TRANSFER_LISTEN", &c.TransferListen)
 	setStr("METRICS_LISTEN", &c.MetricsListen)
 	setStr("LIBP2P_IDENTITY_PATH", &c.Libp2pIdentityPath)
@@ -357,6 +379,7 @@ func (c *Config) LoadEnv(env func(string) string) error {
 // LoadYAML / LoadEnv but before fs.Parse() so flags win.
 func (c *Config) BindFlags(fs *flag.FlagSet) {
 	fs.StringVar(&c.MirrorListen, "mirror-listen", c.MirrorListen, "address for the containerd-facing mirror endpoint (loopback)")
+	fs.BoolVar(&c.MirrorBindAllowNonLoopback, "mirror-bind-allow-non-loopback", c.MirrorBindAllowNonLoopback, "opt in to a non-loopback mirror bind (e.g. when using hostPort + hostIP=127.0.0.1 in Kubernetes)")
 	fs.StringVar(&c.TransferListen, "transfer-listen", c.TransferListen, "address for the peer-facing transfer endpoint")
 	fs.StringVar(&c.MetricsListen, "metrics-listen", c.MetricsListen, "address for the Prometheus metrics endpoint")
 	fs.StringVar(&c.Libp2pIdentityPath, "libp2p-identity-path", c.Libp2pIdentityPath, "path to the persisted libp2p identity key")
@@ -445,14 +468,18 @@ func (c *Config) Validate() error {
 	mustAddr("transfer_listen", c.TransferListen)
 	mustAddr("metrics_listen", c.MetricsListen)
 
-	// MirrorListen MUST be loopback (§4.1, §7.5).
-	if host, _, err := net.SplitHostPort(c.MirrorListen); err == nil {
-		ip := net.ParseIP(host)
-		if ip != nil && !ip.IsLoopback() {
-			errs = append(errs, fmt.Errorf("mirror_listen %q is not loopback; only 127.0.0.1 / ::1 are safe (containerd mirror uses skip_verify=true)", c.MirrorListen))
-		}
-		if ip == nil && host != "localhost" && host != "" {
-			errs = append(errs, fmt.Errorf("mirror_listen host %q: must be loopback", host))
+	// MirrorListen MUST be loopback (§4.1, §7.5) unless the operator has
+	// explicitly opted in to a non-loopback bind. See the field comment on
+	// Config.MirrorBindAllowNonLoopback for when that's safe.
+	if !c.MirrorBindAllowNonLoopback {
+		if host, _, err := net.SplitHostPort(c.MirrorListen); err == nil {
+			ip := net.ParseIP(host)
+			if ip != nil && !ip.IsLoopback() {
+				errs = append(errs, fmt.Errorf("mirror_listen %q is not loopback; only 127.0.0.1 / ::1 are safe (containerd mirror uses skip_verify=true) — set mirror_bind_allow_non_loopback: true to override (operator opt-in)", c.MirrorListen))
+			}
+			if ip == nil && host != "localhost" && host != "" {
+				errs = append(errs, fmt.Errorf("mirror_listen host %q: must be loopback (or set mirror_bind_allow_non_loopback: true)", host))
+			}
 		}
 	}
 
