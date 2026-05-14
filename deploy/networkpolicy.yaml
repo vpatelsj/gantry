@@ -90,22 +90,20 @@ spec:
     # (EKS / GKE / AKS) or on self-hosted clusters where the
     # apiserver runs as a static pod or off-cluster.
     #
-    # Operators MUST replace the placeholder ipBlock below with the
-    # actual apiserver CIDR(s) for their cluster:
+    # Default below is permissive (0.0.0.0/0 on the two apiserver
+    # ports). On many private clusters the apiserver lives inside
+    # RFC1918 (kube-apiserver on a control-plane node at
+    # 10.x.x.x:6443, AKS/EKS private endpoints, etc.), so an `except`
+    # clause excluding RFC1918 would silently break the informer
+    # there. Operators MUST replace this with the actual apiserver
+    # CIDR before going to production:
     #   kubectl get endpoints kubernetes -n default -o jsonpath='{.subsets[*].addresses[*].ip}'
-    # The 0.0.0.0/0 placeholder is intentionally broad so the agent
-    # works out-of-the-box; tighten before going to production.
+    # The two ports below (443 and 6443) are the only egress this rule
+    # enables, so the blast radius from leaving 0.0.0.0/0 in place is
+    # limited to whatever else happens to listen on those ports.
     - to:
         - ipBlock:
             cidr: 0.0.0.0/0
-            except:
-              # Block egress to the pod and service CIDRs through this
-              # rule — apiserver traffic should go through the explicit
-              # ipBlock, peer traffic through the gantry-agent rule
-              # below. Operators substitute their cluster's CIDRs.
-              - 10.0.0.0/8
-              - 172.16.0.0/12
-              - 192.168.0.0/16
       ports:
         - protocol: TCP
           port: 443

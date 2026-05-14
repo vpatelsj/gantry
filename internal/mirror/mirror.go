@@ -487,6 +487,13 @@ func (s *Server) serveDigest(w http.ResponseWriter, r *http.Request, upstream, r
 			logger.Warn("mirror: cache commit failed", slog.Any("err", err))
 			return
 		}
+		// Re-advertise into the DHT now that we hold a byte-identical
+		// copy in our cache. Without this, an NF5-eligible direct
+		// origin pull leaves the cluster's only known provider record
+		// pointing at the origin instead of at this node — defeating
+		// the deduplication promise of §5.2 step 7 specifically for
+		// the cold-start-exhausted path that just escalated to origin.
+		s.reAdvertiseDigest(d, "mirror_origin_announce", logger)
 		s.firePrefetch(kind, upstream, repo, d)
 	}
 }
@@ -709,22 +716,7 @@ func (s *Server) fetchOneProvider(ctx context.Context, w http.ResponseWriter, r 
 	// of the design (detailed-design §5.2 step 7). Fire-and-forget
 	// with a 30s budget; bg ctx so client cancellation can't abort
 	// the announcement.
-	if s.dht != nil {
-		dHash := d
-		go func() {
-			provCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			defer cancel()
-			if perr := s.dht.Provide(provCtx, dHash); perr != nil {
-				if s.metrics.onProvideError != nil {
-					s.metrics.onProvideError("peer_fetch_readvertise")
-				}
-				logger.Debug("mirror: post-peer-fetch dht.Provide failed",
-					slog.String("digest", dHash.String()),
-					slog.Any("err", perr),
-				)
-			}
-		}()
-	}
+	s.reAdvertiseDigest(d, "peer_fetch_readvertise", logger)
 
 	// Re-open from cache and stream verified bytes to the client.
 	rcLocal, size, err := s.cache.Open(ctx, d)
@@ -757,6 +749,34 @@ func (s *Server) firePrefetch(kind ifaces.OriginRefKind, registry, repository st
 		return
 	}
 	go s.prefetcher.OnManifestServed(context.Background(), registry, repository, d)
+}
+
+// reAdvertiseDigest does a fire-and-forget dht.Provide(d) in a
+// goroutine with a 30s budget. The op label distinguishes the call
+// site for the p2p_dht_provide_error_total{op} counter; common
+// values are "peer_fetch_readvertise" (mirror peer-fetch success
+// path) and "mirror_origin_announce" (NF5-eligible direct-origin
+// pull success path). The background context shields the announce
+// from client cancellation.
+func (s *Server) reAdvertiseDigest(d digest.Digest, op string, logger *slog.Logger) {
+	if s.dht == nil {
+		return
+	}
+	dHash := d
+	go func() {
+		provCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if perr := s.dht.Provide(provCtx, dHash); perr != nil {
+			if s.metrics.onProvideError != nil {
+				s.metrics.onProvideError(op)
+			}
+			logger.Debug("mirror: post-commit dht.Provide failed",
+				slog.String("op", op),
+				slog.String("digest", dHash.String()),
+				slog.Any("err", perr),
+			)
+		}
+	}()
 }
 
 // bumpCacheHit / bumpCacheMiss / bumpOriginPull / bumpOriginFailure are

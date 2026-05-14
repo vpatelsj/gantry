@@ -81,9 +81,14 @@ spec:
       # first write to /var/lib/gantry/cache or /var/lib/gantry/libp2p.
       # fsGroup doesn't help here because hostPath volumes don't honour
       # it, so we chown explicitly.
+      #
+      # We use busybox (not the gantry distroless image) because the
+      # production image is built FROM gcr.io/distroless/static-debian12
+      # which intentionally has no shell, no `chown`, and no `chmod`.
+      # Pinning to a fixed busybox tag keeps this step reproducible.
       initContainers:
         - name: chown-hostpaths
-          image: ghcr.io/vpatelsj/gantry:latest
+          image: busybox:1.36
           imagePullPolicy: IfNotPresent
           command:
             - sh
