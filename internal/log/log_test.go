@@ -1,4 +1,4 @@
-package gantrylog
+package log
 
 import (
 	"bytes"

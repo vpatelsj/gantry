@@ -34,11 +34,12 @@ import (
 	"github.com/gantry/gantry/internal/coord"
 	"github.com/gantry/gantry/internal/digest"
 	"github.com/gantry/gantry/internal/discovery"
-	gantrylog "github.com/gantry/gantry/internal/gantrylog"
 	"github.com/gantry/gantry/internal/hrw"
 	"github.com/gantry/gantry/internal/ifaces"
 	"github.com/gantry/gantry/internal/ifaces/fakes"
 	"github.com/gantry/gantry/internal/inflight"
+	gantrylog "github.com/gantry/gantry/internal/log"
+	"github.com/gantry/gantry/internal/manifest"
 	"github.com/gantry/gantry/internal/members"
 	"github.com/gantry/gantry/internal/metrics"
 	"github.com/gantry/gantry/internal/mirror"
@@ -283,6 +284,7 @@ func runAgent(args []string) error {
 	// single-self stub: in dev/test mode every cache miss with empty
 	// DHT must still reach origin via the Phase 1 path.
 	var coldStartResolver mirror.ColdStartResolver
+	var layerPrefetcher mirror.LayerPrefetcher
 	if hasMultiNodeMembership(memberView) {
 		selfZone := lookupSelfZone(memberView)
 		realResolver := coldstart.New(coldstart.Options{
@@ -311,9 +313,15 @@ func runAgent(args []string) error {
 				OnTopKExpansion: func(reason string) {
 					p5.topkExpansionTotal.WithLabelValues(reason).Inc()
 				},
+				OnPrefetchBatch: func(pullers, digests int) {
+					p3.prefetchBatchesTotal.Inc()
+					p3.prefetchDigestsTotal.Add(float64(digests))
+					p3.prefetchPullersPerBatch.Observe(float64(pullers))
+				},
 			},
 		})
 		coldStartResolver = coldStartAdapter{r: realResolver}
+		layerPrefetcher = newLayerPrefetcher(realResolver, cstore, logger)
 		logger.Info("cold-start orchestrator wired",
 			slog.Int("hrw_k", c.HRWK),
 			slog.String("hrw_scope", c.HRWTopologyScope),
@@ -390,6 +398,7 @@ func runAgent(args []string) error {
 			p2.dhtLookupDur.WithLabelValues(outcome).Observe(dur.Seconds())
 		}),
 		mirror.WithColdStart(coldStartResolver),
+		mirror.WithLayerPrefetcher(layerPrefetcher),
 		mirror.WithNF5(nf5Ctrl),
 	)
 
@@ -730,14 +739,17 @@ func announceCachedDigests(ctx context.Context, ds []digest.Digest, dht *discove
 // probe hit rate, in-flight pull gauge, cold-start latency, and coord
 // stream counters.
 type phase3Metrics struct {
-	hrwRankMismatch        *prometheus.CounterVec
-	dhtFalseEmpty          prometheus.Counter
-	topkProbeHit           prometheus.Counter
-	coldStartDuration      *prometheus.HistogramVec
-	coordPullIntentServed  prometheus.Counter
-	coordPleasePullServed  prometheus.Counter
-	coordPleasePullStarted prometheus.Counter
-	coordStreamError       prometheus.Counter
+	hrwRankMismatch         *prometheus.CounterVec
+	dhtFalseEmpty           prometheus.Counter
+	topkProbeHit            prometheus.Counter
+	coldStartDuration       *prometheus.HistogramVec
+	coordPullIntentServed   prometheus.Counter
+	coordPleasePullServed   prometheus.Counter
+	coordPleasePullStarted  prometheus.Counter
+	coordStreamError        prometheus.Counter
+	prefetchBatchesTotal    prometheus.Counter
+	prefetchDigestsTotal    prometheus.Counter
+	prefetchPullersPerBatch prometheus.Histogram
 }
 
 func newPhase3Metrics(reg *metrics.Registry, infl *inflight.Map) *phase3Metrics {
@@ -781,6 +793,19 @@ func newPhase3Metrics(reg *metrics.Registry, infl *inflight.Map) *phase3Metrics 
 		coordStreamError: reg.NewCounter("coord", prometheus.CounterOpts{
 			Name: "p2p_coord_stream_error_total",
 			Help: "Malformed or oversized coord streams rejected by this node.",
+		}),
+		prefetchBatchesTotal: reg.NewCounter("coord", prometheus.CounterOpts{
+			Name: "p2p_prefetch_batches_total",
+			Help: "Speculative manifest-pre-fan PleasePull batches dispatched (one per distinct HRW rank-0 puller per manifest serve, §5.2).",
+		}),
+		prefetchDigestsTotal: reg.NewCounter("coord", prometheus.CounterOpts{
+			Name: "p2p_prefetch_digests_total",
+			Help: "Layer/config digests carried in speculative manifest-pre-fan batches (cumulative sum across batches, §5.2).",
+		}),
+		prefetchPullersPerBatch: reg.NewHistogram("coord", prometheus.HistogramOpts{
+			Name:    "p2p_prefetch_pullers_per_manifest",
+			Help:    "Distribution of distinct HRW rank-0 pullers contacted per manifest pre-fan call.",
+			Buckets: prometheus.LinearBuckets(1, 1, 10),
 		}),
 	}
 }
@@ -881,6 +906,111 @@ func (a coldStartAdapter) Resolve(ctx context.Context, d digest.Digest, kind ifa
 		return nil, err
 	}
 	return &mirror.ColdStartResolution{Providers: res.Providers, Outcome: res.Outcome}, nil
+}
+
+// layerPrefetchAdapter implements mirror.LayerPrefetcher: after a
+// manifest serve it reads the manifest body back from cache, extracts
+// the child layer/config digests, filters out digests already in the
+// local cache, and asks the cold-start resolver to issue batched
+// please_pull RPCs grouped by HRW rank-0 puller.
+//
+// The implementation runs in a goroutine spawned by the mirror; it
+// MUST NOT panic. All errors are logged at DEBUG.
+type layerPrefetchAdapter struct {
+	resolver *coldstart.Resolver
+	cache    ifaces.Cache
+	logger   *slog.Logger
+}
+
+// maxManifestBytes caps the size of a manifest body the prefetcher
+// is willing to parse. OCI Distribution recommends manifests stay
+// well under 4 MiB; a body larger than that almost certainly indicates
+// a misconfigured upstream (or attack), and we'd rather skip prefetch
+// than allocate a multi-MB buffer per manifest serve.
+const maxManifestBytes int64 = 4 * 1024 * 1024
+
+func newLayerPrefetcher(r *coldstart.Resolver, cache ifaces.Cache, logger *slog.Logger) mirror.LayerPrefetcher {
+	return &layerPrefetchAdapter{
+		resolver: r,
+		cache:    cache,
+		logger:   logger.With(slog.String("subsystem", "prefetch")),
+	}
+}
+
+func (p *layerPrefetchAdapter) OnManifestServed(ctx context.Context, registry, repository string, manifestDigest digest.Digest) {
+	if p.resolver == nil {
+		return
+	}
+	// Use a fresh deadline so the prefetch survives the request
+	// context that just finished; cap at 30s so a stuck prefetch
+	// can't pin a goroutine forever.
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	rc, _, err := p.cache.Open(ctx, manifestDigest)
+	if err != nil {
+		p.logger.Debug("prefetch: manifest not in cache",
+			slog.String("digest", manifestDigest.String()),
+			slog.Any("err", err),
+		)
+		return
+	}
+	body, err := io.ReadAll(io.LimitReader(rc, maxManifestBytes))
+	_ = rc.Close()
+	if err != nil {
+		p.logger.Debug("prefetch: manifest read failed",
+			slog.String("digest", manifestDigest.String()),
+			slog.Any("err", err),
+		)
+		return
+	}
+	if int64(len(body)) >= maxManifestBytes {
+		// Likely truncated; refuse to parse.
+		p.logger.Debug("prefetch: manifest exceeds size cap",
+			slog.String("digest", manifestDigest.String()),
+			slog.Int64("cap", maxManifestBytes),
+		)
+		return
+	}
+	children, err := manifest.ChildDigests(body)
+	if err != nil {
+		p.logger.Debug("prefetch: manifest parse failed",
+			slog.String("digest", manifestDigest.String()),
+			slog.Any("err", err),
+		)
+		return
+	}
+	if len(children) == 0 {
+		// Image index or no children — nothing to fan out.
+		return
+	}
+
+	// Filter out digests already present locally; they don't need
+	// prefetching.
+	pending := make([]digest.Digest, 0, len(children))
+	for _, d := range children {
+		has, err := p.cache.Has(ctx, d)
+		if err != nil {
+			// Treat error as "unknown" — include the digest; the
+			// puller's in-flight dedupe handles the case where it's
+			// already there.
+			pending = append(pending, d)
+			continue
+		}
+		if !has {
+			pending = append(pending, d)
+		}
+	}
+	if len(pending) == 0 {
+		return
+	}
+	if err := p.resolver.PrefetchLayers(ctx, pending, registry, repository); err != nil {
+		p.logger.Debug("prefetch: PrefetchLayers reported errors",
+			slog.String("manifest", manifestDigest.String()),
+			slog.Int("layers", len(pending)),
+			slog.Any("err", err),
+		)
+	}
 }
 
 // newPullerPump returns the coord.PullerPump that backs inbound

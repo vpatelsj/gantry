@@ -36,11 +36,9 @@ import (
 	"container/list"
 	"context"
 	"crypto/rand"
-	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"hash"
 	"io"
 	"log/slog"
 	"os"
@@ -51,6 +49,7 @@ import (
 	"time"
 
 	"github.com/gantry/gantry/internal/digest"
+	"github.com/gantry/gantry/internal/digestpipe"
 	"github.com/gantry/gantry/internal/ifaces"
 )
 
@@ -318,7 +317,7 @@ func (c *Cache) Writer(_ context.Context, d digest.Digest) (ifaces.CacheWriter, 
 	return &writer{
 		cache:   c,
 		want:    d,
-		hasher:  sha256.New(),
+		pipe:    digestpipe.New(f),
 		file:    f,
 		tmpPath: tmpPath,
 	}, nil
@@ -633,14 +632,15 @@ func (c *Cache) purgeStaleTmp() error {
 	return nil
 }
 
-// writer is the per-call CacheWriter implementation.
+// writer is the per-call CacheWriter implementation. The digest-tee
+// itself lives in internal/digestpipe; this type owns the temp-file
+// lifecycle and the atomic rename into the content-addressed tree.
 type writer struct {
 	cache   *Cache
 	want    digest.Digest
-	hasher  hash.Hash
+	pipe    *digestpipe.Writer
 	file    *os.File
 	tmpPath string
-	written int64
 	closed  bool
 }
 
@@ -648,12 +648,7 @@ func (w *writer) Write(p []byte) (int, error) {
 	if w.closed {
 		return 0, errors.New("cache: write after close")
 	}
-	n, err := w.file.Write(p)
-	if n > 0 {
-		w.hasher.Write(p[:n])
-		w.written += int64(n)
-	}
-	return n, err
+	return w.pipe.Write(p)
 }
 
 func (w *writer) Commit(_ context.Context) error {
@@ -670,10 +665,9 @@ func (w *writer) Commit(_ context.Context) error {
 		_ = os.Remove(w.tmpPath)
 		return fmt.Errorf("cache: close temp: %w", err)
 	}
-	got := hex.EncodeToString(w.hasher.Sum(nil))
-	if got != w.want.Hex() {
+	if err := w.pipe.Verify(w.want); err != nil {
 		_ = os.Remove(w.tmpPath)
-		return fmt.Errorf("cache: digest mismatch: want %s, got sha256:%s", w.want.String(), got)
+		return fmt.Errorf("cache: %w", err)
 	}
 	final := w.cache.pathFor(w.want)
 	if err := os.MkdirAll(filepath.Dir(final), 0o755); err != nil {
@@ -687,7 +681,7 @@ func (w *writer) Commit(_ context.Context) error {
 		_ = os.Remove(w.tmpPath)
 		return fmt.Errorf("cache: rename: %w", err)
 	}
-	w.cache.admit(w.want, w.written)
+	w.cache.admit(w.want, w.pipe.Written())
 	return nil
 }
 

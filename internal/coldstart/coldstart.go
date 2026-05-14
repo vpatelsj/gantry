@@ -96,6 +96,13 @@ type MetricsHooks struct {
 	// "all_unreachable" (rule-5 expansion). Maps to §7.6 metric
 	// `p2p_topk_expansion_total{reason=}`.
 	OnTopKExpansion func(reason string)
+	// OnPrefetchBatch fires once per PrefetchLayers call with the
+	// number of distinct pullers contacted and the number of layer
+	// digests grouped into those batches (after self / unreachable
+	// filtering). Maps to §5.2 / §7.6 batched-please_pull metrics:
+	// `p2p_prefetch_batches_total` (count) and
+	// `p2p_prefetch_digests_batched_total` (sum).
+	OnPrefetchBatch func(pullers, digests int)
 }
 
 // Options configures a Resolver.

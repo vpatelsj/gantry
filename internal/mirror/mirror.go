@@ -64,6 +64,14 @@ type Server struct {
 	// always returns 5xx.
 	nf5 *NF5Controller
 
+	// Speculative layer prefetcher (§5.2 detailed-design L332 / archecture
+	// L180). When set, every successful manifest serve fires a
+	// fire-and-forget OnManifestServed callback so the prefetcher can
+	// parse the body, group child digests by HRW rank-0 puller, and
+	// issue batched please_pull RPCs before containerd asks for the
+	// layers. Nil-safe.
+	prefetcher LayerPrefetcher
+
 	// Phase 2 tunables (zero values fall back to package defaults).
 	peerLookupBudget time.Duration
 	peerFetchBudget  time.Duration
@@ -189,6 +197,24 @@ func WithColdStart(c ColdStartResolver) Option {
 // cold-start exhaustion always returns 5xx.
 func WithNF5(c *NF5Controller) Option {
 	return func(s *Server) { s.nf5 = c }
+}
+
+// LayerPrefetcher is the speculative wire-level optimisation hook
+// (§5.2 detailed-design.md L332 / archecture.md L180). After the
+// mirror serves a manifest successfully the mirror invokes
+// OnManifestServed in a goroutine so an implementation can fetch
+// the just-cached manifest body, parse it, identify child
+// layer/config digests, group them by HRW rank-0 puller, and issue
+// batched please_pull RPCs to warm the cluster before containerd
+// asks for the layers. The mirror never waits for the callback to
+// return; failures are the prefetcher's to log.
+type LayerPrefetcher interface {
+	OnManifestServed(ctx context.Context, registry, repository string, manifestDigest digest.Digest)
+}
+
+// WithLayerPrefetcher wires a speculative layer prefetcher. Nil-safe.
+func WithLayerPrefetcher(p LayerPrefetcher) Option {
+	return func(s *Server) { s.prefetcher = p }
 }
 
 // New builds a Server bound to the given cache and origin.
@@ -319,6 +345,7 @@ func (s *Server) serveDigest(w http.ResponseWriter, r *http.Request, upstream, r
 		defer func() { _ = rc.Close() }()
 		s.bumpCacheHit()
 		writeBlobHeaders(w, d, size, kind)
+		s.firePrefetch(kind, upstream, repo, d)
 		if r.Method == http.MethodHead {
 			return
 		}
@@ -349,6 +376,7 @@ func (s *Server) serveDigest(w http.ResponseWriter, r *http.Request, upstream, r
 	if s.dht != nil && s.peer != nil {
 		switch s.tryPeerFallback(ctx, w, r, d, kind, upstream, repo, logger) {
 		case peerFallbackServed:
+			s.firePrefetch(kind, upstream, repo, d)
 			return
 		case peerFallbackExhausted:
 			http.Error(w, "warm path exhausted", http.StatusServiceUnavailable)
@@ -410,7 +438,9 @@ func (s *Server) serveDigest(w http.ResponseWriter, r *http.Request, upstream, r
 		if err := cw.Commit(ctx); err != nil {
 			// The client already got the bytes; cache just doesn't keep them.
 			logger.Warn("mirror: cache commit failed", slog.Any("err", err))
+			return
 		}
+		s.firePrefetch(kind, upstream, repo, d)
 	}
 }
 
@@ -595,6 +625,18 @@ func (s *Server) fetchOneProvider(ctx context.Context, w http.ResponseWriter, r 
 		logger.Debug("mirror: copy from cache (post-peer) failed", slog.Any("err", err))
 	}
 	return true
+}
+
+// firePrefetch invokes the LayerPrefetcher (if any) in a goroutine
+// when kind is a manifest. The mirror does NOT wait for the
+// callback; the prefetcher's job is to read the manifest body from
+// cache and dispatch batched please_pull RPCs entirely in the
+// background.
+func (s *Server) firePrefetch(kind ifaces.OriginRefKind, registry, repository string, d digest.Digest) {
+	if s.prefetcher == nil || kind != ifaces.KindManifest {
+		return
+	}
+	go s.prefetcher.OnManifestServed(context.Background(), registry, repository, d)
 }
 
 // bumpCacheHit / bumpCacheMiss / bumpOriginPull / bumpOriginFailure are

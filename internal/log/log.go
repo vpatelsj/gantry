@@ -1,4 +1,4 @@
-// Package gantrylog is the structured-logging entry point for Gantry.
+// Package log is the structured-logging entry point for Gantry.
 //
 // The design docs mandate WARN-level emission in specific places (forced
 // cache eviction in §7.4, HRW rank mismatch in §5.3). This package wraps
@@ -23,7 +23,7 @@
 //	WARN   §7.4 forced eviction, §5.3 HRW rank mismatch, soft failures
 //	       that the design explicitly calls out
 //	ERROR  hard failures requiring operator attention
-package gantrylog
+package log
 
 import (
 	"context"
@@ -82,10 +82,10 @@ func NodeID(id fmt.Stringer) slog.Attr { return slog.String("node_id", safeStrin
 // Err builds a slog.Attr carrying the standard "err" key.
 func Err(err error) slog.Attr { return slog.Any("err", err) }
 
-// LogContext is a tiny helper for the case where a function wants to bind
+// Context is a tiny helper for the case where a function wants to bind
 // per-request attributes onto a child logger and pass it down — e.g., a
 // mirror request handler binding (registry, repo, digest) once at the top.
-func LogContext(_ context.Context, parent *slog.Logger, attrs ...slog.Attr) *slog.Logger {
+func Context(_ context.Context, parent *slog.Logger, attrs ...slog.Attr) *slog.Logger {
 	anys := make([]any, 0, len(attrs))
 	for _, a := range attrs {
 		anys = append(anys, a)
