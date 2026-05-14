@@ -31,6 +31,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/gantry/gantry/internal/config"
@@ -71,7 +72,20 @@ type Server struct {
 	// defaultUpstream is the upstream to use when exactly one is
 	// configured and ?ns= is absent.
 	defaultUpstream string
+
+	// draining is set to true via Drain() when the agent is shutting
+	// down. Once true, every /v2/ request returns 503 immediately so
+	// containerd's hosts.toml falls through to origin (§Phase 6
+	// graceful-shutdown contract). The check is layered ON TOP of
+	// http.Server.Shutdown so that even keep-alive connections that
+	// the kernel has already accepted get a 503 instead of normal
+	// handling once Drain() has fired.
+	draining atomic.Bool
 }
+
+// Drain flips the mirror into shutdown mode: new /v2/ requests return
+// 503 immediately. Idempotent. Safe to call from a signal handler.
+func (s *Server) Drain() { s.draining.Store(true) }
 
 type metricsHooks struct {
 	onCacheHit       func()
@@ -198,9 +212,24 @@ func New(cfg *config.Config, cache ifaces.Cache, origin ifaces.OriginPuller, opt
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", s.handleHealthz)
-	mux.HandleFunc("/v2/", s.handleV2)
-	mux.HandleFunc("/v2", s.handleV2) // some clients omit trailing slash
+	mux.HandleFunc("/v2/", s.drainGuard(s.handleV2))
+	mux.HandleFunc("/v2", s.drainGuard(s.handleV2)) // some clients omit trailing slash
 	return mux
+}
+
+// drainGuard wraps a /v2/ handler so that once Drain() has been called,
+// every new request gets a 503 instead of normal handling. §Phase 6:
+// "stops accepting new mirror requests with 503". The 503 (not 404)
+// is load-bearing — hosts.toml only falls through on 5xx.
+func (s *Server) drainGuard(h http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if s.draining.Load() {
+			w.Header().Set("Docker-Distribution-API-Version", "registry/2.0")
+			http.Error(w, "agent shutting down", http.StatusServiceUnavailable)
+			return
+		}
+		h(w, r)
+	}
 }
 
 func (s *Server) handleHealthz(w http.ResponseWriter, _ *http.Request) {

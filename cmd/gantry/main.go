@@ -20,6 +20,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -260,8 +261,11 @@ func runAgent(args []string) error {
 	// pullerPump bridges inbound please_pull RPCs to the local origin
 	// puller (§5.2 step 7). The pump itself MUST NOT block the coord
 	// stream handler; the actual origin fetch + cache write + dht
-	// Provide all happen in a detached goroutine.
-	pullerPump := newPullerPump(inflightMap, originClient, cstore, disco, negCache, logger)
+	// Provide all happen in a detached goroutine. pullerPumpWG tracks
+	// outstanding goroutines so graceful shutdown can wait for
+	// dht.Provide calls to flush before disco.Close fires (§Phase 6).
+	var pullerPumpWG sync.WaitGroup
+	pullerPump := newPullerPump(inflightMap, originClient, cstore, disco, negCache, logger, &pullerPumpWG)
 	coordServer := coord.NewServer(cstore, memberView, inflightMap,
 		coord.WithLogger(logger),
 		coord.WithMetrics(coord.MetricsHooks{
@@ -416,38 +420,56 @@ func runAgent(args []string) error {
 	// the background; failures are logged but never fatal.
 	go announceCachedDigests(ctx, cstore.Digests(), disco, logger, p2)
 
-	// Phase 6 — readiness state. Members.WaitForSync may block on
-	// initial informer sync; we run it in the background and flip an
-	// atomic once it returns. /healthz checks this + DHT bootstrap.
+	// Phase 6 — readiness state. /readyz waits for three signals:
+	// (1) members informer initial sync, (2) DHT routing table
+	// non-empty, (3) cache scan complete. (3) is implicit because
+	// cache.Open() runs synchronously above, but we set a flag here
+	// so the relationship is explicit in the probe logic.
 	var (
 		membersReady atomic.Bool
+		cacheReady   atomic.Bool
 	)
+	cacheReady.Store(true)
 	go func() {
 		if err := memberView.WaitForSync(ctx); err == nil {
 			membersReady.Store(true)
 		}
 	}()
 
-	// Phase 6 — operations HTTP listener. Exposes Prometheus scrape
-	// at /metrics and liveness/readiness at /livez and /readyz.
+	readyCheck := func() (string, bool) {
+		if !cacheReady.Load() {
+			return "cache scan not complete", false
+		}
+		if !membersReady.Load() {
+			return "members informer not synced", false
+		}
+		if disco.RoutingTableSize() < 1 {
+			return "dht routing table empty", false
+		}
+		return "", true
+	}
+
+	// Phase 6 — operations HTTP listener. Per §Phase 6 plan,
+	// /healthz includes liveness + readiness; /livez is the pure
+	// liveness probe; /readyz is the pure readiness probe. Kubernetes
+	// conventions vary, so we expose all three.
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", reg.Handler())
 	mux.HandleFunc("/livez", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
 	})
-	// /healthz is an alias for /livez (Kubernetes convention).
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+		if reason, ok := readyCheck(); !ok {
+			http.Error(w, reason, http.StatusServiceUnavailable)
+			return
+		}
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
 	})
 	mux.HandleFunc("/readyz", func(w http.ResponseWriter, _ *http.Request) {
-		if !membersReady.Load() {
-			http.Error(w, "members informer not synced", http.StatusServiceUnavailable)
-			return
-		}
-		if disco.RoutingTableSize() < 1 {
-			http.Error(w, "dht routing table empty", http.StatusServiceUnavailable)
+		if reason, ok := readyCheck(); !ok {
+			http.Error(w, reason, http.StatusServiceUnavailable)
 			return
 		}
 		w.WriteHeader(http.StatusOK)
@@ -480,17 +502,26 @@ func runAgent(args []string) error {
 	}
 
 	// Graceful shutdown (§Phase 6). Order:
-	//   1. Mirror.Shutdown — stops accepting new mirror requests (new
-	//      connections get 503) and drains in-flight handlers, up to
-	//      the shutdown deadline.
-	//   2. Wait for cdsub.Run to return — gives any in-flight DHT
-	//      Provide call a chance to flush before libp2p is closed.
-	//   3. Transfer.Shutdown — drains in-flight peer transfers.
-	//   4. Ops endpoint (Shutdown) — last so /readyz can keep
+	//   1. Mirror.Drain() — every new /v2/ request immediately gets
+	//      503 so containerd's hosts.toml falls through to origin.
+	//      Does NOT close the listener yet — existing kubelet
+	//      connections need a chance to complete.
+	//   2. Transfer.Shutdown — drains in-flight peer transfers so a
+	//      requesting peer doesn't see its pull cut mid-stream.
+	//   3. Mirror.Shutdown — closes the listener, drains in-flight
+	//      handlers up to the shutdown deadline.
+	//   4. Wait for cdsub.Run + outstanding pull-pump Provide calls
+	//      to flush before libp2p is closed.
+	//   5. Ops endpoint (Shutdown) — last so /readyz can keep
 	//      reporting NotReady while we drain.
-	//   5. discovery.Close (deferred above) — closes the libp2p host.
+	//   6. discovery.Close (deferred above) — closes the libp2p
+	//      host; membersStop (deferred above) stops the informer.
 	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancelShutdown()
+	mirrorSrv.Drain()
+	if err := transferStop(shutdownCtx); err != nil {
+		logger.Warn("transfer shutdown error", slog.Any("err", err))
+	}
 	if err := mirrorStop(shutdownCtx); err != nil {
 		logger.Warn("mirror shutdown error", slog.Any("err", err))
 	}
@@ -501,8 +532,16 @@ func runAgent(args []string) error {
 	case <-shutdownCtx.Done():
 		logger.Warn("cdsub did not drain within shutdown budget")
 	}
-	if err := transferStop(shutdownCtx); err != nil {
-		logger.Warn("transfer shutdown error", slog.Any("err", err))
+	// §Phase 6: "flushes DHT Provide for any newly committed entries."
+	// runOriginPull goroutines own one inflight handle and one
+	// dht.Provide call each; pullerPumpWG counts them so we can let
+	// pending Provides flush before disco.Close fires below.
+	pumpDone := make(chan struct{})
+	go func() { pullerPumpWG.Wait(); close(pumpDone) }()
+	select {
+	case <-pumpDone:
+	case <-shutdownCtx.Done():
+		logger.Warn("puller-pump did not drain within shutdown budget")
 	}
 	if err := metricsHTTP.Shutdown(shutdownCtx); err != nil {
 		logger.Warn("metrics shutdown error", slog.Any("err", err))
@@ -861,7 +900,7 @@ func (a coldStartAdapter) Resolve(ctx context.Context, d digest.Digest, kind ifa
 //   - On terminal origin failure, the goroutine classifies via the
 //     *ifaces.OriginError wrapper and records the failure so the next
 //     pull_intent_query response surfaces recently_failed.
-func newPullerPump(infl *inflight.Map, originClient ifaces.OriginPuller, cstore ifaces.Cache, disco *discovery.Host, neg *negcache.Cache, logger *slog.Logger) coord.PullerPump {
+func newPullerPump(infl *inflight.Map, originClient ifaces.OriginPuller, cstore ifaces.Cache, disco *discovery.Host, neg *negcache.Cache, logger *slog.Logger, wg *sync.WaitGroup) coord.PullerPump {
 	lg := logger.With(slog.String("subsystem", "puller-pump"))
 	return func(_ context.Context, registry, repository string, d digest.Digest, kind ifaces.OriginRefKind) (time.Time, bool, *coord.NegativeEntry) {
 		// §5.8 short-circuit: if we're inside a cooldown window, refuse
@@ -884,8 +923,19 @@ func newPullerPump(infl *inflight.Map, originClient ifaces.OriginPuller, cstore 
 		}
 		// Detach the actual fetch from the stream handler. The pump
 		// returns immediately; the goroutine owns the inflight handle.
+		// wg lets graceful shutdown wait for the dht.Provide flush at
+		// the end of runOriginPull before closing the libp2p host
+		// (§Phase 6 graceful-shutdown contract).
 		startedAt := existing.StartedAt
-		go runOriginPull(originClient, cstore, disco, neg, lg, h, registry, repository, d, kind)
+		if wg != nil {
+			wg.Add(1)
+		}
+		go func() {
+			if wg != nil {
+				defer wg.Done()
+			}
+			runOriginPull(originClient, cstore, disco, neg, lg, h, registry, repository, d, kind)
+		}()
 		return startedAt, false, nil
 	}
 }
