@@ -80,6 +80,32 @@ func (b *ContainerdBlobSource) Open(ctx context.Context, d gdigest.Digest) (io.R
 	}, size, nil
 }
 
+// Has reports whether the containerd content store already has d
+// locally. Metadata-only — does NOT open a reader handle. The coord
+// pull_intent_query handler uses this to OR with the Gantry cache so
+// has_cached reflects effective local availability (a digest in the
+// containerd store is serveable to peers via Open, so advertising it
+// is honest).
+//
+// nil error + true: present.
+// nil error + false: definitively absent.
+// non-nil error: backend failure; caller MUST NOT roll into
+// has_cached=true (treat as unknown / absent).
+func (b *ContainerdBlobSource) Has(ctx context.Context, d gdigest.Digest) (bool, error) {
+	if b == nil || b.src == nil || b.src.client == nil {
+		return false, nil
+	}
+	ctx = namespaces.WithNamespace(ctx, b.src.namespace)
+	_, err := b.src.client.ContentStore().Info(ctx, godigest.Digest(d.String()))
+	if err != nil {
+		if errors.Is(err, cerrdefs.ErrNotFound) {
+			return false, nil
+		}
+		return false, fmt.Errorf("containerd blob source: Info: %w", err)
+	}
+	return true, nil
+}
+
 // readerAtCloser bundles a SectionReader (Read+Seek) with the
 // underlying content.ReaderAt's Close so the transfer endpoint can
 // type-assert io.ReadSeeker for Range serving while still releasing

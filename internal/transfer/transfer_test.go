@@ -268,6 +268,10 @@ func (f *fakeSecondary) Open(_ context.Context, d digest.Digest) (io.ReadCloser,
 	return io.NopCloser(strings.NewReader(string(f.body))), int64(len(f.body)), nil
 }
 
+func (f *fakeSecondary) Has(_ context.Context, d digest.Digest) (bool, error) {
+	return d.String() == f.digest.String(), nil
+}
+
 func TestSecondaryBlobSource_ServesOnCacheMiss(t *testing.T) {
 	cache := fakes.NewCache()
 	body := []byte("served from containerd content store")

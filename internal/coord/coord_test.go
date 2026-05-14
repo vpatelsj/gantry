@@ -2,6 +2,9 @@ package coord_test
 
 import (
 	"context"
+	"errors"
+	"io"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -469,3 +472,104 @@ func rep(c byte, n int) string {
 	}
 	return string(b)
 }
+
+// fakeSecondary mirrors the ifaces.SecondaryBlobSource shape with two
+// hits we control: a "secondary-only" digest the cache misses on but
+// the secondary serves, and a "miss-everywhere" digest both layers
+// drop. Exercises the pull_intent_query has_cached OR-of-cache-and-
+// secondary path added in Batch 24.
+type fakeSecondary struct {
+	have map[string]struct{}
+	err  error
+}
+
+func (f *fakeSecondary) Open(_ context.Context, d digest.Digest) (io.ReadCloser, int64, error) {
+	if _, ok := f.have[d.String()]; !ok {
+		return nil, 0, &ifaces.ErrNotFound{Digest: d}
+	}
+	return io.NopCloser(strings.NewReader("")), 0, nil
+}
+
+func (f *fakeSecondary) Has(_ context.Context, d digest.Digest) (bool, error) {
+	if f.err != nil {
+		return false, f.err
+	}
+	_, ok := f.have[d.String()]
+	return ok, nil
+}
+
+func TestPullIntent_SecondaryBlobSourceFlipsHasCached(t *testing.T) {
+	hClient, hServer := makeHostPair(t)
+	c, err := cache.Open(t.TempDir(), 1<<30)
+	if err != nil {
+		t.Fatalf("cache.Open: %v", err)
+	}
+	members := fakes.NewMembers(ifaces.NodeID(hServer.ID().String()),
+		ifaces.Node{ID: ifaces.NodeID(hServer.ID().String()), Addr: "x"},
+	)
+	infl := inflight.New(inflight.DefaultStalls(), nil)
+
+	secondaryOnly := digest.MustParse("sha256:" + rep('b', 64))
+	missEverywhere := digest.MustParse("sha256:" + rep('c', 64))
+
+	srv := coord.NewServer(c, members, infl,
+		coord.WithSecondaryBlobSource(&fakeSecondary{
+			have: map[string]struct{}{secondaryOnly.String(): {}},
+		}),
+	)
+	srv.Bind(hServer)
+
+	cli := coord.NewClient(hClient)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	t.Run("secondary hit flips has_cached", func(t *testing.T) {
+		intent, err := cli.PullIntentQuery(ctx, ifaces.NodeID(hServer.ID().String()), secondaryOnly)
+		if err != nil {
+			t.Fatalf("PullIntentQuery: %v", err)
+		}
+		if !intent.HasCached {
+			t.Error("HasCached = false, want true (cache miss but secondary has it)")
+		}
+	})
+
+	t.Run("both miss leaves has_cached false", func(t *testing.T) {
+		intent, err := cli.PullIntentQuery(ctx, ifaces.NodeID(hServer.ID().String()), missEverywhere)
+		if err != nil {
+			t.Fatalf("PullIntentQuery: %v", err)
+		}
+		if intent.HasCached {
+			t.Error("HasCached = true, want false (neither layer has it)")
+		}
+	})
+}
+
+func TestPullIntent_SecondaryErrorDoesNotFalselyClaimCached(t *testing.T) {
+	hClient, hServer := makeHostPair(t)
+	c, err := cache.Open(t.TempDir(), 1<<30)
+	if err != nil {
+		t.Fatalf("cache.Open: %v", err)
+	}
+	members := fakes.NewMembers(ifaces.NodeID(hServer.ID().String()),
+		ifaces.Node{ID: ifaces.NodeID(hServer.ID().String()), Addr: "x"},
+	)
+	infl := inflight.New(inflight.DefaultStalls(), nil)
+	srv := coord.NewServer(c, members, infl,
+		coord.WithSecondaryBlobSource(&fakeSecondary{err: errSecondaryBroken}),
+	)
+	srv.Bind(hServer)
+	cli := coord.NewClient(hClient)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	intent, err := cli.PullIntentQuery(ctx, ifaces.NodeID(hServer.ID().String()),
+		digest.MustParse("sha256:"+rep('d', 64)))
+	if err != nil {
+		t.Fatalf("PullIntentQuery: %v", err)
+	}
+	if intent.HasCached {
+		t.Error("HasCached = true on secondary backend error; must NOT roll error into has_cached=true (peer would then 404 on transfer)")
+	}
+}
+
+var errSecondaryBroken = errors.New("secondary backend failed")

@@ -97,6 +97,14 @@ type Server struct {
 	cache    ifaces.Cache
 	members  ifaces.Members
 	inflight *inflight.Map
+	// secondary is consulted in addition to cache when computing
+	// has_cached for pull_intent_query. Blobs that containerd already
+	// has but Gantry doesn't are serveable to peers via the transfer
+	// endpoint (see internal/transfer + ifaces.SecondaryBlobSource);
+	// advertising has_cached=true for them prevents the peer from
+	// kicking off a redundant please_pull or origin fetch. nil is
+	// fine and matches the Phase 1 behaviour (cache-only).
+	secondary ifaces.SecondaryBlobSource
 	// negCache is consulted by pull_intent_query to populate
 	// recently_failed / cooldown_until / failure_class. Phase 4 lands a
 	// real implementation; Phase 3 ships with a nil-safe call site so
@@ -158,6 +166,19 @@ func WithMetrics(h MetricsHooks) Option {
 // response just doesn't set recently_failed.
 func WithNegativeCache(n NegativeCache) Option {
 	return func(s *Server) { s.negCache = n }
+}
+
+// WithSecondaryBlobSource lets pull_intent_query treat a blob present
+// in the containerd content store (or any other ifaces.SecondaryBlobSource)
+// as locally available for has_cached purposes. Without this hop,
+// every blob containerd already had locally would still report
+// has_cached=false on the wire, defeating the cdsub origin-bandwidth-
+// amplification fix at the coordination layer. The transfer endpoint
+// already serves those blobs via Open; advertising them honestly to
+// peers closes the loop. nil disables the OR (Phase 1 cache-only
+// behaviour).
+func WithSecondaryBlobSource(src ifaces.SecondaryBlobSource) Option {
+	return func(s *Server) { s.secondary = src }
 }
 
 // WithPullerPump wires the please_pull handler to the local origin
@@ -293,9 +314,28 @@ func (s *Server) servePullIntent(ctx context.Context, req *coordv1.PullIntentReq
 
 	resp := &coordv1.PullIntentResponse{}
 
-	// has_cached
+	// has_cached. Effective local availability: blobs in Gantry's own
+	// cache OR in an optional SecondaryBlobSource (canonically the
+	// local containerd content store). Without the OR, blobs cdsub
+	// announced but Gantry never pulled would report has_cached=false
+	// on the wire, triggering redundant please_pull / origin fetches
+	// even though the transfer endpoint would already serve them.
 	if ok, err := s.cache.Has(ctx, d); err == nil && ok {
 		resp.HasCached = true
+	} else if s.secondary != nil {
+		// Cache miss (or cache.Has error): consult the secondary.
+		// nil-error + true is the only path that flips has_cached;
+		// a backend error here MUST NOT roll into has_cached=true
+		// because the peer would then issue a transfer fetch that
+		// also fails.
+		if ok, err := s.secondary.Has(ctx, d); err == nil && ok {
+			resp.HasCached = true
+		} else if err != nil {
+			s.logger.Debug("pull_intent: secondary.Has failed",
+				slog.String("digest", d.String()),
+				slog.Any("err", err),
+			)
+		}
 	}
 
 	// in_flight / started_at

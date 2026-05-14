@@ -308,7 +308,7 @@ func runAgent(args []string) error {
 	pullerPump := newPullerPump(inflightMap, originClient, cstore, disco, negCache, logger, &pullerPumpWG, func() {
 		p2.dhtProvideErr.WithLabelValues("origin_pull_announce").Inc()
 	})
-	coordServer := coord.NewServer(cstore, memberView, inflightMap,
+	coordOpts := []coord.Option{
 		coord.WithLogger(logger),
 		coord.WithMetrics(coord.MetricsHooks{
 			OnPullIntentServed:  func() { p3.coordPullIntentServed.Inc() },
@@ -318,7 +318,18 @@ func runAgent(args []string) error {
 		}),
 		coord.WithNegativeCache(negCacheAdapter{c: negCache}),
 		coord.WithPullerPump(pullerPump),
-	)
+	}
+	// Effective local availability: pull_intent_query OR's the Gantry
+	// cache with the optional secondary blob source (containerd's
+	// content store on Linux). Without this, every blob containerd
+	// pulled outside Gantry — which cdsub announces on the DHT —
+	// would report has_cached=false on the wire and trigger redundant
+	// please_pull / origin fetches even though the transfer endpoint
+	// would already serve them.
+	if secondaryBlobs != nil {
+		coordOpts = append(coordOpts, coord.WithSecondaryBlobSource(secondaryBlobs))
+	}
+	coordServer := coord.NewServer(cstore, memberView, inflightMap, coordOpts...)
 	coordServer.Bind(disco.LibP2P())
 
 	// Phase 3 cold-start orchestrator. Enabled whenever the real

@@ -293,22 +293,34 @@ type Coordinator interface {
 
 // SecondaryBlobSource is an optional read-only blob source consulted by
 // the peer-fetch transfer endpoint when the local cache returns
-// ErrNotFound. The canonical implementation wraps the local containerd
-// content store so that blobs containerd already pulled (and that the
-// cdsub source announced on the DHT) can be served to peers without
-// re-downloading them through the mirror.
+// ErrNotFound, and by the coord pull_intent_query handler when computing
+// effective local availability. The canonical implementation wraps the
+// local containerd content store so that blobs containerd already
+// pulled (and that the cdsub source announced on the DHT) can be
+// served to peers without re-downloading them through the mirror.
 //
 // Without this hop, cdsub.Source announces presence of a digest the
 // transfer endpoint then 404s on — peers fetch nothing useful and the
 // origin-pull-bandwidth-amplification problem isn't actually solved.
+// Similarly, pull_intent_query that consulted only the Gantry cache
+// would advertise has_cached=false for digests containerd already has,
+// triggering redundant please_pull / origin fetches.
 //
 // Implementations MUST verify the digest of returned bytes (the
 // containerd content store already maintains digest integrity, but a
-// custom backend would need its own check). Returns *ErrNotFound when
-// the digest is not locally present so the transfer endpoint can
+// custom backend would need its own check). Open returns *ErrNotFound
+// when the digest is not locally present so the transfer endpoint can
 // distinguish miss from error.
+//
+// Has is a metadata-only existence check used by pull_intent_query.
+// It MUST NOT open a streaming reader; the containerd impl uses
+// content.Store.Info() which is a single map lookup. A nil error and
+// false return signals "definitively absent"; a non-nil error means
+// the backend itself failed (the caller should treat this as "do not
+// claim local availability" without rolling it into has_cached=true).
 type SecondaryBlobSource interface {
 	Open(ctx context.Context, d digest.Digest) (io.ReadCloser, int64, error)
+	Has(ctx context.Context, d digest.Digest) (bool, error)
 }
 
 // ErrNotFound is returned by Cache and PeerDialer to signal a digest is not
