@@ -50,9 +50,10 @@ const MirroredHeader = "Gantry-Mirrored"
 
 // Server serves peer-fetch requests from the local cache.
 type Server struct {
-	cache   ifaces.Cache
-	logger  *slog.Logger
-	metrics metricsHooks
+	cache     ifaces.Cache
+	secondary ifaces.SecondaryBlobSource
+	logger    *slog.Logger
+	metrics   metricsHooks
 }
 
 type metricsHooks struct {
@@ -76,6 +77,18 @@ func WithLogger(l *slog.Logger) Option {
 func WithMetrics(onPeerServe, onPeerMiss func()) Option {
 	return func(s *Server) {
 		s.metrics = metricsHooks{onPeerServe: onPeerServe, onPeerMiss: onPeerMiss}
+	}
+}
+
+// WithSecondaryBlobSource registers a fallback blob source consulted on
+// cache miss. The canonical implementation reads from containerd's
+// content store so that digests announced by the cdsub Source are
+// actually serveable to peers (otherwise cdsub announces phantom
+// providers and peers 404 on the transfer endpoint). When nil, a cache
+// miss returns 404 directly.
+func WithSecondaryBlobSource(src ifaces.SecondaryBlobSource) Option {
+	return func(s *Server) {
+		s.secondary = src
 	}
 }
 
@@ -150,7 +163,7 @@ func (s *Server) handleV2(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) serveDigest(w http.ResponseWriter, r *http.Request, d digest.Digest) {
-	rc, size, err := s.cache.Open(r.Context(), d)
+	rc, size, err := s.openBlob(r.Context(), d)
 	if err != nil {
 		var enf *ifaces.ErrNotFound
 		if errors.As(err, &enf) {
@@ -223,6 +236,47 @@ func (s *Server) bumpServe() {
 	if s.metrics.onPeerServe != nil {
 		s.metrics.onPeerServe()
 	}
+}
+
+// openBlob consults the cache first; on ErrNotFound, falls back to the
+// optional SecondaryBlobSource (typically the containerd content
+// store, wired by main.go when the cdsub source is enabled). Any other
+// cache error is returned as-is — we don't paper over real I/O
+// failures by silently retrying the secondary.
+//
+// This is the fix for the cdsub-announces-but-transfer-404s mismatch:
+// the Source registers Provider records for digests in containerd's
+// content store, but the transfer endpoint only knew about Gantry's
+// own cache. Peers would dial in, get a 404, and the announcement
+// became misinformation.
+func (s *Server) openBlob(ctx context.Context, d digest.Digest) (io.ReadCloser, int64, error) {
+	rc, size, err := s.cache.Open(ctx, d)
+	if err == nil {
+		return rc, size, nil
+	}
+	var enf *ifaces.ErrNotFound
+	if !errors.As(err, &enf) {
+		return nil, 0, err
+	}
+	if s.secondary == nil {
+		return nil, 0, err
+	}
+	rc2, size2, err2 := s.secondary.Open(ctx, d)
+	if err2 == nil {
+		return rc2, size2, nil
+	}
+	// Whether the secondary reports ErrNotFound or another error, we
+	// hand the original cache ErrNotFound back. Callers above only
+	// branch on Not-Found vs error; the secondary is opportunistic.
+	var enf2 *ifaces.ErrNotFound
+	if errors.As(err2, &enf2) {
+		return nil, 0, err
+	}
+	s.logger.Debug("transfer: secondary blob source error; reporting miss",
+		slog.String("digest", d.String()),
+		slog.Any("err", err2),
+	)
+	return nil, 0, err
 }
 
 // parseSingleRange parses an RFC 7233 single-range header like

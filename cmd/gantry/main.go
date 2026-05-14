@@ -197,15 +197,27 @@ func runAgent(args []string) error {
 	}
 	defer func() { _ = cstore.Close() }()
 
-	// Phase 2 — peer dialer + transfer endpoint.
+	// Phase 2 — peer dialer + transfer endpoint. The cdsub source is
+	// constructed early so the transfer endpoint can read blobs out
+	// of containerd's content store on cache miss; without this hop
+	// peers receive DHT announcements for digests cdsub knows about
+	// but the transfer endpoint then 404s on them, defeating the
+	// whole point of cdsub-driven advertisement.
 	peerClient := transfer.NewClient()
-	transferSrv := transfer.New(cstore,
+	cdsubSrc := newCdsubSource(c, logger)
+	secondaryBlobs := cdsubBlobSource(cdsubSrc)
+	transferOpts := []transfer.Option{
 		transfer.WithLogger(logger),
 		transfer.WithMetrics(
 			func() { p2.peerServe.Inc() },
 			func() { p2.peerMiss.Inc() },
 		),
-	)
+	}
+	if secondaryBlobs != nil {
+		transferOpts = append(transferOpts, transfer.WithSecondaryBlobSource(secondaryBlobs))
+		logger.Info("transfer: containerd content store wired as secondary blob source")
+	}
+	transferSrv := transfer.New(cstore, transferOpts...)
 	transferStop, err := transferSrv.ListenAndServe(c.TransferListen)
 	if err != nil {
 		return fmt.Errorf("transfer listen: %w", err)
@@ -440,12 +452,9 @@ func runAgent(args []string) error {
 	}
 	logger.Info("mirror endpoint listening", slog.String("addr", c.MirrorListen))
 
-	// Phase 2 — cdsub announce loop. The platform-specific selector in
-	// cdsub_source_{linux,other}.go returns the real containerd source
-	// on linux (when ContainerdSocket is reachable) and NoOpSource
-	// otherwise; the Subscriber loop handles either uniformly via the
-	// ImageSource interface.
-	cdsubSrc := newCdsubSource(c, logger)
+	// Phase 2 — cdsub announce loop. cdsubSrc was constructed above
+	// (see the transfer-endpoint block) so the transfer endpoint can
+	// chain into the same containerd content store on cache miss.
 	cdSub := cdsub.New(cdsubSrc, disco,
 		cdsub.WithLogger(logger),
 		cdsub.WithMetrics(

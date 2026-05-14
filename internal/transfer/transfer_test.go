@@ -1,6 +1,7 @@
 package transfer
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"io"
@@ -10,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/gantry/gantry/internal/digest"
+	"github.com/gantry/gantry/internal/ifaces"
 	"github.com/gantry/gantry/internal/ifaces/fakes"
 )
 
@@ -248,5 +250,88 @@ func TestMethodNotAllowed(t *testing.T) {
 	}
 	if got := resp.Header.Get("Allow"); got != "GET, HEAD" {
 		t.Errorf("Allow header = %q, want GET, HEAD", got)
+	}
+}
+
+// fakeSecondary is a SecondaryBlobSource that returns a fixed body for
+// one digest and *ErrNotFound for everything else, used to assert the
+// transfer server's miss → secondary fallback (Batch 19 / review #5).
+type fakeSecondary struct {
+	digest digest.Digest
+	body   []byte
+}
+
+func (f *fakeSecondary) Open(_ context.Context, d digest.Digest) (io.ReadCloser, int64, error) {
+	if d.String() != f.digest.String() {
+		return nil, 0, &ifaces.ErrNotFound{Digest: d}
+	}
+	return io.NopCloser(strings.NewReader(string(f.body))), int64(len(f.body)), nil
+}
+
+func TestSecondaryBlobSource_ServesOnCacheMiss(t *testing.T) {
+	cache := fakes.NewCache()
+	body := []byte("served from containerd content store")
+	d := mustDigest(body)
+	// Deliberately NOT calling cache.Put — the cache misses, the
+	// secondary must serve.
+	served := 0
+	missed := 0
+	s := New(cache,
+		WithMetrics(func() { served++ }, func() { missed++ }),
+		WithSecondaryBlobSource(&fakeSecondary{digest: d, body: body}),
+	)
+	ts := httptest.NewServer(s.Handler())
+	t.Cleanup(ts.Close)
+
+	req, _ := http.NewRequest(http.MethodGet, ts.URL+"/v2/myrepo/blobs/"+d.String(), nil)
+	req.Header.Set(MirroredHeader, "1")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (secondary should serve)", resp.StatusCode)
+	}
+	got, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	if string(got) != string(body) {
+		t.Errorf("body = %q, want %q", got, body)
+	}
+	if served != 1 {
+		t.Errorf("served counter = %d, want 1 (secondary hit still bumps peer-serve)", served)
+	}
+	if missed != 0 {
+		t.Errorf("missed counter = %d, want 0 (secondary covered the miss)", missed)
+	}
+}
+
+func TestSecondaryBlobSource_404WhenBothMiss(t *testing.T) {
+	cache := fakes.NewCache()
+	body := []byte("not in cache, not in secondary either")
+	d := mustDigest(body)
+	otherD := mustDigest([]byte("something else entirely"))
+	missed := 0
+	s := New(cache,
+		WithMetrics(nil, func() { missed++ }),
+		WithSecondaryBlobSource(&fakeSecondary{digest: otherD, body: []byte("x")}),
+	)
+	ts := httptest.NewServer(s.Handler())
+	t.Cleanup(ts.Close)
+
+	req, _ := http.NewRequest(http.MethodGet, ts.URL+"/v2/myrepo/blobs/"+d.String(), nil)
+	req.Header.Set(MirroredHeader, "1")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("status = %d, want 404 (both layers miss)", resp.StatusCode)
+	}
+	if missed != 1 {
+		t.Errorf("missed counter = %d, want 1", missed)
 	}
 }

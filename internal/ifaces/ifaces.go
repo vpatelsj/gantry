@@ -291,6 +291,26 @@ type Coordinator interface {
 // Errors.
 // ---------------------------------------------------------------------------
 
+// SecondaryBlobSource is an optional read-only blob source consulted by
+// the peer-fetch transfer endpoint when the local cache returns
+// ErrNotFound. The canonical implementation wraps the local containerd
+// content store so that blobs containerd already pulled (and that the
+// cdsub source announced on the DHT) can be served to peers without
+// re-downloading them through the mirror.
+//
+// Without this hop, cdsub.Source announces presence of a digest the
+// transfer endpoint then 404s on — peers fetch nothing useful and the
+// origin-pull-bandwidth-amplification problem isn't actually solved.
+//
+// Implementations MUST verify the digest of returned bytes (the
+// containerd content store already maintains digest integrity, but a
+// custom backend would need its own check). Returns *ErrNotFound when
+// the digest is not locally present so the transfer endpoint can
+// distinguish miss from error.
+type SecondaryBlobSource interface {
+	Open(ctx context.Context, d digest.Digest) (io.ReadCloser, int64, error)
+}
+
 // ErrNotFound is returned by Cache and PeerDialer to signal a digest is not
 // locally available. Distinct from transport-level errors so callers can
 // distinguish "fall back to next provider" from "definitively missing here".
