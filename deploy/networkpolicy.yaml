@@ -47,12 +47,25 @@ spec:
           port: 4001
         - protocol: UDP
           port: 4001
-    # Metrics + healthz scraped by Prometheus / Kubernetes from the
-    # monitoring namespace.
+    # Metrics + healthz scraped by Prometheus from the monitoring
+    # namespace AND probed by kubelet from the node itself. Kubelet
+    # liveness/readiness traffic is sourced from the node IP, not from
+    # a labeled namespace, so a namespaceSelector-only rule strands the
+    # DaemonSet in NotReady on strict CNIs (Calico with
+    # disableNamespaceSelector, strict Cilium policies, etc.).
+    #
+    # The ipBlock 0.0.0.0/0 is the kubelet-permissive default; operators
+    # who want tighter scoping should replace it with their node CIDR
+    # (kubectl get nodes -o jsonpath='{.items[*].status.addresses[?(@.type=="InternalIP")].address}').
+    # The Prometheus rule is kept as a documented selector so monitoring
+    # stacks living in non-default-CIDR namespaces don't depend on the
+    # broader ipBlock if it's later tightened.
     - from:
         - namespaceSelector:
             matchLabels:
               kubernetes.io/metadata.name: monitoring
+        - ipBlock:
+            cidr: 0.0.0.0/0
       ports:
         - protocol: TCP
           port: 9095

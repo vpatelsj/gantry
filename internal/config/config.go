@@ -59,7 +59,12 @@ type Config struct {
 	// restricts inter-node visibility; the agent itself binds 0.0.0.0.
 	TransferListen string `yaml:"transfer_listen"`
 
-	// MetricsListen is the Prometheus scrape endpoint (§7.6).
+	// MetricsListen is the Prometheus scrape endpoint and /readyz /livez
+	// kubelet-probe target (§7.6). Default is 0.0.0.0:9095 because both
+	// Prometheus (off-node) and the kubelet (off-pod, node-IP source)
+	// need to reach it — a loopback default would silently break the
+	// DaemonSet's readiness gate. Access control belongs in NetworkPolicy
+	// and pod ports, not in the bind address.
 	MetricsListen string `yaml:"metrics_listen"`
 
 	// Libp2pListen is the multiaddr(s) the libp2p host advertises (§7.2).
@@ -229,7 +234,7 @@ func NewDefault() *Config {
 		MirrorListen:               "127.0.0.1:5000",
 		MirrorBindAllowNonLoopback: false,
 		TransferListen:             "0.0.0.0:5001",
-		MetricsListen:              "127.0.0.1:9095",
+		MetricsListen:              "0.0.0.0:9095",
 		Libp2pListen:               nil,
 		Libp2pIdentityPath:         "/var/lib/gantry/libp2p.key",
 
