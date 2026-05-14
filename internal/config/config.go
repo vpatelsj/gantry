@@ -154,9 +154,17 @@ type Config struct {
 
 	// ContainerdSocket is the path to the containerd gRPC API socket
 	// that the cdsub subsystem dials to discover locally-cached images
-	// and announce them on the DHT (§5.4 image-event → Provide loop).
-	// Empty disables the containerd source (cdsub becomes a no-op,
-	// which is the only sensible mode on non-linux build hosts).
+	// and announce them on the DHT (§5.4 image-event → Provide loop),
+	// and that the transfer endpoint reads from on cache miss to serve
+	// peers without a re-download.
+	//
+	// Default is empty (""): operators must explicitly opt in by
+	// setting `containerd_socket` in the ConfigMap or
+	// GANTRY_CONTAINERD_SOCKET in the environment. The default deploy
+	// manifests set it to "/run/containerd/containerd.sock". Leaving
+	// it empty disables the containerd source entirely (cdsub becomes
+	// a no-op, transfer's secondary blob source becomes nil) — the
+	// agent still serves peer fetches out of its own cache.
 	ContainerdSocket string `yaml:"containerd_socket"`
 
 	// ContainerdNamespace is the containerd namespace cdsub watches.
@@ -272,7 +280,7 @@ func NewDefault() *Config {
 		CacheForcedEvictionHeadroomPct: 5,
 		EvictionProviderCountThreshold: 3,
 
-		ContainerdSocket:    "/run/containerd/containerd.sock",
+		ContainerdSocket:    "",
 		ContainerdNamespace: "k8s.io",
 
 		UpstreamRegistries: nil,

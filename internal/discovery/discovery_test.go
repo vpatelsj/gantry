@@ -61,7 +61,7 @@ func TestHostBringUpEphemeral(t *testing.T) {
 		t.Error("no listen addrs")
 	}
 	if got, want := h.Health(), 1.0; got != want {
-		t.Errorf("Health() = %v, want %v (Phase 2 stub)", got, want)
+		t.Errorf("Health() = %v, want %v (no monitor wired in test mode)", got, want)
 	}
 }
 

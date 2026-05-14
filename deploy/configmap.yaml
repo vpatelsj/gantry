@@ -50,9 +50,13 @@ data:
     eviction_provider_count_threshold: 3
 
     # ---------- containerd integration (cdsub, §5.4) ----------
-    # Path to the host's containerd gRPC socket. Set to "" to disable
-    # the cdsub source entirely (the agent will still serve peer
-    # fetches; it just won't announce locally-cached images).
+    # Path to the host's containerd gRPC socket. Required to enable
+    # the cdsub announce loop AND the transfer endpoint's secondary
+    # blob source that serves digests directly from containerd's
+    # content store on cache miss. Set to "" to disable the
+    # containerd integration entirely (the agent will still serve
+    # peer fetches from its own cache; it just won't announce or
+    # serve containerd-only digests).
     containerd_socket: "/run/containerd/containerd.sock"
     # Containerd namespace cdsub watches. "k8s.io" is what kubelet
     # uses; switch to "moby" for Docker-managed images.

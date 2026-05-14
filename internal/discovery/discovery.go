@@ -17,14 +17,17 @@
 // Phase 2 scope:
 //
 //   - Host + DHT bring-up, Provide / FindProviders.
-//   - Health() returns 1.0 as a stub; the real geometric-mean health score
-//     (routing-table coverage, p95 lookup latency, self-test) lands in
-//     Phase 5 (internal/discovery/health.go).
-//   - Bootstrap pulls from the operator-supplied `Libp2pBootstrapPeers`
-//     static list. Dynamic bootstrap from K8s pod annotations is a planned
-//     follow-up (the protocol is: agents publish their own peer.AddrInfo
-//     on a pod annotation at startup; Members surfaces it; this package
-//     dials from that pool with the §7.2 8/5/32 cascade).
+//   - Health() returns the geometric-mean health score from
+//     internal/discovery/health.go (routing-table coverage, p95
+//     lookup latency, self-test success rate); in test mode where
+//     no Monitor is wired it returns 1.0.
+//   - Bootstrap pulls from operator-supplied `Libp2pBootstrapPeers`
+//     plus the dynamic K8s pod-annotation pool (see
+//     cmd/gantry/main.go announceSelfAndBootstrap): every Gantry
+//     pod self-patches its peer.AddrInfo on `gantry.io/p2p-addrs`,
+//     Members surfaces those entries via SnapshotForBootstrap, and
+//     this package's ConnectPeers dials them with the §7.2
+//     8/5/32 cascade.
 package discovery
 
 import (
@@ -241,8 +244,9 @@ func (h *Host) PeerID() peer.ID { return h.h.ID() }
 // Addrs returns the libp2p listen multiaddrs (host-local view).
 func (h *Host) Addrs() []multiaddr.Multiaddr { return h.h.Addrs() }
 
-// LibP2P returns the underlying libp2p host. Reserved for Phase 3
-// coord-stream wiring.
+// LibP2P returns the underlying libp2p host. Used by the Phase 3
+// coord-stream wiring (internal/coord) to attach the gRPC-over-libp2p
+// stream handler to the same host that runs the DHT.
 func (h *Host) LibP2P() host.Host { return h.h }
 
 // ConnectPeers dials a set of multiaddr strings in parallel with a 5s
