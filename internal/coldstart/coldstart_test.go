@@ -700,7 +700,8 @@ func TestTopKExpansionFactor_AllUnreachable(t *testing.T) {
 }
 
 // TestTopKExpansion_DegradedReason asserts OnTopKExpansion fires with
-// reason="degraded" on the rule-6 path (rule 7 + DHT health < 0.5).
+// reason="degraded_health" on the rule-6 path (rule 7 + DHT health
+// in the §7.7 Degraded band [0.3, 0.7)).
 func TestTopKExpansion_DegradedReason(t *testing.T) {
 	d := digest.MustParse("sha256:" + rep('5', 64))
 	nodes := make([]ifaces.Node, 8)
@@ -726,7 +727,7 @@ func TestTopKExpansion_DegradedReason(t *testing.T) {
 	if _, err := r.Resolve(context.Background(), d, ifaces.KindManifest, "reg.example.com", "test/repo", 0); err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
-	if len(reasons) != 1 || reasons[0] != "degraded" {
-		t.Errorf("OnTopKExpansion reasons = %v; want [degraded]", reasons)
+	if len(reasons) != 1 || reasons[0] != "degraded_health" {
+		t.Errorf("OnTopKExpansion reasons = %v; want [degraded_health]", reasons)
 	}
 }

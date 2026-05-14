@@ -229,7 +229,9 @@ func (r *Resolver) Resolve(ctx context.Context, d digest.Digest, kind ifaces.Ori
 	// Rules 5/6: expansion to 2K. These apply when:
 	//   - rule 5: probe returned ErrNoReachable (no reachable top-K).
 	//   - rule 6: probe returned ErrAllNeitherCachedNorInFlight AND
-	//     DHT health is below the §7.7 degraded threshold (we use 0.5).
+	//     DHT health is below the §7.7 Healthy threshold (0.7).
+	//     Below 0.3 the health is "Unhealthy" per §7.7 and the
+	//     expansion reason is distinguished from "Degraded".
 	expand := false
 	expandReason := ""
 	expandMetricReason := ""
@@ -238,10 +240,17 @@ func (r *Resolver) Resolve(ctx context.Context, d digest.Digest, kind ifaces.Ori
 		expand = true
 		expandReason = "rule5_all_unreachable"
 		expandMetricReason = "all_unreachable"
-	case errors.Is(err, errAllNeither) && r.opts.Discovery.Health() < 0.5:
-		expand = true
-		expandReason = "rule6_degraded_expand"
-		expandMetricReason = "degraded"
+	case errors.Is(err, errAllNeither):
+		health := r.opts.Discovery.Health()
+		if health < 0.7 {
+			expand = true
+			expandReason = "rule6_degraded_expand"
+			if health < 0.3 {
+				expandMetricReason = "unhealthy_health"
+			} else {
+				expandMetricReason = "degraded_health"
+			}
+		}
 	}
 	if expand {
 		factor := r.opts.TopKExpansionFactor

@@ -11,7 +11,7 @@
 //     we have one peer.
 //
 //  2. **Lookup latency**: p95 of FindProviders latencies over a 5-min
-//     rolling window. <500ms → 1.0; >5s → 0.0; linear in between.
+//     rolling window. <200ms → 1.0; >5s → 0.0; linear in between.
 //
 //  3. **Self-test success rate**: success/(success+failure) of the
 //     last N (default 10) periodic Provide(self_id) → FindProviders
@@ -54,10 +54,12 @@ type MonitorOptions struct {
 	// routing table. Required.
 	RoutingTableSize func() int
 
-	// RoutingTableTarget is the expected steady-state routing-table
-	// size (typically `cluster_size - 1`). When non-positive the
-	// routing-table component contributes 1.0 (no signal).
-	RoutingTableTarget int
+	// RoutingTableTarget returns the expected steady-state
+	// routing-table size, computed per §7.7 as
+	// `min(informer_node_count, kademlia_max_routing_table_size)`.
+	// Nil or a return value <= 0 disables the routing-table
+	// component (it contributes 1.0).
+	RoutingTableTarget func() int
 
 	// LatencyWindow is the rolling window for p95 lookup latency.
 	// Defaults to 5min (§7.7).
@@ -65,7 +67,7 @@ type MonitorOptions struct {
 
 	// LatencyFloor and LatencyCeiling bound the linear-interpolation
 	// region for the latency component. p95 ≤ floor → 1.0; ≥ ceiling
-	// → 0.0. Defaults: 500ms / 5s.
+	// → 0.0. Defaults: 200ms / 5s (§7.7).
 	LatencyFloor   time.Duration
 	LatencyCeiling time.Duration
 
@@ -105,7 +107,7 @@ func NewMonitor(opts MonitorOptions) *Monitor {
 		opts.LatencyWindow = 5 * time.Minute
 	}
 	if opts.LatencyFloor <= 0 {
-		opts.LatencyFloor = 500 * time.Millisecond
+		opts.LatencyFloor = 200 * time.Millisecond
 	}
 	if opts.LatencyCeiling <= 0 || opts.LatencyCeiling <= opts.LatencyFloor {
 		opts.LatencyCeiling = 5 * time.Second
@@ -132,6 +134,17 @@ func (m *Monitor) ObserveLatency(d time.Duration) {
 	defer m.mu.Unlock()
 	m.latencies = append(m.latencies, latencySample{at: now, d: d})
 	m.evictOldLatenciesLocked(now)
+}
+
+// SetRoutingTableTarget swaps the routing-table-target closure
+// atomically. Used by main to wire the membership-derived target
+// (§7.7's `min(informer_node_count, kademlia_max_routing_table_size)`)
+// after the informer has come online, since Monitor is constructed
+// before memberView in discovery.New.
+func (m *Monitor) SetRoutingTableTarget(fn func() int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.opts.RoutingTableTarget = fn
 }
 
 // RecordSelfTest stores the outcome of one self-test cycle.
@@ -184,15 +197,18 @@ func (m *Monitor) State() string {
 //   - now-started < bootstrapWindow, OR
 //   - routing-table size < (routingTableTarget × bootstrapRoutingTablePct / 100).
 //
-// When RoutingTableTarget is zero (no known cluster size), only the
-// time component is consulted.
+// When RoutingTableTarget is nil or returns 0 (no known cluster
+// size), only the time component is consulted.
 func (m *Monitor) InBootstrapWindow(bootstrapWindow time.Duration, bootstrapRoutingTablePct int) bool {
 	now := m.opts.Now()
 	if bootstrapWindow > 0 && now.Sub(m.started) < bootstrapWindow {
 		return true
 	}
-	if m.opts.RoutingTableTarget > 0 && m.opts.RoutingTableSize != nil && bootstrapRoutingTablePct > 0 {
-		threshold := (m.opts.RoutingTableTarget * bootstrapRoutingTablePct) / 100
+	m.mu.Lock()
+	target := m.routingTableTargetLocked()
+	m.mu.Unlock()
+	if target > 0 && m.opts.RoutingTableSize != nil && bootstrapRoutingTablePct > 0 {
+		threshold := (target * bootstrapRoutingTablePct) / 100
 		if threshold < 1 {
 			threshold = 1
 		}
@@ -203,17 +219,28 @@ func (m *Monitor) InBootstrapWindow(bootstrapWindow time.Duration, bootstrapRout
 	return false
 }
 
+// routingTableTargetLocked reads the current target value from the
+// closure (if set). Returns 0 when no source is wired, which
+// disables the routing-table component. Caller must hold m.mu.
+func (m *Monitor) routingTableTargetLocked() int {
+	if m.opts.RoutingTableTarget == nil {
+		return 0
+	}
+	return m.opts.RoutingTableTarget()
+}
+
 // routingCoverageLocked computes the routing-table component. With
 // no callback or zero target, returns 1.0 (no signal).
 func (m *Monitor) routingCoverageLocked() float64 {
-	if m.opts.RoutingTableSize == nil || m.opts.RoutingTableTarget <= 0 {
+	target := m.routingTableTargetLocked()
+	if m.opts.RoutingTableSize == nil || target <= 0 {
 		return 1.0
 	}
 	size := m.opts.RoutingTableSize()
 	if size <= 0 {
 		return 0.0
 	}
-	ratio := float64(size) / float64(m.opts.RoutingTableTarget)
+	ratio := float64(size) / float64(target)
 	if ratio > 1.0 {
 		ratio = 1.0
 	}

@@ -197,6 +197,22 @@ func runAgent(args []string) error {
 	memberView, membersStop := buildMembers(ctx, c, disco, logger)
 	defer membersStop()
 
+	// Phase 5 — wire the routing-table target now that memberView is
+	// online. §7.7 defines target = min(informer_node_count,
+	// kademlia_max_routing_table_size); the constant cap of 256 is
+	// derived from kad-dht's bucket-size 20 × log2(10000) ≈ 266 and
+	// rounded down. Read live on every score call.
+	const kademliaMaxRoutingTable = 256
+	if monitor := disco.Monitor(); monitor != nil {
+		monitor.SetRoutingTableTarget(func() int {
+			sz := len(memberView.Snapshot())
+			if sz > kademliaMaxRoutingTable {
+				return kademliaMaxRoutingTable
+			}
+			return sz
+		})
+	}
+
 	// Phase 3 — in-flight map + coord client + coord server + metrics.
 	inflightMap := inflight.New(inflight.DefaultStalls(), nil)
 	p3 := newPhase3Metrics(reg, inflightMap)

@@ -15,7 +15,7 @@ import (
 func TestMonitor_EmptyWindowScores1(t *testing.T) {
 	m := discovery.NewMonitor(discovery.MonitorOptions{
 		RoutingTableSize:   func() int { return 0 },
-		RoutingTableTarget: 0, // no signal
+		RoutingTableTarget: nil, // no signal
 	})
 	if s := m.Score(); s != 1.0 {
 		t.Fatalf("empty monitor: score = %v; want 1.0", s)
@@ -45,7 +45,7 @@ func TestMonitor_RoutingTableRatio(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			m := discovery.NewMonitor(discovery.MonitorOptions{
 				RoutingTableSize:   func() int { return tt.size },
-				RoutingTableTarget: tt.target,
+				RoutingTableTarget: func() int { return tt.target },
 			})
 			s := m.Score()
 			if s < tt.minScore || s > tt.maxScore {
@@ -61,7 +61,7 @@ func TestMonitor_RoutingTableRatio(t *testing.T) {
 func TestMonitor_LatencyScore(t *testing.T) {
 	m := discovery.NewMonitor(discovery.MonitorOptions{
 		RoutingTableSize:   func() int { return 100 },
-		RoutingTableTarget: 100, // pin rt component at 1.0
+		RoutingTableTarget: func() int { return 100 }, // pin rt component at 1.0
 	})
 
 	// 20 samples all at 100ms → p95 = 100ms → latency score 1.0.
@@ -78,7 +78,7 @@ func TestMonitor_LatencyScore(t *testing.T) {
 func TestMonitor_LatencyHighP95Scores0(t *testing.T) {
 	m := discovery.NewMonitor(discovery.MonitorOptions{
 		RoutingTableSize:   func() int { return 100 },
-		RoutingTableTarget: 100,
+		RoutingTableTarget: func() int { return 100 },
 	})
 	for i := 0; i < 20; i++ {
 		m.ObserveLatency(6 * time.Second)
@@ -99,7 +99,7 @@ func TestMonitor_LatencyWindowEviction(t *testing.T) {
 	m := discovery.NewMonitor(discovery.MonitorOptions{
 		Now:                func() time.Time { return clock },
 		RoutingTableSize:   func() int { return 100 },
-		RoutingTableTarget: 100,
+		RoutingTableTarget: func() int { return 100 },
 		LatencyWindow:      1 * time.Minute,
 	})
 
@@ -126,7 +126,7 @@ func TestMonitor_LatencyWindowEviction(t *testing.T) {
 func TestMonitor_SelfTestRatio(t *testing.T) {
 	m := discovery.NewMonitor(discovery.MonitorOptions{
 		RoutingTableSize:   func() int { return 100 },
-		RoutingTableTarget: 100,
+		RoutingTableTarget: func() int { return 100 },
 		SelfTestWindow:     10,
 	})
 	// 7 successes, 3 failures → 0.7 ratio.
@@ -149,7 +149,7 @@ func TestMonitor_SelfTestRatio(t *testing.T) {
 func TestMonitor_SelfTestWindowSlides(t *testing.T) {
 	m := discovery.NewMonitor(discovery.MonitorOptions{
 		RoutingTableSize:   func() int { return 100 },
-		RoutingTableTarget: 100,
+		RoutingTableTarget: func() int { return 100 },
 		SelfTestWindow:     5,
 	})
 	// 5 failures fills the window with 0.0.
@@ -186,7 +186,7 @@ func TestMonitor_StateThresholds(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			m := discovery.NewMonitor(discovery.MonitorOptions{
 				RoutingTableSize:   func() int { return 100 },
-				RoutingTableTarget: 100,
+				RoutingTableTarget: func() int { return 100 },
 				SelfTestWindow:     20,
 			})
 			for i := 0; i < tt.successCnt; i++ {
@@ -205,7 +205,7 @@ func TestMonitor_StateThresholds(t *testing.T) {
 	// Direct threshold checks:
 	mHealthy := discovery.NewMonitor(discovery.MonitorOptions{
 		RoutingTableSize:   func() int { return 100 },
-		RoutingTableTarget: 100,
+		RoutingTableTarget: func() int { return 100 },
 	})
 	if mHealthy.State() != "healthy" {
 		t.Fatalf("perfect monitor: state=%q; want healthy", mHealthy.State())
@@ -213,7 +213,7 @@ func TestMonitor_StateThresholds(t *testing.T) {
 
 	mUnhealthy := discovery.NewMonitor(discovery.MonitorOptions{
 		RoutingTableSize:   func() int { return 1 }, // 1% of 100
-		RoutingTableTarget: 100,
+		RoutingTableTarget: func() int { return 100 },
 	})
 	if mUnhealthy.State() != "unhealthy" {
 		t.Fatalf("1%% rt: state=%q; want unhealthy", mUnhealthy.State())
@@ -227,7 +227,7 @@ func TestMonitor_BootstrapWindowTime(t *testing.T) {
 	m := discovery.NewMonitor(discovery.MonitorOptions{
 		Now:                func() time.Time { return clock },
 		RoutingTableSize:   func() int { return 100 }, // saturated
-		RoutingTableTarget: 100,
+		RoutingTableTarget: func() int { return 100 },
 	})
 	if !m.InBootstrapWindow(30*time.Second, 25) {
 		t.Fatalf("t=0: expected InBootstrapWindow=true")
@@ -247,7 +247,7 @@ func TestMonitor_BootstrapWindowRoutingTable(t *testing.T) {
 	m := discovery.NewMonitor(discovery.MonitorOptions{
 		Now:                func() time.Time { return clock },
 		RoutingTableSize:   func() int { return rtSize },
-		RoutingTableTarget: 100,
+		RoutingTableTarget: func() int { return 100 },
 	})
 	// Past the time window but RT is only 5/100 = 5% < 25%.
 	clock = clock.Add(2 * time.Minute)
@@ -266,7 +266,7 @@ func TestMonitor_BootstrapWindowRoutingTable(t *testing.T) {
 func TestMonitor_RunSelfTestLoopExits(t *testing.T) {
 	m := discovery.NewMonitor(discovery.MonitorOptions{
 		RoutingTableSize:   func() int { return 100 },
-		RoutingTableTarget: 100,
+		RoutingTableTarget: func() int { return 100 },
 	})
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})

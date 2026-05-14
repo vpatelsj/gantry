@@ -78,11 +78,13 @@ type Options struct {
 	// Logger is the structured logger; nil uses slog.Default().
 	Logger *slog.Logger
 
-	// RoutingTableTarget is the expected steady-state routing-table
-	// size (used as the denominator for the §7.7 routing-table
-	// component). Typically `cluster_size - 1`. Zero disables the
-	// component (Health()'s rt term reads 1.0).
-	RoutingTableTarget int
+	// RoutingTableTarget returns the expected steady-state routing-table
+	// size, computed per §7.7 as `min(informer_node_count,
+	// kademlia_max_routing_table_size)`. Nil or a return value <= 0
+	// disables the routing-table component (Health()'s rt term reads
+	// 1.0). The closure is invoked on every score read so it reflects
+	// live cluster membership.
+	RoutingTableTarget func() int
 
 	// SelfTestPeriod is the interval between Provide(self_id) →
 	// FindProviders(self_id) self-test cycles. Zero disables the
