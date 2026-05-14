@@ -37,7 +37,7 @@ func (s *stubCoord) PullIntentQuery(_ context.Context, id ifaces.NodeID, _ diges
 	return s.intents[id], nil
 }
 
-func (s *stubCoord) PleasePull(_ context.Context, id ifaces.NodeID, registry, repository string, ds []digest.Digest) ([]ifaces.PleasePullOutcome, error) {
+func (s *stubCoord) PleasePull(_ context.Context, id ifaces.NodeID, registry, repository string, _ ifaces.OriginRefKind, ds []digest.Digest) ([]ifaces.PleasePullOutcome, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.pleasePullCalls = append(s.pleasePullCalls, id)
@@ -282,13 +282,18 @@ func TestRule3_InFlightStaleExcluded(t *testing.T) {
 	}
 	r := buildResolver(t, coord, disco, "self", nodes, hooks, func() time.Time { return now })
 
-	_, err := r.Resolve(context.Background(), d, ifaces.KindManifest, "reg.example.com", "test/repo", 0)
-	// Without expansion, rule 7 runs from the first pass. But the
-	// orchestrator deliberately defers rule 7 until after a potential
-	// expansion (to honor §5.2 rule 6). With health=1.0 the expansion
-	// is NOT triggered, so the cascade reports exhausted.
-	if !errors.Is(err, coldstart.ErrExhausted) {
-		t.Logf("err = %v (acceptable: cascade exhausted under healthy DHT without expansion)", err)
+	res, err := r.Resolve(context.Background(), d, ifaces.KindManifest, "reg.example.com", "test/repo", 0)
+	// Healthy DHT + all-neither must fire rule 7 cold-start at top-K
+	// without an expansion pass (§5.2 rule 7). The DHT poll returns
+	// "x:5001" on the second FindProviders call.
+	if err != nil {
+		t.Fatalf("Resolve: %v (want success via rule 7 cold-start)", err)
+	}
+	if len(res.Providers) != 1 || res.Providers[0].Addr != "x:5001" {
+		t.Fatalf("Providers = %+v; want single x:5001 from DHT poll", res.Providers)
+	}
+	if len(coord.pleasePullCalls) != 1 {
+		t.Fatalf("please_pull dialed %d times; want 1", len(coord.pleasePullCalls))
 	}
 	if len(takeoverKinds) == 0 {
 		t.Fatalf("OnDesignatedPullerTakeover never fired; want at least one (manifest)")
@@ -504,6 +509,43 @@ func TestRule7_EmptyRegistryRejected(t *testing.T) {
 	}
 	if len(coord.pleasePullCalls) != 0 {
 		t.Errorf("pleasePullCalls = %d; want 0 (must not dial puller with empty registry)", len(coord.pleasePullCalls))
+	}
+}
+
+// Rule 7 cold-start MUST fire on the top-K pass when DHT is healthy
+// and every reachable peer reports neither cached nor in-flight.
+// Regression test for the earlier early-return that bypassed rule 7
+// whenever expandLabel=="" — making the design's primary cold-start
+// path unreachable on a healthy cluster.
+func TestRule7_HealthyDhtFiresColdStartAtTopK(t *testing.T) {
+	d := digest.MustParse("sha256:" + rep('a', 64))
+	nodes := clusterNodes()
+	top := hrw.TopK(nodes, d, 3)
+	// All three top-K peers respond with empty intent (not cached,
+	// not in-flight, not recently failed).
+	coord := &stubCoord{intents: map[ifaces.NodeID]ifaces.PullIntent{
+		top[0].Node.ID: {},
+		top[1].Node.ID: {},
+		top[2].Node.ID: {},
+	}}
+	// Healthy DHT (1.0). Provider stack: first FindProviders returns
+	// nil (which triggered the cold-start path); subsequent
+	// pollDHT call returns "x:5001" once please_pull has completed.
+	disco := &stubDisco{
+		health:    1.0,
+		providers: [][]ifaces.Provider{nil, {{NodeID: "x", Addr: "x:5001"}}},
+	}
+	r := buildResolver(t, coord, disco, "self", nodes, coldstart.MetricsHooks{}, time.Now)
+
+	res, err := r.Resolve(context.Background(), d, ifaces.KindBlob, "reg.example.com", "test/repo", 0)
+	if err != nil {
+		t.Fatalf("Resolve err = %v; want success via rule 7 cold-start at top-K", err)
+	}
+	if len(res.Providers) != 1 || res.Providers[0].Addr != "x:5001" {
+		t.Fatalf("Providers = %+v; want single x:5001 from DHT poll after please_pull", res.Providers)
+	}
+	if len(coord.pleasePullCalls) != 1 {
+		t.Fatalf("please_pull dialed %d times; want exactly 1 (lowest-rank reachable)", len(coord.pleasePullCalls))
 	}
 }
 

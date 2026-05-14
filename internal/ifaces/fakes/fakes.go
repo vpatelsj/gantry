@@ -315,7 +315,7 @@ func (c *Coordinator) PullIntentQuery(_ context.Context, peer ifaces.NodeID, d d
 	return intent, nil
 }
 
-func (c *Coordinator) PleasePull(_ context.Context, peer ifaces.NodeID, _, _ string, digests []digest.Digest) ([]ifaces.PleasePullOutcome, error) {
+func (c *Coordinator) PleasePull(_ context.Context, peer ifaces.NodeID, _, _ string, _ ifaces.OriginRefKind, digests []digest.Digest) ([]ifaces.PleasePullOutcome, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	out := make([]ifaces.PleasePullOutcome, 0, len(digests))

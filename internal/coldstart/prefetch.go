@@ -134,7 +134,7 @@ func (r *Resolver) PrefetchLayers(ctx context.Context, digests []digest.Digest, 
 			defer wg.Done()
 			callCtx, cancel := context.WithTimeout(ctx, r.opts.QueryTimeout)
 			defer cancel()
-			_, err := r.opts.Coord.PleasePull(callCtx, node, registry, repository, digests)
+			_, err := r.opts.Coord.PleasePull(callCtx, node, registry, repository, ifaces.KindBlob, digests)
 			if err != nil {
 				failures.Add(1)
 				r.opts.Logger.Debug("coldstart: prefetch please_pull failed",

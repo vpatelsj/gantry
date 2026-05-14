@@ -407,16 +407,18 @@ func (r *Resolver) probe(ctx context.Context, d digest.Digest, kind ifaces.Origi
 		return nil, prefix(expandLabel, "rule7_no_puller"), ErrExhausted
 	}
 
-	// If the orchestrator hasn't expanded yet AND none of rules 2/3
-	// fired, the design (§5.2 rule 6) says: under Degraded DHT health,
-	// expand to top-2K *before* cold-starting. Surface errAllNeither so
-	// Resolve() can decide.
-	if expandLabel == "" {
+	// If the orchestrator hasn't expanded yet AND DHT health is below
+	// the §7.7 Healthy threshold, surface errAllNeither so Resolve()
+	// can expand to top-2K *before* cold-starting (§5.2 rule 6). Under
+	// Healthy DHT we proceed straight to rule 7 at top-K — expansion
+	// is the degraded-mode safety net, not a prerequisite for
+	// cold-start.
+	if expandLabel == "" && r.opts.Discovery.Health() < 0.7 {
 		return nil, "", errAllNeither
 	}
 
 	// Cold-start: please_pull, then DHT-poll for completion.
-	if err := r.sendPleasePull(ctx, *puller, d, registry, repository); err != nil {
+	if err := r.sendPleasePull(ctx, *puller, d, kind, registry, repository); err != nil {
 		return nil, prefix(expandLabel, "rule7_please_pull_failed"), ErrExhausted
 	}
 	providers, err := r.pollDHT(ctx, d, kind, expectedSize)
@@ -598,7 +600,7 @@ func (r *Resolver) providersFor(v *response, top []hrw.Scored) *Resolution {
 	return &Resolution{Providers: out, Outcome: "rule2_cache_hit"}
 }
 
-func (r *Resolver) sendPleasePull(ctx context.Context, puller response, d digest.Digest, registry, repository string) error {
+func (r *Resolver) sendPleasePull(ctx context.Context, puller response, d digest.Digest, kind ifaces.OriginRefKind, registry, repository string) error {
 	// §4.4 invariant: please_pull is a single repo per batch. If the
 	// caller didn't supply registry+repository, refuse to send a
 	// malformed RPC (the server would reject it) and surface a
@@ -611,7 +613,7 @@ func (r *Resolver) sendPleasePull(ctx context.Context, puller response, d digest
 	// (the mirror at the layer-fanout level groups by puller).
 	ctx, cancel := context.WithTimeout(ctx, r.opts.QueryTimeout)
 	defer cancel()
-	_, err := r.opts.Coord.PleasePull(ctx, puller.node.ID, registry, repository, []digest.Digest{d})
+	_, err := r.opts.Coord.PleasePull(ctx, puller.node.ID, registry, repository, kind, []digest.Digest{d})
 	return err
 }
 

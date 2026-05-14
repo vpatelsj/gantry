@@ -142,7 +142,7 @@ func TestPleasePull_Started(t *testing.T) {
 
 	d1 := digest.MustParse("sha256:" + rep('1', 64))
 	d2 := digest.MustParse("sha256:" + rep('2', 64))
-	outs, err := cli.PleasePull(ctx, ifaces.NodeID(hServer.ID().String()), "reg", "repo", []digest.Digest{d1, d2})
+	outs, err := cli.PleasePull(ctx, ifaces.NodeID(hServer.ID().String()), "reg", "repo", ifaces.KindBlob, []digest.Digest{d1, d2})
 	if err != nil {
 		t.Fatalf("PleasePull: %v", err)
 	}
@@ -184,7 +184,7 @@ func TestPleasePull_AlreadyPulling(t *testing.T) {
 	cli := coord.NewClient(hClient)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	outs, err := cli.PleasePull(ctx, ifaces.NodeID(hServer.ID().String()), "reg", "repo", []digest.Digest{d})
+	outs, err := cli.PleasePull(ctx, ifaces.NodeID(hServer.ID().String()), "reg", "repo", ifaces.KindBlob, []digest.Digest{d})
 	if err != nil {
 		t.Fatalf("PleasePull: %v", err)
 	}
@@ -271,7 +271,7 @@ func TestPleasePull_RecentlyFailedShortCircuit(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	outs, err := cli.PleasePull(ctx, ifaces.NodeID(hServer.ID().String()), "reg", "repo", []digest.Digest{d})
+	outs, err := cli.PleasePull(ctx, ifaces.NodeID(hServer.ID().String()), "reg", "repo", ifaces.KindBlob, []digest.Digest{d})
 	if err != nil {
 		t.Fatalf("PleasePull: %v", err)
 	}
@@ -290,6 +290,50 @@ func TestPleasePull_RecentlyFailedShortCircuit(t *testing.T) {
 	}
 	if got := atomic.LoadInt32(&pumpCalls); got != 1 {
 		t.Fatalf("pumpCalls = %d, want 1", got)
+	}
+}
+
+// TestPleasePull_KindRoundtrip asserts that the PleasePullRequest.kind
+// field is encoded on the client and surfaced verbatim to the
+// puller-pump on the server. Regression test for the earlier wire
+// gap where the server hardcoded ifaces.KindBlob, causing manifest
+// cold-start requests to be sent to /v2/<repo>/blobs/<digest>
+// instead of /v2/<repo>/manifests/<digest>.
+func TestPleasePull_KindRoundtrip(t *testing.T) {
+	hClient, hServer := makeHostPair(t)
+
+	c, err := cache.Open(t.TempDir(), 1<<30)
+	if err != nil {
+		t.Fatalf("cache.Open: %v", err)
+	}
+	members := fakes.NewMembers(ifaces.NodeID(hServer.ID().String()))
+	infl := inflight.New(inflight.DefaultStalls(), nil)
+
+	var observedKind ifaces.OriginRefKind
+	var observedDigest digest.Digest
+	pump := coord.PullerPump(func(_ context.Context, _, _ string, d digest.Digest, kind ifaces.OriginRefKind) (time.Time, bool, *coord.NegativeEntry) {
+		observedKind = kind
+		observedDigest = d
+		h, _, already := infl.Start(d, kind, 0)
+		_ = h
+		return time.Now(), already, nil
+	})
+	srv := coord.NewServer(c, members, infl, coord.WithPullerPump(pump))
+	srv.Bind(hServer)
+
+	cli := coord.NewClient(hClient)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	d := digest.MustParse("sha256:" + rep('b', 64))
+	if _, err := cli.PleasePull(ctx, ifaces.NodeID(hServer.ID().String()), "reg", "repo", ifaces.KindManifest, []digest.Digest{d}); err != nil {
+		t.Fatalf("PleasePull: %v", err)
+	}
+	if observedDigest != d {
+		t.Fatalf("observedDigest = %s; want %s", observedDigest, d)
+	}
+	if observedKind != ifaces.KindManifest {
+		t.Fatalf("observedKind = %v; want KindManifest", observedKind)
 	}
 }
 

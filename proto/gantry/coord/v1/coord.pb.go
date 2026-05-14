@@ -90,6 +90,63 @@ func (FailureClass) EnumDescriptor() ([]byte, []int) {
 	return file_gantry_coord_v1_coord_proto_rawDescGZIP(), []int{0}
 }
 
+// Kind discriminates the OCI Distribution Spec URL family the puller
+// should target at the upstream registry:
+//
+//	/v2/<repo>/blobs/<digest>      (KIND_BLOB)
+//	/v2/<repo>/manifests/<digest>  (KIND_MANIFEST)
+//
+// KIND_UNSPECIFIED is treated as KIND_BLOB for back-compat with peers
+// running pre-Kind builds.
+type PleasePullRequest_Kind int32
+
+const (
+	PleasePullRequest_KIND_UNSPECIFIED PleasePullRequest_Kind = 0
+	PleasePullRequest_KIND_BLOB        PleasePullRequest_Kind = 1
+	PleasePullRequest_KIND_MANIFEST    PleasePullRequest_Kind = 2
+)
+
+// Enum value maps for PleasePullRequest_Kind.
+var (
+	PleasePullRequest_Kind_name = map[int32]string{
+		0: "KIND_UNSPECIFIED",
+		1: "KIND_BLOB",
+		2: "KIND_MANIFEST",
+	}
+	PleasePullRequest_Kind_value = map[string]int32{
+		"KIND_UNSPECIFIED": 0,
+		"KIND_BLOB":        1,
+		"KIND_MANIFEST":    2,
+	}
+)
+
+func (x PleasePullRequest_Kind) Enum() *PleasePullRequest_Kind {
+	p := new(PleasePullRequest_Kind)
+	*p = x
+	return p
+}
+
+func (x PleasePullRequest_Kind) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (PleasePullRequest_Kind) Descriptor() protoreflect.EnumDescriptor {
+	return file_gantry_coord_v1_coord_proto_enumTypes[1].Descriptor()
+}
+
+func (PleasePullRequest_Kind) Type() protoreflect.EnumType {
+	return &file_gantry_coord_v1_coord_proto_enumTypes[1]
+}
+
+func (x PleasePullRequest_Kind) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use PleasePullRequest_Kind.Descriptor instead.
+func (PleasePullRequest_Kind) EnumDescriptor() ([]byte, []int) {
+	return file_gantry_coord_v1_coord_proto_rawDescGZIP(), []int{3, 0}
+}
+
 type PleasePullResponse_Result_Outcome int32
 
 const (
@@ -126,11 +183,11 @@ func (x PleasePullResponse_Result_Outcome) String() string {
 }
 
 func (PleasePullResponse_Result_Outcome) Descriptor() protoreflect.EnumDescriptor {
-	return file_gantry_coord_v1_coord_proto_enumTypes[1].Descriptor()
+	return file_gantry_coord_v1_coord_proto_enumTypes[2].Descriptor()
 }
 
 func (PleasePullResponse_Result_Outcome) Type() protoreflect.EnumType {
-	return &file_gantry_coord_v1_coord_proto_enumTypes[1]
+	return &file_gantry_coord_v1_coord_proto_enumTypes[2]
 }
 
 func (x PleasePullResponse_Result_Outcome) Number() protoreflect.EnumNumber {
@@ -408,11 +465,12 @@ func (x *PullIntentResponse) GetFailureClass() FailureClass {
 type PleasePullRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Batched (§5.2a). All digests in a single batch MUST share
-	// `upstream_registry` and `repository`. Cross-repo digests (e.g., a layer
-	// reachable via OCI cross-repo blob mount) require separate calls.
-	Digests          []string `protobuf:"bytes,1,rep,name=digests,proto3" json:"digests,omitempty"`
-	UpstreamRegistry string   `protobuf:"bytes,2,opt,name=upstream_registry,json=upstreamRegistry,proto3" json:"upstream_registry,omitempty"` // e.g. "registry.example.com"
-	Repository       string   `protobuf:"bytes,3,opt,name=repository,proto3" json:"repository,omitempty"`                                     // e.g. "library/nginx"
+	// `upstream_registry`, `repository`, AND `kind`. Mixed-kind batches
+	// require separate calls.
+	Digests          []string               `protobuf:"bytes,1,rep,name=digests,proto3" json:"digests,omitempty"`
+	UpstreamRegistry string                 `protobuf:"bytes,2,opt,name=upstream_registry,json=upstreamRegistry,proto3" json:"upstream_registry,omitempty"` // e.g. "registry.example.com"
+	Repository       string                 `protobuf:"bytes,3,opt,name=repository,proto3" json:"repository,omitempty"`                                     // e.g. "library/nginx"
+	Kind             PleasePullRequest_Kind `protobuf:"varint,4,opt,name=kind,proto3,enum=gantry.coord.v1.PleasePullRequest_Kind" json:"kind,omitempty"`
 	unknownFields    protoimpl.UnknownFields
 	sizeCache        protoimpl.SizeCache
 }
@@ -466,6 +524,13 @@ func (x *PleasePullRequest) GetRepository() string {
 		return x.Repository
 	}
 	return ""
+}
+
+func (x *PleasePullRequest) GetKind() PleasePullRequest_Kind {
+	if x != nil {
+		return x.Kind
+	}
+	return PleasePullRequest_KIND_UNSPECIFIED
 }
 
 // PleasePullResponse reports the per-digest outcome of a `please_pull` request.
@@ -611,13 +676,18 @@ const file_gantry_coord_v1_coord_proto_rawDesc = "" +
 	"\bhrw_rank\x18\x04 \x01(\x05R\ahrwRank\x12'\n" +
 	"\x0frecently_failed\x18\x05 \x01(\bR\x0erecentlyFailed\x12A\n" +
 	"\x0ecooldown_until\x18\x06 \x01(\v2\x1a.google.protobuf.TimestampR\rcooldownUntil\x12B\n" +
-	"\rfailure_class\x18\a \x01(\x0e2\x1d.gantry.coord.v1.FailureClassR\ffailureClass\"z\n" +
+	"\rfailure_class\x18\a \x01(\x0e2\x1d.gantry.coord.v1.FailureClassR\ffailureClass\"\xf7\x01\n" +
 	"\x11PleasePullRequest\x12\x18\n" +
 	"\adigests\x18\x01 \x03(\tR\adigests\x12+\n" +
 	"\x11upstream_registry\x18\x02 \x01(\tR\x10upstreamRegistry\x12\x1e\n" +
 	"\n" +
 	"repository\x18\x03 \x01(\tR\n" +
-	"repository\"\x86\x04\n" +
+	"repository\x12;\n" +
+	"\x04kind\x18\x04 \x01(\x0e2'.gantry.coord.v1.PleasePullRequest.KindR\x04kind\">\n" +
+	"\x04Kind\x12\x14\n" +
+	"\x10KIND_UNSPECIFIED\x10\x00\x12\r\n" +
+	"\tKIND_BLOB\x10\x01\x12\x11\n" +
+	"\rKIND_MANIFEST\x10\x02\"\x86\x04\n" +
 	"\x12PleasePullResponse\x12D\n" +
 	"\aresults\x18\x01 \x03(\v2*.gantry.coord.v1.PleasePullResponse.ResultR\aresults\x1a\xa9\x03\n" +
 	"\x06Result\x12\x16\n" +
@@ -651,37 +721,39 @@ func file_gantry_coord_v1_coord_proto_rawDescGZIP() []byte {
 	return file_gantry_coord_v1_coord_proto_rawDescData
 }
 
-var file_gantry_coord_v1_coord_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
+var file_gantry_coord_v1_coord_proto_enumTypes = make([]protoimpl.EnumInfo, 3)
 var file_gantry_coord_v1_coord_proto_msgTypes = make([]protoimpl.MessageInfo, 6)
 var file_gantry_coord_v1_coord_proto_goTypes = []any{
 	(FailureClass)(0),                      // 0: gantry.coord.v1.FailureClass
-	(PleasePullResponse_Result_Outcome)(0), // 1: gantry.coord.v1.PleasePullResponse.Result.Outcome
-	(*Envelope)(nil),                       // 2: gantry.coord.v1.Envelope
-	(*PullIntentRequest)(nil),              // 3: gantry.coord.v1.PullIntentRequest
-	(*PullIntentResponse)(nil),             // 4: gantry.coord.v1.PullIntentResponse
-	(*PleasePullRequest)(nil),              // 5: gantry.coord.v1.PleasePullRequest
-	(*PleasePullResponse)(nil),             // 6: gantry.coord.v1.PleasePullResponse
-	(*PleasePullResponse_Result)(nil),      // 7: gantry.coord.v1.PleasePullResponse.Result
-	(*timestamppb.Timestamp)(nil),          // 8: google.protobuf.Timestamp
+	(PleasePullRequest_Kind)(0),            // 1: gantry.coord.v1.PleasePullRequest.Kind
+	(PleasePullResponse_Result_Outcome)(0), // 2: gantry.coord.v1.PleasePullResponse.Result.Outcome
+	(*Envelope)(nil),                       // 3: gantry.coord.v1.Envelope
+	(*PullIntentRequest)(nil),              // 4: gantry.coord.v1.PullIntentRequest
+	(*PullIntentResponse)(nil),             // 5: gantry.coord.v1.PullIntentResponse
+	(*PleasePullRequest)(nil),              // 6: gantry.coord.v1.PleasePullRequest
+	(*PleasePullResponse)(nil),             // 7: gantry.coord.v1.PleasePullResponse
+	(*PleasePullResponse_Result)(nil),      // 8: gantry.coord.v1.PleasePullResponse.Result
+	(*timestamppb.Timestamp)(nil),          // 9: google.protobuf.Timestamp
 }
 var file_gantry_coord_v1_coord_proto_depIdxs = []int32{
-	3,  // 0: gantry.coord.v1.Envelope.pull_intent_request:type_name -> gantry.coord.v1.PullIntentRequest
-	4,  // 1: gantry.coord.v1.Envelope.pull_intent_response:type_name -> gantry.coord.v1.PullIntentResponse
-	5,  // 2: gantry.coord.v1.Envelope.please_pull_request:type_name -> gantry.coord.v1.PleasePullRequest
-	6,  // 3: gantry.coord.v1.Envelope.please_pull_response:type_name -> gantry.coord.v1.PleasePullResponse
-	8,  // 4: gantry.coord.v1.PullIntentResponse.started_at:type_name -> google.protobuf.Timestamp
-	8,  // 5: gantry.coord.v1.PullIntentResponse.cooldown_until:type_name -> google.protobuf.Timestamp
+	4,  // 0: gantry.coord.v1.Envelope.pull_intent_request:type_name -> gantry.coord.v1.PullIntentRequest
+	5,  // 1: gantry.coord.v1.Envelope.pull_intent_response:type_name -> gantry.coord.v1.PullIntentResponse
+	6,  // 2: gantry.coord.v1.Envelope.please_pull_request:type_name -> gantry.coord.v1.PleasePullRequest
+	7,  // 3: gantry.coord.v1.Envelope.please_pull_response:type_name -> gantry.coord.v1.PleasePullResponse
+	9,  // 4: gantry.coord.v1.PullIntentResponse.started_at:type_name -> google.protobuf.Timestamp
+	9,  // 5: gantry.coord.v1.PullIntentResponse.cooldown_until:type_name -> google.protobuf.Timestamp
 	0,  // 6: gantry.coord.v1.PullIntentResponse.failure_class:type_name -> gantry.coord.v1.FailureClass
-	7,  // 7: gantry.coord.v1.PleasePullResponse.results:type_name -> gantry.coord.v1.PleasePullResponse.Result
-	1,  // 8: gantry.coord.v1.PleasePullResponse.Result.outcome:type_name -> gantry.coord.v1.PleasePullResponse.Result.Outcome
-	8,  // 9: gantry.coord.v1.PleasePullResponse.Result.started_at:type_name -> google.protobuf.Timestamp
-	8,  // 10: gantry.coord.v1.PleasePullResponse.Result.cooldown_until:type_name -> google.protobuf.Timestamp
-	0,  // 11: gantry.coord.v1.PleasePullResponse.Result.failure_class:type_name -> gantry.coord.v1.FailureClass
-	12, // [12:12] is the sub-list for method output_type
-	12, // [12:12] is the sub-list for method input_type
-	12, // [12:12] is the sub-list for extension type_name
-	12, // [12:12] is the sub-list for extension extendee
-	0,  // [0:12] is the sub-list for field type_name
+	1,  // 7: gantry.coord.v1.PleasePullRequest.kind:type_name -> gantry.coord.v1.PleasePullRequest.Kind
+	8,  // 8: gantry.coord.v1.PleasePullResponse.results:type_name -> gantry.coord.v1.PleasePullResponse.Result
+	2,  // 9: gantry.coord.v1.PleasePullResponse.Result.outcome:type_name -> gantry.coord.v1.PleasePullResponse.Result.Outcome
+	9,  // 10: gantry.coord.v1.PleasePullResponse.Result.started_at:type_name -> google.protobuf.Timestamp
+	9,  // 11: gantry.coord.v1.PleasePullResponse.Result.cooldown_until:type_name -> google.protobuf.Timestamp
+	0,  // 12: gantry.coord.v1.PleasePullResponse.Result.failure_class:type_name -> gantry.coord.v1.FailureClass
+	13, // [13:13] is the sub-list for method output_type
+	13, // [13:13] is the sub-list for method input_type
+	13, // [13:13] is the sub-list for extension type_name
+	13, // [13:13] is the sub-list for extension extendee
+	0,  // [0:13] is the sub-list for field type_name
 }
 
 func init() { file_gantry_coord_v1_coord_proto_init() }
@@ -700,7 +772,7 @@ func file_gantry_coord_v1_coord_proto_init() {
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_gantry_coord_v1_coord_proto_rawDesc), len(file_gantry_coord_v1_coord_proto_rawDesc)),
-			NumEnums:      2,
+			NumEnums:      3,
 			NumMessages:   6,
 			NumExtensions: 0,
 			NumServices:   0,

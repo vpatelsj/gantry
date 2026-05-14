@@ -260,7 +260,7 @@ const (
 // expected to open one libp2p stream per call.
 type Coordinator interface {
 	PullIntentQuery(ctx context.Context, peer NodeID, d digest.Digest) (PullIntent, error)
-	PleasePull(ctx context.Context, peer NodeID, registry, repository string, digests []digest.Digest) ([]PleasePullOutcome, error)
+	PleasePull(ctx context.Context, peer NodeID, registry, repository string, kind OriginRefKind, digests []digest.Digest) ([]PleasePullOutcome, error)
 }
 
 // ---------------------------------------------------------------------------

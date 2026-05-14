@@ -350,7 +350,7 @@ func (s *Server) servePleasePull(ctx context.Context, _ peer.ID, req *coordv1.Pl
 			results = append(results, r)
 			continue
 		}
-		startedAt, already, fail := s.pullerPump(ctx, req.GetUpstreamRegistry(), req.GetRepository(), d, ifaces.KindBlob)
+		startedAt, already, fail := s.pullerPump(ctx, req.GetUpstreamRegistry(), req.GetRepository(), d, pleasePullKindFromProto(req.GetKind()))
 		switch {
 		case fail != nil:
 			r.Outcome = coordv1.PleasePullResponse_Result_OUTCOME_RECENTLY_FAILED
@@ -468,7 +468,7 @@ func (c *Client) PullIntentQuery(ctx context.Context, target ifaces.NodeID, d di
 }
 
 // PleasePull implements ifaces.Coordinator.
-func (c *Client) PleasePull(ctx context.Context, target ifaces.NodeID, registry, repository string, digests []digest.Digest) ([]ifaces.PleasePullOutcome, error) {
+func (c *Client) PleasePull(ctx context.Context, target ifaces.NodeID, registry, repository string, kind ifaces.OriginRefKind, digests []digest.Digest) ([]ifaces.PleasePullOutcome, error) {
 	raws := make([]string, len(digests))
 	for i, d := range digests {
 		raws[i] = d.String()
@@ -478,6 +478,7 @@ func (c *Client) PleasePull(ctx context.Context, target ifaces.NodeID, registry,
 			Digests:          raws,
 			UpstreamRegistry: registry,
 			Repository:       repository,
+			Kind:             pleasePullKindToProto(kind),
 		},
 	}}
 	out, err := c.roundTrip(ctx, target, in)
@@ -632,6 +633,32 @@ func pleasePullStatusFromProto(o coordv1.PleasePullResponse_Result_Outcome) ifac
 		return ifaces.PleasePullRecentlyFailed
 	default:
 		return ifaces.PleasePullUnspecified
+	}
+}
+
+// pleasePullKindToProto maps the in-process OriginRefKind enum to the
+// wire-form Kind enum. Unknown / zero is sent as KIND_UNSPECIFIED so a
+// pre-Kind responder still defaults to blob semantics.
+func pleasePullKindToProto(k ifaces.OriginRefKind) coordv1.PleasePullRequest_Kind {
+	switch k {
+	case ifaces.KindManifest:
+		return coordv1.PleasePullRequest_KIND_MANIFEST
+	case ifaces.KindBlob:
+		return coordv1.PleasePullRequest_KIND_BLOB
+	default:
+		return coordv1.PleasePullRequest_KIND_UNSPECIFIED
+	}
+}
+
+// pleasePullKindFromProto maps the wire-form Kind enum back to the
+// in-process OriginRefKind. KIND_UNSPECIFIED is treated as KindBlob for
+// back-compat with peers that have not been recompiled.
+func pleasePullKindFromProto(k coordv1.PleasePullRequest_Kind) ifaces.OriginRefKind {
+	switch k {
+	case coordv1.PleasePullRequest_KIND_MANIFEST:
+		return ifaces.KindManifest
+	default:
+		return ifaces.KindBlob
 	}
 }
 
