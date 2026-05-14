@@ -9,10 +9,10 @@ import (
 	"io"
 	"log/slog"
 
-	cerrdefs "github.com/containerd/errdefs"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
-	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+	cerrdefs "github.com/containerd/errdefs"
 	godigest "github.com/opencontainers/go-digest"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 
 	gdigest "github.com/gantry/gantry/internal/digest"
 	"github.com/gantry/gantry/internal/ifaces"

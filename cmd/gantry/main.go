@@ -1152,30 +1152,46 @@ func bootstrapPeerAddrs(mgr *members.Manager) []string {
 }
 
 // rewriteWildcardMultiaddr returns ma with any wildcard IP component
-// (/ip4/0.0.0.0 or /ip6/::) replaced by /ip4/<podIP> when podIP is
-// non-empty and parseable as an IPv4. Non-wildcard multiaddrs are
+// (/ip4/0.0.0.0 or /ip6/::) replaced by /ip4/<podIP> or /ip6/<podIP>
+// depending on the family of podIP. Non-wildcard multiaddrs are
 // returned unchanged. Returns "" when the address is a wildcard and
 // no usable pod IP is available (signal to the caller to skip
 // publishing this entry).
+//
+// IPv6 dual-stack handling: an IPv6 Pod IP must be advertised under
+// the /ip6/ multiaddr family, not /ip4/, otherwise libp2p rejects the
+// multiaddr at dial time and the bootstrap pool contains no usable
+// entry for v6-only clusters. We parse the Pod IP and pick the
+// matching family explicitly.
 func rewriteWildcardMultiaddr(ma, podIP string) string {
-	switch {
-	case strings.HasPrefix(ma, "/ip4/0.0.0.0/"):
-		if podIP == "" {
-			return ""
-		}
-		return "/ip4/" + podIP + ma[len("/ip4/0.0.0.0"):]
-	case strings.HasPrefix(ma, "/ip6/::/"):
-		if podIP == "" {
-			return ""
-		}
-		// IPv6 wildcard → IPv4 pod IP requires the /ip4/ prefix; the
-		// /ip6/:: component is dropped (libp2p will pick the matching
-		// transport from the protocol stack after this prefix).
-		rest := ma[len("/ip6/::"):]
-		return "/ip4/" + podIP + rest
-	default:
+	isWildcardV4 := strings.HasPrefix(ma, "/ip4/0.0.0.0/")
+	isWildcardV6 := strings.HasPrefix(ma, "/ip6/::/")
+	if !isWildcardV4 && !isWildcardV6 {
 		return ma
 	}
+	if podIP == "" {
+		return ""
+	}
+	ip := net.ParseIP(podIP)
+	if ip == nil {
+		return ""
+	}
+	var (
+		family string
+		rest   string
+	)
+	switch {
+	case ip.To4() != nil:
+		family = "/ip4/" + ip.To4().String()
+	default:
+		family = "/ip6/" + ip.String()
+	}
+	if isWildcardV4 {
+		rest = ma[len("/ip4/0.0.0.0"):]
+	} else {
+		rest = ma[len("/ip6/::"):]
+	}
+	return family + rest
 }
 
 // advertisedTransferAddr returns the transfer endpoint to publish on
