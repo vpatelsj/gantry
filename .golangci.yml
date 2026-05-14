@@ -1,0 +1,47 @@
+version: "2"
+
+run:
+  timeout: 5m
+  tests: true
+
+linters:
+  default: none
+  enable:
+    - errcheck
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    - misspell
+    - revive
+    - gocritic
+    - bodyclose
+    - errorlint
+    - nilerr
+    - unconvert
+    - unparam
+  exclusions:
+    rules:
+      # Generated protobuf code is not linted.
+      - path: \.pb\.go$
+        linters:
+          - all
+      # Tests can be a bit looser.
+      - path: _test\.go$
+        linters:
+          - errcheck
+          - unparam
+          - revive
+      # In-process fakes are test scaffolding; exported-comment churn isn't worth it.
+      - path: internal/ifaces/fakes/
+        linters:
+          - revive
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/gantry/gantry

@@ -1,0 +1,471 @@
+// Package origin pulls bytes from upstream OCI registries.
+//
+// Phase 1 scope:
+//
+//   - Multi-registry: one *Client serves every UpstreamRegistry configured
+//     by the operator.
+//   - Endpoints: GET /v2/, GET /v2/<repo>/blobs/<digest>,
+//     GET /v2/<repo>/manifests/<digest>.
+//   - Auth: optional Basic auth (credentials from a hostPath file in
+//     "username:password" format) plus the OCI Distribution Spec bearer-
+//     token flow (401 → realm/service/scope → token → retry).
+//   - Failure classification: maps HTTP status and network errors to
+//     ifaces.FailureClass for §5.8 propagation. Tag-resolution requests are
+//     not handled here (the mirror returns 503 on tag manifests so
+//     containerd falls through to origin directly — §5.1a / §7.1).
+//
+// Out of scope for Phase 1 (lands later):
+//
+//   - §5.8 negative-cache cooldown integration (Phase 4).
+//   - Per-pull retries with backoff (caller's responsibility for now).
+//   - Resumable / ranged pulls (Phase 2 §5.2a layer-pull semantics).
+package origin
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
+	"net/url"
+	"os"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/gantry/gantry/internal/config"
+	"github.com/gantry/gantry/internal/ifaces"
+)
+
+// Client is the concrete OriginPuller. It fans out to one *registry per
+// configured upstream and routes calls by OriginRef.Registry.
+type Client struct {
+	logger     *slog.Logger
+	registries map[string]*registry // keyed by both Name and NSAlias
+	metrics    metricsHooks
+}
+
+// metricsHooks lets the origin client emit counters without importing the
+// metrics package directly. Hooks may be nil.
+type metricsHooks struct {
+	onPullStart   func(kind string)              // before request
+	onPullSuccess func(kind string, bytes int64) // after streaming completes
+	onPullFailure func(kind, class string)       // any non-success terminal status
+}
+
+// Option configures a Client.
+type Option func(*Client)
+
+// WithLogger plumbs a structured logger.
+func WithLogger(l *slog.Logger) Option {
+	return func(c *Client) {
+		if l != nil {
+			c.logger = l.With(slog.String("subsystem", "origin"))
+		}
+	}
+}
+
+// WithMetrics registers metric callbacks.
+func WithMetrics(start, success func(kind string, bytes int64), failure func(kind, class string)) Option {
+	return func(c *Client) {
+		c.metrics.onPullStart = func(kind string) { start(kind, 0) }
+		c.metrics.onPullSuccess = success
+		c.metrics.onPullFailure = failure
+	}
+}
+
+// New builds a Client from the operator config. Returns an error if any
+// upstream credentials file cannot be read.
+func New(cfg *config.Config, opts ...Option) (*Client, error) {
+	if cfg == nil || len(cfg.UpstreamRegistries) == 0 {
+		return nil, errors.New("origin: at least one upstream registry required")
+	}
+	c := &Client{
+		logger:     slog.Default().With(slog.String("subsystem", "origin")),
+		registries: map[string]*registry{},
+	}
+	for _, opt := range opts {
+		opt(c)
+	}
+	for _, ur := range cfg.UpstreamRegistries {
+		r, err := newRegistry(ur, c.logger)
+		if err != nil {
+			return nil, fmt.Errorf("origin: registry %q: %w", ur.Name, err)
+		}
+		c.registries[ur.Name] = r
+		if ur.NSAlias != "" {
+			c.registries[ur.NSAlias] = r
+		}
+	}
+	return c, nil
+}
+
+// Pull implements ifaces.OriginPuller.
+func (c *Client) Pull(ctx context.Context, ref ifaces.OriginRef) (io.ReadCloser, int64, error) {
+	kind := ref.Kind.String()
+	if c.metrics.onPullStart != nil {
+		c.metrics.onPullStart(kind)
+	}
+	r, ok := c.registries[ref.Registry]
+	if !ok {
+		err := &ifaces.OriginError{
+			Ref:   ref,
+			Class: ifaces.FailureNotFound,
+			Err:   fmt.Errorf("unknown registry %q", ref.Registry),
+		}
+		c.recordFailure(kind, err)
+		return nil, 0, err
+	}
+	rc, size, err := r.pull(ctx, ref)
+	if err != nil {
+		c.recordFailure(kind, err)
+		return nil, 0, err
+	}
+	// Wrap so successful end-of-stream emits the success metric.
+	return &metricReader{
+		ReadCloser: rc,
+		onClose: func(n int64) {
+			if c.metrics.onPullSuccess != nil {
+				c.metrics.onPullSuccess(kind, n)
+			}
+		},
+	}, size, nil
+}
+
+func (c *Client) recordFailure(kind string, err error) {
+	if c.metrics.onPullFailure == nil {
+		return
+	}
+	var oe *ifaces.OriginError
+	class := string(ifaces.FailureUnspecified)
+	if errors.As(err, &oe) {
+		class = string(oe.Class)
+	}
+	c.metrics.onPullFailure(kind, class)
+}
+
+// Compile-time check.
+var _ ifaces.OriginPuller = (*Client)(nil)
+
+// ---------------------------------------------------------------------------
+// per-registry client
+// ---------------------------------------------------------------------------
+
+type registry struct {
+	name     string
+	base     *url.URL // root of the OCI Distribution v2 API
+	username string
+	password string
+	hc       *http.Client
+	logger   *slog.Logger
+
+	// Phase 1 keeps a single most-recent token per registry. OCI registries
+	// usually issue tokens whose scope covers an entire repo's pulls, so one
+	// token serves manifest + config + many layer requests. A per-scope map
+	// lands when §5.8 retries make that worthwhile.
+	tokMu sync.Mutex
+	token *cachedToken
+}
+
+type cachedToken struct {
+	value     string
+	expiresAt time.Time
+}
+
+func newRegistry(ur config.UpstreamRegistry, logger *slog.Logger) (*registry, error) {
+	u, err := url.Parse(ur.Endpoint)
+	if err != nil {
+		return nil, fmt.Errorf("parse endpoint: %w", err)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return nil, fmt.Errorf("endpoint %q: scheme must be http or https", ur.Endpoint)
+	}
+	r := &registry{
+		name:   ur.Name,
+		base:   u,
+		hc:     &http.Client{Timeout: 5 * time.Minute},
+		logger: logger.With(slog.String("registry", ur.Name)),
+	}
+	if ur.CredentialsPath != "" {
+		b, err := os.ReadFile(ur.CredentialsPath) //#nosec G304 -- operator-supplied path
+		if err != nil {
+			return nil, fmt.Errorf("read credentials %q: %w", ur.CredentialsPath, err)
+		}
+		line := strings.TrimSpace(string(b))
+		idx := strings.IndexByte(line, ':')
+		if idx <= 0 || idx == len(line)-1 {
+			return nil, fmt.Errorf("credentials %q: want \"username:password\"", ur.CredentialsPath)
+		}
+		r.username = line[:idx]
+		r.password = line[idx+1:]
+	}
+	return r, nil
+}
+
+func (r *registry) pull(ctx context.Context, ref ifaces.OriginRef) (io.ReadCloser, int64, error) {
+	path := r.urlFor(ref)
+	resp, err := r.do(ctx, http.MethodGet, path)
+	if err != nil {
+		return nil, 0, &ifaces.OriginError{Ref: ref, Class: ifaces.FailureTransient, Err: err}
+	}
+	if resp.StatusCode != http.StatusOK {
+		defer func() { _ = resp.Body.Close() }()
+		return nil, 0, classify(ref, resp)
+	}
+	size := int64(-1)
+	if cl := resp.Header.Get("Content-Length"); cl != "" {
+		if n, err := strconv.ParseInt(cl, 10, 64); err == nil {
+			size = n
+		}
+	}
+	return resp.Body, size, nil
+}
+
+// urlFor returns the full URL for an OriginRef.
+func (r *registry) urlFor(ref ifaces.OriginRef) string {
+	switch ref.Kind {
+	case ifaces.KindManifest:
+		return r.base.String() + "/v2/" + ref.Repository + "/manifests/" + ref.Digest.String()
+	default:
+		return r.base.String() + "/v2/" + ref.Repository + "/blobs/" + ref.Digest.String()
+	}
+}
+
+// do issues a request, transparently performing the bearer-token flow on
+// 401. The cached token (if any) is sent on the first attempt; on 401 the
+// challenge is honored, the token is replaced, and one retry is issued.
+func (r *registry) do(ctx context.Context, method, urlStr string) (*http.Response, error) {
+	build := func(tok string) (*http.Request, error) {
+		req, err := http.NewRequestWithContext(ctx, method, urlStr, nil)
+		if err != nil {
+			return nil, err
+		}
+		if strings.Contains(urlStr, "/manifests/") {
+			req.Header.Set("Accept",
+				"application/vnd.oci.image.manifest.v1+json, "+
+					"application/vnd.oci.image.index.v1+json, "+
+					"application/vnd.docker.distribution.manifest.v2+json, "+
+					"application/vnd.docker.distribution.manifest.list.v2+json")
+		}
+		if tok != "" {
+			req.Header.Set("Authorization", "Bearer "+tok)
+		}
+		return req, nil
+	}
+
+	cachedTok := r.cachedToken()
+	req, err := build(cachedTok)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := r.hc.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusUnauthorized {
+		return resp, nil
+	}
+
+	// Cached token (if any) is stale; clear and negotiate fresh.
+	challenge := resp.Header.Get("WWW-Authenticate")
+	_ = resp.Body.Close()
+	if cachedTok != "" {
+		r.clearToken()
+	}
+	if !strings.HasPrefix(strings.ToLower(challenge), "bearer ") {
+		// No bearer challenge — return 401 verbatim so classify() reports auth.
+		return r.repeatWithoutToken(ctx, method, urlStr)
+	}
+	tok, err := r.fetchBearerToken(ctx, challenge)
+	if err != nil {
+		return nil, err
+	}
+	r.setToken(tok)
+	req2, err := build(tok)
+	if err != nil {
+		return nil, err
+	}
+	return r.hc.Do(req2)
+}
+
+// repeatWithoutToken re-issues a request that received a 401 but no usable
+// bearer challenge. Returns the 401 response so the caller can classify it
+// as FailureAuth.
+func (r *registry) repeatWithoutToken(ctx context.Context, method, urlStr string) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, method, urlStr, nil)
+	if err != nil {
+		return nil, err
+	}
+	if r.username != "" {
+		req.SetBasicAuth(r.username, r.password)
+	}
+	return r.hc.Do(req)
+}
+
+// fetchBearerToken parses a Bearer challenge and exchanges it for a token.
+func (r *registry) fetchBearerToken(ctx context.Context, challenge string) (string, error) {
+	params := parseChallenge(challenge)
+	realm := params["realm"]
+	if realm == "" {
+		return "", fmt.Errorf("bearer challenge missing realm: %q", challenge)
+	}
+	scope := params["scope"]
+	q := url.Values{}
+	if svc := params["service"]; svc != "" {
+		q.Set("service", svc)
+	}
+	if scope != "" {
+		q.Set("scope", scope)
+	}
+	tokenURL := realm
+	if len(q) > 0 {
+		sep := "?"
+		if strings.Contains(realm, "?") {
+			sep = "&"
+		}
+		tokenURL = realm + sep + q.Encode()
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, tokenURL, nil)
+	if err != nil {
+		return "", err
+	}
+	if r.username != "" {
+		req.SetBasicAuth(r.username, r.password)
+	}
+	resp, err := r.hc.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("token request: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("token endpoint returned %s", resp.Status)
+	}
+	var body struct {
+		Token       string `json:"token"`
+		AccessToken string `json:"access_token"`
+		ExpiresIn   int    `json:"expires_in"`
+	}
+	if err := decodeJSON(resp.Body, &body); err != nil {
+		return "", err
+	}
+	tok := body.Token
+	if tok == "" {
+		tok = body.AccessToken
+	}
+	if tok == "" {
+		return "", errors.New("token endpoint returned no token")
+	}
+	return tok, nil
+}
+
+func (r *registry) cachedToken() string {
+	r.tokMu.Lock()
+	defer r.tokMu.Unlock()
+	if r.token == nil {
+		return ""
+	}
+	if !r.token.expiresAt.IsZero() && time.Now().After(r.token.expiresAt) {
+		r.token = nil
+		return ""
+	}
+	return r.token.value
+}
+
+func (r *registry) setToken(value string) {
+	r.tokMu.Lock()
+	defer r.tokMu.Unlock()
+	r.token = &cachedToken{value: value, expiresAt: time.Now().Add(5 * time.Minute)}
+}
+
+func (r *registry) clearToken() {
+	r.tokMu.Lock()
+	defer r.tokMu.Unlock()
+	r.token = nil
+}
+
+// classify maps an HTTP status to a §5.8 FailureClass.
+func classify(ref ifaces.OriginRef, resp *http.Response) error {
+	var class ifaces.FailureClass
+	switch resp.StatusCode {
+	case http.StatusUnauthorized, http.StatusForbidden:
+		class = ifaces.FailureAuth
+	case http.StatusNotFound:
+		class = ifaces.FailureNotFound
+	case http.StatusTooManyRequests:
+		class = ifaces.FailureRateLimited
+	default:
+		class = ifaces.FailureTransient
+	}
+	return &ifaces.OriginError{
+		Ref:   ref,
+		Class: class,
+		Err:   fmt.Errorf("upstream returned %s", resp.Status),
+	}
+}
+
+// parseChallenge parses a WWW-Authenticate Bearer challenge into its
+// key=value parameters. Quotes are stripped.
+func parseChallenge(challenge string) map[string]string {
+	out := map[string]string{}
+	rest := strings.TrimSpace(challenge)
+	if !strings.HasPrefix(strings.ToLower(rest), "bearer ") {
+		return out
+	}
+	rest = strings.TrimSpace(rest[len("Bearer "):])
+	for len(rest) > 0 {
+		eq := strings.IndexByte(rest, '=')
+		if eq < 0 {
+			break
+		}
+		key := strings.TrimSpace(rest[:eq])
+		rest = rest[eq+1:]
+		var val string
+		if strings.HasPrefix(rest, `"`) {
+			rest = rest[1:]
+			end := strings.IndexByte(rest, '"')
+			if end < 0 {
+				break
+			}
+			val = rest[:end]
+			rest = rest[end+1:]
+		} else {
+			end := strings.IndexByte(rest, ',')
+			if end < 0 {
+				val = rest
+				rest = ""
+			} else {
+				val = rest[:end]
+				rest = rest[end:]
+			}
+		}
+		out[strings.ToLower(key)] = val
+		rest = strings.TrimLeft(rest, ", \t")
+	}
+	return out
+}
+
+// metricReader wraps a ReadCloser, counts bytes, and fires onClose once.
+type metricReader struct {
+	io.ReadCloser
+	n       int64
+	closed  bool
+	onClose func(n int64)
+}
+
+func (m *metricReader) Read(p []byte) (int, error) {
+	n, err := m.ReadCloser.Read(p)
+	m.n += int64(n)
+	return n, err
+}
+
+func (m *metricReader) Close() error {
+	if !m.closed {
+		m.closed = true
+		if m.onClose != nil {
+			m.onClose(m.n)
+		}
+	}
+	return m.ReadCloser.Close()
+}

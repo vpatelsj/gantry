@@ -1,0 +1,22 @@
+# Build artifacts
+/bin/
+/dist/
+*.test
+*.out
+coverage.txt
+
+# Go workspace
+go.work
+go.work.sum
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+*.swp
+
+# Local env
+.env
+.envrc
