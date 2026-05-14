@@ -228,8 +228,15 @@ func runAgent(args []string) error {
 	// requires Kubernetes credentials (in-cluster or explicit
 	// kubeconfig); when neither is available we fall back to a
 	// single-self membership view that disables cold-start so the
-	// mirror keeps Phase 1 behaviour for local development.
-	memberView, membersStop := buildMembers(ctx, c, disco, logger)
+	// mirror keeps Phase 1 behaviour for local development. When
+	// production K8s env vars are set (GANTRY_NODE_NAME etc.)
+	// failure to start the informer is fatal — silently degrading
+	// to single-node mode in production would advertise a healthy
+	// agent that is in fact running with no peer coordination.
+	memberView, membersStop, err := buildMembers(ctx, c, disco, logger)
+	if err != nil {
+		return fmt.Errorf("members: %w", err)
+	}
 	defer membersStop()
 
 	// Phase 3 (cont.) — self-announce: write libp2p peer.ID, listen
@@ -873,16 +880,46 @@ func newPhase3Metrics(reg *metrics.Registry, infl *inflight.Map) *phase3Metrics 
 	}
 }
 
+// isProductionMode reports whether the caller has set any of the
+// Kubernetes-Downward-API signals that imply the agent is running
+// inside a real cluster (DaemonSet wiring sets all three via
+// metadata.name, spec.nodeName, and a fixed Namespace env var). When
+// true, a single-self membership fallback is unsafe because the
+// operator believes peer coordination is active.
+func isProductionMode(c *config.Config) bool {
+	return c.NodeName != "" || c.PodName != "" || c.MembersNamespace != ""
+}
+
 // buildMembers tries to construct a k8s-informer-backed Members
-// Manager. When required config is missing or the informer fails to
-// start, it falls back to a single-self stub (so dev/test runs stay
-// functional). Returns the Members impl plus a stop function the caller
-// MUST defer.
-func buildMembers(ctx context.Context, c *config.Config, disco *discovery.Host, logger *slog.Logger) (ifaces.Members, func()) {
+// Manager. Behaviour depends on whether production-mode env vars
+// signal that K8s membership is expected:
+//
+//   - Dev mode (NodeName, PodName, and MembersNamespace all empty):
+//     fall back silently to a single-self stub. Cold-start is
+//     disabled downstream via hasMultiNodeMembership; the agent
+//     serves the Phase 1 direct-mirror path. This is the path local
+//     `go run` invocations take.
+//
+//   - Production mode (any of NodeName / PodName / MembersNamespace
+//     non-empty): an informer construction or Start failure is
+//     fatal. Returning a single-self stub here would advertise a
+//     healthy agent that is silently running with no peer
+//     coordination at all — worse than crash-looping, because the
+//     operator sees no signal.
+//
+//   - WaitForSync timeout remains a warning regardless of mode: the
+//     informer may sync moments later, the bootstrap loop retries
+//     dialing periodically, and the readiness probe blocks until
+//     the routing table is non-empty.
+func buildMembers(ctx context.Context, c *config.Config, disco *discovery.Host, logger *slog.Logger) (ifaces.Members, func(), error) {
+	prodMode := isProductionMode(c)
 	// Required inputs for the real informer path.
 	if c.NodeName == "" || c.MembersLabelSelector == "" {
+		if prodMode {
+			return nil, nil, fmt.Errorf("production mode (NodeName/PodName/Namespace set) but NodeName or LabelSelector missing: refusing to silently fall back to single-self stub")
+		}
 		logger.Info("members: using single-self stub (NodeName/LabelSelector unset)")
-		return singleSelfMembers(c, disco), func() {}
+		return singleSelfMembers(c, disco), func() {}, nil
 	}
 	mgr, err := members.New(members.Options{
 		NodeName:      c.NodeName,
@@ -893,12 +930,20 @@ func buildMembers(ctx context.Context, c *config.Config, disco *discovery.Host, 
 		TransferPort:  transferPortFromListen(c.TransferListen),
 	})
 	if err != nil {
-		logger.Warn("members.New failed; falling back to single-self stub", slog.Any("err", err))
-		return singleSelfMembers(c, disco), func() {}
+		if prodMode {
+			return nil, nil, fmt.Errorf("members.New: %w", err)
+		}
+		logger.Warn("members.New failed; falling back to single-self stub (dev mode)", slog.Any("err", err))
+		return singleSelfMembers(c, disco), func() {}, nil
 	}
 	if err := mgr.Start(ctx); err != nil {
-		logger.Warn("members.Start failed; falling back to single-self stub", slog.Any("err", err))
-		return singleSelfMembers(c, disco), func() {}
+		if prodMode {
+			mgr.Stop()
+			return nil, nil, fmt.Errorf("members.Start: %w", err)
+		}
+		logger.Warn("members.Start failed; falling back to single-self stub (dev mode)", slog.Any("err", err))
+		mgr.Stop()
+		return singleSelfMembers(c, disco), func() {}, nil
 	}
 	syncCtx, syncCancel := context.WithTimeout(ctx, 10*time.Second)
 	if err := mgr.WaitForSync(syncCtx); err != nil {
@@ -909,7 +954,7 @@ func buildMembers(ctx context.Context, c *config.Config, disco *discovery.Host, 
 		slog.String("node_name", c.NodeName),
 		slog.Int("peers", len(mgr.Snapshot())),
 	)
-	return mgr, mgr.Stop
+	return mgr, mgr.Stop, nil
 }
 
 // singleSelfMembers returns a single-entry Members view for dev/test

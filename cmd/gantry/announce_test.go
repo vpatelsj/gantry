@@ -3,6 +3,7 @@ package main
 import (
 	"testing"
 
+	"github.com/gantry/gantry/internal/config"
 	"github.com/gantry/gantry/internal/ifaces"
 	"github.com/gantry/gantry/internal/ifaces/fakes"
 	"github.com/gantry/gantry/internal/members"
@@ -165,4 +166,47 @@ func TestHasMultiNodeMembership(t *testing.T) {
 			t.Errorf("hasMultiNodeMembership(single-self fake) = true, want false (no peers to coordinate)")
 		}
 	})
+}
+
+// isProductionMode is the gate that decides whether a Kubernetes-
+// membership setup failure crashes the agent or silently falls back
+// to a single-self stub. Misclassifying this is the difference
+// between a clear deploy-time error and an apparently-healthy agent
+// running with no peer coordination.
+func TestIsProductionMode(t *testing.T) {
+	cases := []struct {
+		name string
+		mut  func(c *config.Config)
+		want bool
+	}{
+		{
+			name: "all empty is dev mode",
+			mut:  func(*config.Config) {},
+			want: false,
+		},
+		{
+			name: "NodeName set is production",
+			mut:  func(c *config.Config) { c.NodeName = "node-1" },
+			want: true,
+		},
+		{
+			name: "PodName set is production",
+			mut:  func(c *config.Config) { c.PodName = "gantry-abc" },
+			want: true,
+		},
+		{
+			name: "MembersNamespace set is production",
+			mut:  func(c *config.Config) { c.MembersNamespace = "gantry-system" },
+			want: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := &config.Config{}
+			tc.mut(c)
+			if got := isProductionMode(c); got != tc.want {
+				t.Errorf("isProductionMode = %v, want %v", got, tc.want)
+			}
+		})
+	}
 }
