@@ -20,6 +20,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -40,6 +41,7 @@ import (
 	"github.com/gantry/gantry/internal/members"
 	"github.com/gantry/gantry/internal/metrics"
 	"github.com/gantry/gantry/internal/mirror"
+	"github.com/gantry/gantry/internal/negcache"
 	"github.com/gantry/gantry/internal/origin"
 	"github.com/gantry/gantry/internal/transfer"
 )
@@ -199,6 +201,20 @@ func runAgent(args []string) error {
 	inflightMap := inflight.New(inflight.DefaultStalls(), nil)
 	p3 := newPhase3Metrics(reg, inflightMap)
 
+	// Phase 4 — §5.8 origin-failure negative cache (puller-local) +
+	// stall-takeover metric. Constructed before the pump so the pump
+	// can consult it; the coord server is given a thin adapter so
+	// pull_intent_query responses surface recently_failed.
+	p4 := newPhase4Metrics(reg)
+	negCache := negcache.New(negcache.Options{
+		Initial:    c.OriginFailureCooldownInitial,
+		Max:        c.OriginFailureCooldownMax,
+		Multiplier: c.OriginFailureCooldownMultiplier,
+		OnEnter:    func(class ifaces.FailureClass) { p4.observeEnter(class) },
+		OnHit:      func(class ifaces.FailureClass) { p4.observeHit(class) },
+		OnSize:     func(n int) { p4.setSize(n) },
+	})
+
 	coordClient := coord.NewClient(disco.LibP2P(),
 		coord.WithClientLogger(logger),
 	)
@@ -206,7 +222,7 @@ func runAgent(args []string) error {
 	// puller (§5.2 step 7). The pump itself MUST NOT block the coord
 	// stream handler; the actual origin fetch + cache write + dht
 	// Provide all happen in a detached goroutine.
-	pullerPump := newPullerPump(inflightMap, originClient, cstore, disco, logger)
+	pullerPump := newPullerPump(inflightMap, originClient, cstore, disco, negCache, logger)
 	coordServer := coord.NewServer(cstore, memberView, inflightMap,
 		coord.WithLogger(logger),
 		coord.WithMetrics(coord.MetricsHooks{
@@ -215,6 +231,7 @@ func runAgent(args []string) error {
 			OnPleasePullStarted: func() { p3.coordPleasePullStarted.Inc() },
 			OnStreamError:       func() { p3.coordStreamError.Inc() },
 		}),
+		coord.WithNegativeCache(negCacheAdapter{c: negCache}),
 		coord.WithPullerPump(pullerPump),
 	)
 	coordServer.Bind(disco.LibP2P())
@@ -242,6 +259,9 @@ func runAgent(args []string) error {
 				OnTopKProbeHit:  func() { p3.topkProbeHit.Inc() },
 				OnColdStartDuration: func(kindLabel, outcome string, d time.Duration) {
 					p3.coldStartDuration.WithLabelValues(kindLabel, outcome).Observe(d.Seconds())
+				},
+				OnDesignatedPullerTakeover: func(kindLabel string) {
+					p4.designatedPullerTakeoverTotal.WithLabelValues(kindLabel).Inc()
 				},
 			},
 		})
@@ -683,12 +703,29 @@ func (a coldStartAdapter) Resolve(ctx context.Context, d digest.Digest, kind ifa
 //
 // On success, the pulled bytes land in the local cache (digest-
 // verifying writer) and are then advertised via dht.Provide so peer
-// requesters can discover them through the warm path. Failures during
-// the background fetch are logged; Phase 4 will plumb them into the
-// negative cache (§5.8).
-func newPullerPump(infl *inflight.Map, originClient ifaces.OriginPuller, cstore ifaces.Cache, disco *discovery.Host, logger *slog.Logger) coord.PullerPump {
+// requesters can discover them through the warm path.
+//
+// On failure, the §5.8 negative cache is consulted/updated:
+//   - Before starting an origin pull, the pump checks negCache for an
+//     active cooldown; if present, please_pull short-circuits with
+//     OUTCOME_RECENTLY_FAILED (cluster-wide propagation).
+//   - On terminal origin failure, the goroutine classifies via the
+//     *ifaces.OriginError wrapper and records the failure so the next
+//     pull_intent_query response surfaces recently_failed.
+func newPullerPump(infl *inflight.Map, originClient ifaces.OriginPuller, cstore ifaces.Cache, disco *discovery.Host, neg *negcache.Cache, logger *slog.Logger) coord.PullerPump {
 	lg := logger.With(slog.String("subsystem", "puller-pump"))
 	return func(_ context.Context, registry, repository string, d digest.Digest, kind ifaces.OriginRefKind) (time.Time, bool, *coord.NegativeEntry) {
+		// §5.8 short-circuit: if we're inside a cooldown window, refuse
+		// to start a new origin pull and surface the existing entry so
+		// the requester gets recently_failed without round-tripping.
+		if neg != nil {
+			if e, ok := neg.Lookup(d); ok {
+				return time.Time{}, false, &coord.NegativeEntry{
+					CooldownUntil: e.CooldownUntil,
+					Class:         e.Class,
+				}
+			}
+		}
 		// Dedupe at this node: if a pull is already running, the
 		// stream handler must report ALREADY_PULLING with the existing
 		// start time so the requester can run the §5.6 stall check.
@@ -699,7 +736,7 @@ func newPullerPump(infl *inflight.Map, originClient ifaces.OriginPuller, cstore 
 		// Detach the actual fetch from the stream handler. The pump
 		// returns immediately; the goroutine owns the inflight handle.
 		startedAt := existing.StartedAt
-		go runOriginPull(originClient, cstore, disco, lg, h, registry, repository, d, kind)
+		go runOriginPull(originClient, cstore, disco, neg, lg, h, registry, repository, d, kind)
 		return startedAt, false, nil
 	}
 }
@@ -707,7 +744,18 @@ func newPullerPump(infl *inflight.Map, originClient ifaces.OriginPuller, cstore 
 // runOriginPull executes an origin pull → cache write → dht.Provide
 // pipeline for d. Caller owns the inflight handle and must arrange for
 // Done() to be called exactly once; we do that here on every exit path.
-func runOriginPull(originClient ifaces.OriginPuller, cstore ifaces.Cache, disco *discovery.Host, lg *slog.Logger, h *inflight.Handle, registry, repository string, d digest.Digest, kind ifaces.OriginRefKind) {
+//
+// §5.8 wiring:
+//   - Terminal origin errors are classified via *ifaces.OriginError and
+//     recorded into the negative cache so the next probe surfaces
+//     recently_failed.
+//   - I/O / cache-side failures (copy + commit) are recorded as
+//     FailureTransient: they are not the origin's fault, but treating
+//     them as transient blocks the cluster from re-hammering the same
+//     puller on a flapping local disk while still self-healing.
+//   - On commit success, we clear any prior entry so the ladder resets
+//     for the next failure run.
+func runOriginPull(originClient ifaces.OriginPuller, cstore ifaces.Cache, disco *discovery.Host, neg *negcache.Cache, lg *slog.Logger, h *inflight.Handle, registry, repository string, d digest.Digest, kind ifaces.OriginRefKind) {
 	defer h.Done()
 
 	// Background context: the requesting peer's stream is already
@@ -724,39 +772,31 @@ func runOriginPull(originClient ifaces.OriginPuller, cstore ifaces.Cache, disco 
 	}
 	rc, _, err := originClient.Pull(ctx, ref)
 	if err != nil {
-		lg.Warn("origin pull failed",
-			slog.String("digest", d.String()),
-			slog.String("registry", registry),
-			slog.String("repository", repository),
-			slog.Any("err", err),
-		)
+		recordOriginFailure(neg, d, err, lg, "origin pull failed", registry, repository)
 		return
 	}
 	defer func() { _ = rc.Close() }()
 
 	w, err := cstore.Writer(ctx, d)
 	if err != nil {
-		lg.Warn("cache writer open failed",
-			slog.String("digest", d.String()),
-			slog.Any("err", err),
-		)
+		recordOriginFailure(neg, d, err, lg, "cache writer open failed", registry, repository)
 		return
 	}
 	defer func() { _ = w.Abort(ctx) }()
 
 	if _, err := io.Copy(w, rc); err != nil {
-		lg.Warn("origin pull copy failed",
-			slog.String("digest", d.String()),
-			slog.Any("err", err),
-		)
+		recordOriginFailure(neg, d, err, lg, "origin pull copy failed", registry, repository)
 		return
 	}
 	if err := w.Commit(ctx); err != nil {
-		lg.Warn("cache commit failed (digest mismatch or io error)",
-			slog.String("digest", d.String()),
-			slog.Any("err", err),
-		)
+		recordOriginFailure(neg, d, err, lg, "cache commit failed (digest mismatch or io error)", registry, repository)
 		return
+	}
+
+	// Success: clear any prior negative-cache entry so the next
+	// failure starts the ladder from Initial again (§5.8 "Self-healing").
+	if neg != nil {
+		neg.RecordSuccess(d)
 	}
 
 	// Advertise the new digest so peer requesters can discover us
@@ -775,4 +815,93 @@ func runOriginPull(originClient ifaces.OriginPuller, cstore ifaces.Cache, disco 
 		slog.String("registry", registry),
 		slog.String("repository", repository),
 	)
+}
+
+// recordOriginFailure classifies err and records the failure into the
+// per-puller §5.8 negative cache. Non-§5.8 callers (e.g. cache I/O
+// errors not covered by *ifaces.OriginError) are bucketed as
+// FailureTransient: see runOriginPull's docs for why we still record
+// them. The log is emitted at WARN regardless of class.
+func recordOriginFailure(neg *negcache.Cache, d digest.Digest, err error, lg *slog.Logger, msg, registry, repository string) {
+	class := ifaces.FailureTransient
+	var oe *ifaces.OriginError
+	if errors.As(err, &oe) && oe.Class != ifaces.FailureUnspecified {
+		class = oe.Class
+	}
+	lg.Warn(msg,
+		slog.String("digest", d.String()),
+		slog.String("registry", registry),
+		slog.String("repository", repository),
+		slog.String("failure_class", string(class)),
+		slog.Any("err", err),
+	)
+	if neg != nil {
+		neg.RecordFailure(d, class)
+	}
+}
+
+// negCacheAdapter bridges *negcache.Cache to coord.NegativeCache.
+// Required because internal/negcache must not import internal/coord
+// (would cycle on the metric hooks the coord server uses).
+type negCacheAdapter struct{ c *negcache.Cache }
+
+func (a negCacheAdapter) Lookup(d digest.Digest) (coord.NegativeEntry, bool) {
+	e, ok := a.c.Lookup(d)
+	if !ok {
+		return coord.NegativeEntry{}, false
+	}
+	return coord.NegativeEntry{
+		CooldownUntil: e.CooldownUntil,
+		Class:         e.Class,
+	}, true
+}
+
+// phase4Metrics groups the §7.6 instruments owned by Phase 4: the §5.8
+// negative-cache entry gauge + hit counters, and the §5.6 designated-
+// puller takeover counter. The takeover counter is incremented from
+// the cold-start orchestrator (requester side); the cache metrics
+// come from negcache.Cache callbacks (puller side).
+type phase4Metrics struct {
+	size                          atomic.Int64
+	hits                          *prometheus.CounterVec
+	enters                        *prometheus.CounterVec
+	designatedPullerTakeoverTotal *prometheus.CounterVec
+}
+
+func newPhase4Metrics(reg *metrics.Registry) *phase4Metrics {
+	p := &phase4Metrics{}
+	_ = reg.NewGaugeFunc("coord", prometheus.GaugeOpts{
+		Name: "p2p_negative_cache_entries",
+		Help: "Active §5.8 negative-cache entries on this puller (per-digest cooldowns).",
+	}, func() float64 { return float64(p.size.Load()) })
+	p.hits = reg.NewCounterVec("coord", prometheus.CounterOpts{
+		Name: "p2p_negative_cache_hit_total",
+		Help: "Lookups against the §5.8 negative cache that returned an active cooldown, by failure class.",
+	}, []string{"class"})
+	p.enters = reg.NewCounterVec("coord", prometheus.CounterOpts{
+		Name: "p2p_negative_cache_enter_total",
+		Help: "New or extended §5.8 negative-cache entries by failure class.",
+	}, []string{"class"})
+	p.designatedPullerTakeoverTotal = reg.NewCounterVec("coord", prometheus.CounterOpts{
+		Name: "p2p_designated_puller_takeover_total",
+		Help: "Cold-start observations where the rank-0 puller's in-flight pull was older than the §5.2a stall threshold, triggering a §5.6 takeover by the next-ranked node.",
+	}, []string{"digest_kind"})
+	return p
+}
+
+func (p *phase4Metrics) observeEnter(class ifaces.FailureClass) {
+	p.enters.WithLabelValues(failureClassLabel(class)).Inc()
+}
+
+func (p *phase4Metrics) observeHit(class ifaces.FailureClass) {
+	p.hits.WithLabelValues(failureClassLabel(class)).Inc()
+}
+
+func (p *phase4Metrics) setSize(n int) { p.size.Store(int64(n)) }
+
+func failureClassLabel(c ifaces.FailureClass) string {
+	if c == ifaces.FailureUnspecified {
+		return "unspecified"
+	}
+	return string(c)
 }

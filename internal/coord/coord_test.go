@@ -193,6 +193,106 @@ func TestPleasePull_AlreadyPulling(t *testing.T) {
 	}
 }
 
+// stubNegCache implements coord.NegativeCache for testing §5.8 wiring.
+type stubNegCache struct {
+	entries map[digest.Digest]coord.NegativeEntry
+}
+
+func (s stubNegCache) Lookup(d digest.Digest) (coord.NegativeEntry, bool) {
+	e, ok := s.entries[d]
+	return e, ok
+}
+
+func TestPullIntent_NegativeCacheSurfaced(t *testing.T) {
+	hClient, hServer := makeHostPair(t)
+
+	c, err := cache.Open(t.TempDir(), 1<<30)
+	if err != nil {
+		t.Fatalf("cache.Open: %v", err)
+	}
+	members := fakes.NewMembers(ifaces.NodeID(hServer.ID().String()),
+		ifaces.Node{ID: ifaces.NodeID(hServer.ID().String()), Addr: "x"},
+	)
+	infl := inflight.New(inflight.DefaultStalls(), nil)
+
+	d := digest.MustParse("sha256:" + rep('f', 64))
+	cooldownUntil := time.Now().Add(30 * time.Second).UTC().Truncate(time.Microsecond)
+	neg := stubNegCache{entries: map[digest.Digest]coord.NegativeEntry{
+		d: {CooldownUntil: cooldownUntil, Class: ifaces.FailureRateLimited},
+	}}
+
+	srv := coord.NewServer(c, members, infl, coord.WithNegativeCache(neg))
+	srv.Bind(hServer)
+	cli := coord.NewClient(hClient)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	intent, err := cli.PullIntentQuery(ctx, ifaces.NodeID(hServer.ID().String()), d)
+	if err != nil {
+		t.Fatalf("PullIntentQuery: %v", err)
+	}
+	if !intent.RecentlyFailed {
+		t.Fatalf("RecentlyFailed = false, want true")
+	}
+	if intent.FailureClass != ifaces.FailureRateLimited {
+		t.Fatalf("FailureClass = %v, want FailureRateLimited", intent.FailureClass)
+	}
+	if !intent.CooldownUntil.Equal(cooldownUntil) {
+		t.Fatalf("CooldownUntil = %v, want %v", intent.CooldownUntil, cooldownUntil)
+	}
+}
+
+func TestPleasePull_RecentlyFailedShortCircuit(t *testing.T) {
+	hClient, hServer := makeHostPair(t)
+
+	c, err := cache.Open(t.TempDir(), 1<<30)
+	if err != nil {
+		t.Fatalf("cache.Open: %v", err)
+	}
+	members := fakes.NewMembers(ifaces.NodeID(hServer.ID().String()))
+	infl := inflight.New(inflight.DefaultStalls(), nil)
+
+	d := digest.MustParse("sha256:" + rep('7', 64))
+	cooldownUntil := time.Now().Add(time.Minute).UTC().Truncate(time.Microsecond)
+
+	// Pump returns *NegativeEntry to short-circuit (real puller would
+	// consult its negcache before starting an origin pull).
+	var pumpCalls int32
+	pump := coord.PullerPump(func(_ context.Context, _ string, _ string, _ digest.Digest, _ ifaces.OriginRefKind) (time.Time, bool, *coord.NegativeEntry) {
+		atomic.AddInt32(&pumpCalls, 1)
+		return time.Time{}, false, &coord.NegativeEntry{
+			CooldownUntil: cooldownUntil,
+			Class:         ifaces.FailureAuth,
+		}
+	})
+	srv := coord.NewServer(c, members, infl, coord.WithPullerPump(pump))
+	srv.Bind(hServer)
+	cli := coord.NewClient(hClient)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	outs, err := cli.PleasePull(ctx, ifaces.NodeID(hServer.ID().String()), "reg", "repo", []digest.Digest{d})
+	if err != nil {
+		t.Fatalf("PleasePull: %v", err)
+	}
+	if len(outs) != 1 {
+		t.Fatalf("len(outs) = %d, want 1", len(outs))
+	}
+	o := outs[0]
+	if o.Outcome != ifaces.PleasePullRecentlyFailed {
+		t.Fatalf("Outcome = %v, want PleasePullRecentlyFailed", o.Outcome)
+	}
+	if o.FailureClass != ifaces.FailureAuth {
+		t.Fatalf("FailureClass = %v, want FailureAuth", o.FailureClass)
+	}
+	if !o.CooldownUntil.Equal(cooldownUntil) {
+		t.Fatalf("CooldownUntil = %v, want %v", o.CooldownUntil, cooldownUntil)
+	}
+	if got := atomic.LoadInt32(&pumpCalls); got != 1 {
+		t.Fatalf("pumpCalls = %d, want 1", got)
+	}
+}
+
 func TestClient_UnknownNodeReturnsError(t *testing.T) {
 	hClient, _ := makeHostPair(t)
 	cli := coord.NewClient(hClient)

@@ -183,6 +183,43 @@ func TestRule1_FailureShortCircuitBeatsCacheHit(t *testing.T) {
 	}
 }
 
+// TestRule1_ClusterWideTrustedClasses covers §5.8's requester rule:
+// auth / not_found / rate_limited are trusted cluster-wide, so a
+// single reachable node reporting any of them must short-circuit the
+// cascade. Transient is handled separately by rule 4 (TestRule4_*).
+func TestRule1_ClusterWideTrustedClasses(t *testing.T) {
+	classes := []ifaces.FailureClass{
+		ifaces.FailureAuth,
+		ifaces.FailureNotFound,
+		ifaces.FailureRateLimited,
+	}
+	for _, fc := range classes {
+		fc := fc
+		t.Run(string(fc), func(t *testing.T) {
+			d := digest.MustParse("sha256:" + rep('b', 64))
+			nodes := clusterNodes()
+			top := hrw.TopK(nodes, d, 3)
+			coord := &stubCoord{intents: map[ifaces.NodeID]ifaces.PullIntent{
+				top[0].Node.ID: {RecentlyFailed: true, FailureClass: fc, CooldownUntil: time.Now().Add(time.Minute)},
+				top[1].Node.ID: {},
+				top[2].Node.ID: {},
+			}}
+			disco := &stubDisco{}
+			r := buildResolver(t, coord, disco, "self", nodes, coldstart.MetricsHooks{}, time.Now)
+
+			_, err := r.Resolve(context.Background(), d, ifaces.KindManifest, "reg.example.com", "test/repo", 0)
+			if !errors.Is(err, coldstart.ErrFailureShortCircuit) {
+				t.Fatalf("class=%s err = %v; want ErrFailureShortCircuit", fc, err)
+			}
+			// Crucially, no please_pull dialed: rule 1 forbids it
+			// because rank-1 will get the same answer.
+			if len(coord.pleasePullCalls) != 0 {
+				t.Fatalf("class=%s: please_pull dialed %d times, want 0", fc, len(coord.pleasePullCalls))
+			}
+		})
+	}
+}
+
 func TestRule3_InFlightThenDhtProvider(t *testing.T) {
 	d := digest.MustParse("sha256:" + rep('c', 64))
 	nodes := clusterNodes()
@@ -233,7 +270,15 @@ func TestRule3_InFlightStaleExcluded(t *testing.T) {
 		providers: [][]ifaces.Provider{nil, {{NodeID: "x", Addr: "x:5001"}}},
 	}
 
-	r := buildResolver(t, coord, disco, "self", nodes, coldstart.MetricsHooks{}, func() time.Time { return now })
+	// §5.6: the stale puller exclusion must fire the takeover metric so
+	// operators can observe rank-0 → rank-1 routing.
+	var takeoverKinds []string
+	hooks := coldstart.MetricsHooks{
+		OnDesignatedPullerTakeover: func(kindLabel string) {
+			takeoverKinds = append(takeoverKinds, kindLabel)
+		},
+	}
+	r := buildResolver(t, coord, disco, "self", nodes, hooks, func() time.Time { return now })
 
 	_, err := r.Resolve(context.Background(), d, ifaces.KindManifest, "reg.example.com", "test/repo", 0)
 	// Without expansion, rule 7 runs from the first pass. But the
@@ -242,6 +287,14 @@ func TestRule3_InFlightStaleExcluded(t *testing.T) {
 	// is NOT triggered, so the cascade reports exhausted.
 	if !errors.Is(err, coldstart.ErrExhausted) {
 		t.Logf("err = %v (acceptable: cascade exhausted under healthy DHT without expansion)", err)
+	}
+	if len(takeoverKinds) == 0 {
+		t.Fatalf("OnDesignatedPullerTakeover never fired; want at least one (manifest)")
+	}
+	for _, k := range takeoverKinds {
+		if k != "manifest" {
+			t.Errorf("OnDesignatedPullerTakeover kind = %q; want \"manifest\"", k)
+		}
 	}
 }
 

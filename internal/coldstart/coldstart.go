@@ -83,6 +83,13 @@ type MetricsHooks struct {
 	// elapsed time and the outcome rule that fired ("rule1".."rule7"
 	// or "expanded_rule_N").
 	OnColdStartDuration func(kindLabel, outcome string, d time.Duration)
+	// OnDesignatedPullerTakeover fires when a pull_intent_query
+	// responder reports in_flight=true but its started_at is older
+	// than the per-§5.2a stall threshold, so the requester excludes
+	// it from rule-3 piggyback and routes via the next-ranked node
+	// (rule 6 / rule 7). kindLabel is "manifest" or "layer". Maps to
+	// §7.6 metric `p2p_designated_puller_takeover_total`.
+	OnDesignatedPullerTakeover func(kindLabel string)
 }
 
 // Options configures a Resolver.
@@ -285,7 +292,7 @@ func (r *Resolver) probe(ctx context.Context, d digest.Digest, kind ifaces.Origi
 	}
 
 	// Rule 3: in-flight piggyback.
-	if v := findInFlight(reachable, r.opts.Inflight, kind, expectedSize, r.opts.Now()); v != nil {
+	if v := findInFlight(reachable, r.opts.Inflight, kind, expectedSize, r.opts.Now(), r.opts.Metrics.OnDesignatedPullerTakeover); v != nil {
 		if r.opts.Metrics.OnTopKProbeHit != nil {
 			r.opts.Metrics.OnTopKProbeHit()
 		}
@@ -400,7 +407,7 @@ func findCacheHit(rs []response) *response {
 	return nil
 }
 
-func findInFlight(rs []response, infl *inflight.Map, kind ifaces.OriginRefKind, expectedSize int64, now time.Time) *response {
+func findInFlight(rs []response, infl *inflight.Map, kind ifaces.OriginRefKind, expectedSize int64, now time.Time, onTakeover func(kindLabel string)) *response {
 	for i := range rs {
 		intent := rs[i].intent
 		if !intent.InFlight {
@@ -412,6 +419,11 @@ func findInFlight(rs []response, infl *inflight.Map, kind ifaces.OriginRefKind, 
 			elapsed := now.Sub(intent.StartedAt)
 			threshold := infl.Stalls().ResolveStall(kind, expectedSize)
 			if elapsed > threshold {
+				// Stale puller — emit the §7.6 takeover metric and
+				// keep searching. Rank-1 (next entry) may still serve.
+				if onTakeover != nil {
+					onTakeover(kindLabel(kind))
+				}
 				continue
 			}
 		}
