@@ -223,6 +223,121 @@ func buildColdStartMirror(t *testing.T, originBlobs map[digest.Digest][]byte, pr
 	return srv, &originHits, &peerFetches
 }
 
+// TestMirror_PeerProvidersExhaustedUnhealthyDHT_ConsultsColdStart covers
+// §7.7 rule-7 under the "stale providers" variant: the DHT returns a
+// non-empty provider set but every entry is dead (e.g. the peers crashed
+// without re-publishing). Without the cold-start consultation the mirror
+// would return 5xx and leave the request stuck behind stale DHT records;
+// with it, cold-start gets a chance to surface fresh providers or signal
+// ErrColdStartExhausted so NF5 can fire.
+func TestMirror_PeerProvidersExhaustedUnhealthyDHT_ConsultsColdStart(t *testing.T) {
+	body := []byte("the canonical bytes for this digest")
+	d := digestOf(body)
+
+	// Peer that has the blob (cold-start surfaces it on retry).
+	freshCache := fakes.NewCache()
+	freshCache.Put(d, body)
+	freshAddr := startPeerTransfer(t, freshCache)
+
+	// Dead peer that the DHT thinks has it (stale provider record).
+	deadCache := fakes.NewCache() // empty
+	deadAddr := startPeerTransfer(t, deadCache)
+
+	staleProviders := map[digest.Digest][]ifaces.Provider{
+		d: {{NodeID: "peer-stale", Addr: deadAddr}},
+	}
+	cs := &stubColdStart{
+		providers: []ifaces.Provider{{NodeID: "peer-fresh", Addr: freshAddr}},
+	}
+
+	srv, dht, originHits, peerFetches := buildColdStartMirrorExposingDHT(t,
+		map[digest.Digest][]byte{d: body}, staleProviders, cs)
+
+	// Drive DHT into Degraded so rule-7 fires (§7.7: < 0.7 is the gate).
+	dht.SetHealth(0.4)
+
+	resp, err := http.Get(srv.URL + "/v2/r/blobs/" + d.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != 200 {
+		got, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, body = %q; want 200 (cold-start should have surfaced fresh peer)", resp.StatusCode, got)
+	}
+	if atomic.LoadInt32(originHits) != 0 {
+		t.Errorf("origin hits = %d, want 0 (cold-start returned fresh peer)", *originHits)
+	}
+	if atomic.LoadInt32(peerFetches) != 1 {
+		t.Errorf("peer hits = %d, want 1 (the fresh peer)", *peerFetches)
+	}
+}
+
+// buildColdStartMirrorExposingDHT is buildColdStartMirror with the *fakes.DHT
+// returned so the test can tune Health(). Duplication is intentional —
+// tests that need DHT control are a small minority.
+func buildColdStartMirrorExposingDHT(t *testing.T, originBlobs map[digest.Digest][]byte, providers map[digest.Digest][]ifaces.Provider, cs mirror.ColdStartResolver) (*httptest.Server, *fakes.DHT, *int32, *int32) {
+	t.Helper()
+	var originHits int32
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&originHits, 1)
+		path := r.URL.Path
+		ref := ""
+		for _, sep := range []string{"/blobs/", "/manifests/"} {
+			if idx := stringsLastIndex(path, sep); idx >= 0 {
+				ref = path[idx+len(sep):]
+				break
+			}
+		}
+		d, err := digest.Parse(ref)
+		if err != nil {
+			w.WriteHeader(404)
+			return
+		}
+		body, ok := originBlobs[d]
+		if !ok {
+			w.WriteHeader(404)
+			return
+		}
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(body)))
+		_, _ = w.Write(body)
+	}))
+	t.Cleanup(up.Close)
+
+	cfg := &config.Config{
+		UpstreamRegistries: []config.UpstreamRegistry{
+			{Name: "reg.example.com", Endpoint: up.URL},
+		},
+	}
+	c, err := cache.Open(t.TempDir(), 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+	oc, err := origin.New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dht := fakes.NewDHT()
+	for d, p := range providers {
+		dht.Inject(d, p...)
+	}
+	var peerFetches int32
+	client := transfer.NewClient()
+	m := mirror.New(cfg, c, oc,
+		mirror.WithDiscovery(dht, client),
+		mirror.WithColdStart(cs),
+		mirror.WithPeerMetrics(func(o string) {
+			if o == "hit" {
+				atomic.AddInt32(&peerFetches, 1)
+			}
+		}, nil),
+	)
+	srv := httptest.NewServer(m.Handler())
+	t.Cleanup(srv.Close)
+	return srv, dht, &originHits, &peerFetches
+}
+
 // minimal lastIndex helper (avoids importing strings just for this).
 func stringsLastIndex(s, sub string) int {
 	for i := len(s) - len(sub); i >= 0; i-- {

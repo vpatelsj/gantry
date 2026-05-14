@@ -447,6 +447,13 @@ func (s *Server) serveDigest(w http.ResponseWriter, r *http.Request, upstream, r
 // peerFallbackResult is the tri-state outcome of tryPeerFallback.
 type peerFallbackResult int
 
+// unhealthyDHTHealthThreshold is the DHT health score below which the
+// mirror treats exhausted provider sets as likely-stale and consults
+// cold-start (§7.7 rule-7) instead of returning 5xx. Matches the
+// coldstart package's own health gate so the two layers agree on what
+// "unhealthy" means.
+const unhealthyDHTHealthThreshold = 0.7
+
 const (
 	// peerFallbackUnused means the DHT layer was bypassed: no DHT call
 	// fired (caller-gated), or it errored, or it returned no providers.
@@ -546,6 +553,38 @@ func (s *Server) tryPeerFallback(ctx context.Context, w http.ResponseWriter, r *
 		tried++
 		if s.fetchOneProvider(ctx, w, r, d, kind, upstream, repo, p, fetchBudget, logger) {
 			return peerFallbackServed
+		}
+	}
+	// All initial peer attempts failed. If the DHT is unhealthy AND we
+	// have a cold-start orchestrator, treat the provider set we just
+	// drained as stale and consult cold-start so rule-7 can unblock
+	// origin (§7.7). An unhealthy DHT doesn't re-publish provider
+	// records reliably, so persisting with "5xx because providers
+	// existed" leaves the caller stuck behind dead DHT entries.
+	if tried > 0 && s.coldStart != nil && s.dht.Health() < unhealthyDHTHealthThreshold {
+		logger.Debug("mirror: peer providers exhausted under unhealthy DHT, consulting cold-start",
+			slog.Float64("dht_health", s.dht.Health()),
+			slog.Int("attempted", tried),
+		)
+		res, csErr := s.coldStart.Resolve(ctx, d, kind, upstream, repo, 0)
+		if csErr != nil {
+			if errors.Is(csErr, ErrColdStartExhausted) {
+				return peerFallbackColdExhausted
+			}
+			return peerFallbackExhausted
+		}
+		// Cold-start surfaced fresh providers (rule-2 expansion).
+		// Give them the remaining maxAttempts budget; collisions with
+		// the already-tried set are unlikely because cold-start
+		// re-runs FindProviders with an expanded scope.
+		for _, p := range res.Providers {
+			if tried >= maxAttempts*2 {
+				break
+			}
+			tried++
+			if s.fetchOneProvider(ctx, w, r, d, kind, upstream, repo, p, fetchBudget, logger) {
+				return peerFallbackServed
+			}
 		}
 	}
 	return peerFallbackExhausted

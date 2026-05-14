@@ -130,18 +130,28 @@ type OriginRef struct {
 }
 
 // OriginRefKind discriminates manifest vs blob URLs at the upstream.
+//
+// Note on KindConfig: per the OCI Distribution Spec the image-config
+// document is fetched from /v2/<repo>/blobs/<digest> — the same URL
+// family as KindBlob. KindConfig therefore does NOT change routing;
+// it exists purely to tighten metric/log labels so cold-start manifest
+// → config → blob traversal is distinguishable from regular layer
+// fetches when reading dashboards or traces.
 type OriginRefKind int
 
 // Recognised OriginRefKind values.
 const (
 	KindBlob     OriginRefKind = 0
 	KindManifest OriginRefKind = 1
+	KindConfig   OriginRefKind = 2
 )
 
 func (k OriginRefKind) String() string {
 	switch k {
 	case KindManifest:
 		return "manifest"
+	case KindConfig:
+		return "config"
 	default:
 		return "blob"
 	}

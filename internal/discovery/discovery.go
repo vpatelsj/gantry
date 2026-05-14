@@ -35,8 +35,10 @@ import (
 	"fmt"
 	"log/slog"
 	mathrand "math/rand"
+	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"time"
 
@@ -91,16 +93,36 @@ type Options struct {
 	// background self-test loop (used in tests). Production default
 	// is 60s (§7.7).
 	SelfTestPeriod time.Duration
+
+	// TransferPort is the TCP port to suffix onto IP addresses returned
+	// by FindProviders. Zero defaults to 5001 (the design-doc value).
+	// In a cluster all agents share a transfer port by convention so
+	// inferring it from the local config is safe; the value travels
+	// through Options so test harnesses and operators that override the
+	// port don't get a hardcoded mismatch.
+	TransferPort int
 }
+
+// DefaultTransferPort is the conventional peer-transfer port used when
+// Options.TransferPort is zero. Kept exported so callers building Options
+// by hand can spell it explicitly.
+const DefaultTransferPort = 5001
 
 // FromConfig builds Options from a *config.Config.
 func FromConfig(c *config.Config) Options {
+	port := DefaultTransferPort
+	if _, p, err := net.SplitHostPort(c.TransferListen); err == nil {
+		if n, perr := strconv.Atoi(p); perr == nil && n > 0 {
+			port = n
+		}
+	}
 	return Options{
 		IdentityPath:   c.Libp2pIdentityPath,
 		ListenAddrs:    c.Libp2pListen,
 		BootstrapPeers: c.Libp2pBootstrapPeers,
 		ProtocolPrefix: "/gantry",
 		SelfTestPeriod: 60 * time.Second,
+		TransferPort:   port,
 	}
 }
 
@@ -109,6 +131,11 @@ type Host struct {
 	logger *slog.Logger
 	h      host.Host
 	d      *dht.IpfsDHT
+
+	// transferPort is the conventional peer-transfer port suffixed to
+	// FindProviders results' IP. Captured from Options at New() so
+	// FindProviders doesn't have to thread Options state.
+	transferPort int
 
 	// monitor is the Phase 5 §7.7 health tracker. Latency samples
 	// flow from FindProviders; the self-test loop is owned by
@@ -169,6 +196,10 @@ func New(ctx context.Context, opts Options) (*Host, error) {
 	}
 
 	host := &Host{logger: logger, h: h, d: d}
+	host.transferPort = opts.TransferPort
+	if host.transferPort == 0 {
+		host.transferPort = DefaultTransferPort
+	}
 	host.monitor = NewMonitor(MonitorOptions{
 		RoutingTableSize:   func() int { return d.RoutingTable().Size() },
 		RoutingTableTarget: opts.RoutingTableTarget,
@@ -288,7 +319,7 @@ func (h *Host) FindProviders(ctx context.Context, d digest.Digest) ([]ifaces.Pro
 	}
 	out := make([]ifaces.Provider, 0, len(ais))
 	for _, ai := range ais {
-		addr := transferAddr(ai)
+		addr := transferAddrWithPort(ai, h.transferPort)
 		if addr == "" {
 			continue
 		}
@@ -470,16 +501,17 @@ func DigestToCID(d digest.Digest) (cid.Cid, error) {
 	return cid.NewCidV1(cid.Raw, mh), nil
 }
 
-// transferAddr extracts the dial address for the peer's :5001 transfer
-// endpoint by walking its multiaddrs for an IPv4/IPv6 component. Returns
-// the empty string if no IP-based multiaddr is present.
-func transferAddr(ai peer.AddrInfo) string {
+// transferAddrWithPort extracts the dial address for the peer's transfer
+// endpoint by walking its multiaddrs for an IPv4/IPv6 component and
+// appending the configured port. Returns the empty string if no
+// IP-based multiaddr is present.
+func transferAddrWithPort(ai peer.AddrInfo, port int) string {
 	for _, ma := range ai.Addrs {
 		ip, ok := extractIP(ma)
 		if !ok {
 			continue
 		}
-		return ip + ":5001"
+		return ip + ":" + strconv.Itoa(port)
 	}
 	return ""
 }
