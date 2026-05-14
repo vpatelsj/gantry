@@ -187,7 +187,7 @@ func TestMirror_PeerFallback_NoProvidersFallsThroughToOrigin(t *testing.T) {
 	}
 }
 
-func TestMirror_PeerFallback_PeerNotFoundFallsThrough(t *testing.T) {
+func TestMirror_PeerFallback_PeerNotFoundExhaustsWarmPath(t *testing.T) {
 	body := []byte("origin-only")
 	d := digestOf(body)
 
@@ -206,19 +206,20 @@ func TestMirror_PeerFallback_PeerNotFoundFallsThrough(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != 200 {
-		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	// §5.1 v1 transfer policy: warm path exhausted → 5xx, NOT origin pull.
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 (warm path exhausted)", resp.StatusCode)
 	}
-	if atomic.LoadInt32(originHits) != 1 {
-		t.Errorf("origin hits = %d, want 1 (peer 404 -> origin fallback)", *originHits)
+	if atomic.LoadInt32(originHits) != 0 {
+		t.Errorf("origin hits = %d, want 0 (§5.1: containerd handles origin via hosts.toml)", *originHits)
 	}
 	if atomic.LoadInt32(peerFetches) != 0 {
 		t.Errorf("peer hits = %d, want 0", *peerFetches)
 	}
 }
 
-func TestMirror_PeerFallback_DialFailureFallsThroughToOrigin(t *testing.T) {
-	body := []byte("eventually-from-origin")
+func TestMirror_PeerFallback_DialFailureExhaustsWarmPath(t *testing.T) {
+	body := []byte("unreachable-peer")
 	d := digestOf(body)
 
 	// Provide an unreachable peer addr (port 1 is reliably refused).
@@ -266,11 +267,12 @@ func TestMirror_PeerFallback_DialFailureFallsThroughToOrigin(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != 200 {
-		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	// §5.1 v1 transfer policy: warm path exhausted → 5xx.
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 (warm path exhausted)", resp.StatusCode)
 	}
-	if atomic.LoadInt32(&originHits) != 1 {
-		t.Errorf("origin hits = %d, want 1", originHits)
+	if atomic.LoadInt32(&originHits) != 0 {
+		t.Errorf("origin hits = %d, want 0 (§5.1: agent must NOT origin-pull after warm-path exhaustion)", originHits)
 	}
 	if atomic.LoadInt32(&dialFailures) == 0 {
 		t.Error("expected at least one dial failure metric")

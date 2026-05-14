@@ -263,13 +263,23 @@ func (s *Server) serveDigest(w http.ResponseWriter, r *http.Request, upstream, r
 	s.bumpCacheMiss()
 
 	// 2. Peer fallback (Phase 2). If both DHT and PeerDialer are wired,
-	// try up to maxPeerAttempts providers from FindProviders before
-	// falling through to origin. On any successful peer fetch the bytes
-	// are committed to the local cache (digest-verified) and re-served
-	// from cache, ensuring the client never sees unverified bytes even
-	// if the peer responds with corrupt content.
+	// try up to maxPeerAttempts providers from FindProviders. The result
+	// is tri-state per design §5.1's "v1 transfer policy":
+	//   - served: bytes already written from a peer; we're done.
+	//   - exhausted: DHT had providers but all maxAttempts failed (stall
+	//     or error). Return 5xx so containerd's hosts.toml mirror chain
+	//     promotes the request to origin directly. The agent does *not*
+	//     do a direct origin pull here (Phase 5 NF5 owns the controlled
+	//     direct-origin path).
+	//   - unused: DHT not wired, errored, or returned empty providers.
+	//     Fall through to Phase 1's origin path; Phase 3's HRW probe
+	//     replaces this leg for the cold-start case.
 	if s.dht != nil && s.peer != nil {
-		if s.tryPeerFallback(ctx, w, r, d, kind, upstream, repo, logger) {
+		switch s.tryPeerFallback(ctx, w, r, d, kind, upstream, repo, logger) {
+		case peerFallbackServed:
+			return
+		case peerFallbackExhausted:
+			http.Error(w, "warm path exhausted", http.StatusServiceUnavailable)
 			return
 		}
 	}
@@ -313,12 +323,32 @@ func (s *Server) serveDigest(w http.ResponseWriter, r *http.Request, upstream, r
 	}
 }
 
+// peerFallbackResult is the tri-state outcome of tryPeerFallback.
+type peerFallbackResult int
+
+const (
+	// peerFallbackUnused means the DHT layer was bypassed: no DHT call
+	// fired (caller-gated), or it errored, or it returned no providers.
+	// The caller may fall through to origin (Phase 1 behavior).
+	peerFallbackUnused peerFallbackResult = iota
+	// peerFallbackServed means a peer's bytes were digest-verified,
+	// committed to cache, and streamed to the client. Caller must not
+	// write further bytes.
+	peerFallbackServed
+	// peerFallbackExhausted means the DHT returned providers but all
+	// maxAttempts of them failed (stall or error). Per §5.1's v1
+	// transfer policy the mirror must return 5xx so containerd's
+	// hosts.toml mirror chain advances to origin directly. The caller
+	// must NOT do its own origin pull — that's Phase 5 NF5's job.
+	peerFallbackExhausted
+)
+
 // tryPeerFallback attempts to satisfy a cache miss via a DHT-discovered
-// peer. Returns true if it served a response from a peer; false if the
-// caller should fall through to origin. No bytes are written to w until a
-// peer's body is digest-verified and committed to the local cache, so a
-// false return guarantees no partial response has been emitted.
-func (s *Server) tryPeerFallback(ctx context.Context, w http.ResponseWriter, r *http.Request, d digest.Digest, kind ifaces.OriginRefKind, upstream, repo string, logger *slog.Logger) bool {
+// peer. Returns one of peerFallbackResult above. No bytes are written to
+// w until a peer's body is digest-verified and committed to the local
+// cache, so non-served returns guarantee no partial response has been
+// emitted.
+func (s *Server) tryPeerFallback(ctx context.Context, w http.ResponseWriter, r *http.Request, d digest.Digest, kind ifaces.OriginRefKind, upstream, repo string, logger *slog.Logger) peerFallbackResult {
 	lookupBudget := s.peerLookupBudget
 	if lookupBudget <= 0 {
 		lookupBudget = 2 * time.Second
@@ -345,11 +375,11 @@ func (s *Server) tryPeerFallback(ctx context.Context, w http.ResponseWriter, r *
 		}
 		s.bumpDhtLookup(outcome, lookupDur)
 		logger.Debug("mirror: FindProviders error", slog.Any("err", err))
-		return false
+		return peerFallbackUnused
 	}
 	if len(providers) == 0 {
 		s.bumpDhtLookup("miss", lookupDur)
-		return false
+		return peerFallbackUnused
 	}
 	s.bumpDhtLookup("hit", lookupDur)
 
@@ -360,10 +390,10 @@ func (s *Server) tryPeerFallback(ctx context.Context, w http.ResponseWriter, r *
 		}
 		tried++
 		if s.fetchOneProvider(ctx, w, r, d, kind, upstream, repo, p, fetchBudget, logger) {
-			return true
+			return peerFallbackServed
 		}
 	}
-	return false
+	return peerFallbackExhausted
 }
 
 // fetchOneProvider streams from one peer into the local cache (which
