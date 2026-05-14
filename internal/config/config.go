@@ -108,6 +108,16 @@ type Config struct {
 	// addr so other agents can discover this peer (§7.2, §7.3).
 	PodName string `yaml:"pod_name"`
 
+	// PodIP is the agent's routable Pod IP. Sourced via the Downward
+	// API (env status.podIP) into GANTRY_POD_IP. Used to rewrite
+	// 0.0.0.0 wildcard listen addresses into dialable advertised
+	// addresses when self-announcing on Pod annotations (§7.2): a peer
+	// publishing 0.0.0.0:5001 is otherwise unreachable from other
+	// pods, defeating libp2p bootstrap on first-cluster boot. Empty
+	// when running outside Kubernetes; self-announce then publishes
+	// only non-wildcard listen addresses.
+	PodIP string `yaml:"pod_ip"`
+
 	// MembersNamespace restricts the Pod informer to a single namespace.
 	// Empty means cluster-wide (typical for Gantry as a privileged DaemonSet).
 	MembersNamespace string `yaml:"members_namespace"`
@@ -360,6 +370,7 @@ func (c *Config) LoadEnv(env func(string) string) error {
 
 	setStr("NODE_NAME", &c.NodeName)
 	setStr("POD_NAME", &c.PodName)
+	setStr("POD_IP", &c.PodIP)
 	setStr("MEMBERS_NAMESPACE", &c.MembersNamespace)
 	setStr("MEMBERS_LABEL_SELECTOR", &c.MembersLabelSelector)
 	setStr("MEMBERS_KUBECONFIG", &c.MembersKubeconfig)
@@ -404,6 +415,7 @@ func (c *Config) BindFlags(fs *flag.FlagSet) {
 
 	fs.StringVar(&c.NodeName, "node-name", c.NodeName, "Kubernetes node name this agent runs on (Downward API spec.nodeName)")
 	fs.StringVar(&c.PodName, "pod-name", c.PodName, "Kubernetes pod name of this agent (Downward API metadata.name)")
+	fs.StringVar(&c.PodIP, "pod-ip", c.PodIP, "Kubernetes pod IP of this agent (Downward API status.podIP); used to rewrite 0.0.0.0 listeners into dialable advertised addresses")
 	fs.StringVar(&c.MembersNamespace, "members-namespace", c.MembersNamespace, "namespace to scope the pod informer (empty = cluster-wide)")
 	fs.StringVar(&c.MembersLabelSelector, "members-label-selector", c.MembersLabelSelector, "label selector identifying Gantry DaemonSet pods")
 	fs.StringVar(&c.MembersKubeconfig, "members-kubeconfig", c.MembersKubeconfig, "optional path to a kubeconfig file (empty = in-cluster)")

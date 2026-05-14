@@ -371,3 +371,74 @@ func TestAnnounceSelf_RequiresNamespace(t *testing.T) {
 		t.Fatal("expected error when Namespace empty (cluster-wide informer)")
 	}
 }
+
+// SnapshotForBootstrap must include Running-but-NotReady pods that
+// have published p2p-addrs so first-cluster boot doesn't deadlock on
+// the readiness/RoutingTableSize circular dependency. It must also
+// exclude pods that haven't AnnounceSelf'd yet (no annotations).
+func TestSnapshotForBootstrap_IncludesNotReadyPodsWithAnnotations(t *testing.T) {
+	readyAnn := newPod("ready", "ns", "node-a", "10.0.0.1", true,
+		map[string]string{"app.kubernetes.io/name": "gantry"})
+	readyAnn.Annotations = map[string]string{
+		AnnotationPeerID:   "peer-ready",
+		AnnotationP2PAddrs: "/ip4/10.0.0.1/tcp/4001/p2p/peer-ready",
+	}
+	notReadyAnn := newPod("notready", "ns", "node-b", "10.0.0.2", false,
+		map[string]string{"app.kubernetes.io/name": "gantry"})
+	notReadyAnn.Annotations = map[string]string{
+		AnnotationPeerID:   "peer-notready",
+		AnnotationP2PAddrs: "/ip4/10.0.0.2/tcp/4001/p2p/peer-notready",
+	}
+	notReadyNoAnn := newPod("blank", "ns", "node-c", "10.0.0.3", false,
+		map[string]string{"app.kubernetes.io/name": "gantry"})
+	pending := newPod("pending", "ns", "node-d", "10.0.0.4", true,
+		map[string]string{"app.kubernetes.io/name": "gantry"})
+	pending.Status.Phase = corev1.PodPending
+	pending.Annotations = map[string]string{AnnotationP2PAddrs: "/ip4/10.0.0.4/tcp/4001/p2p/peer-pending"}
+
+	cs := fake.NewSimpleClientset(readyAnn, notReadyAnn, notReadyNoAnn, pending,
+		newNode("node-a", ""), newNode("node-b", ""), newNode("node-c", ""), newNode("node-d", ""),
+	)
+	m, err := New(Options{
+		NodeName:      "node-a",
+		Namespace:     "ns",
+		LabelSelector: "app.kubernetes.io/name=gantry",
+		Clientset:     cs,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(m.Stop)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := m.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	got := m.SnapshotForBootstrap()
+	gotIDs := map[string]bool{}
+	for _, n := range got {
+		gotIDs[string(n.ID)] = true
+	}
+	if !gotIDs["node-a"] {
+		t.Errorf("SnapshotForBootstrap missing Ready+annotated node-a; got %+v", got)
+	}
+	if !gotIDs["node-b"] {
+		t.Errorf("SnapshotForBootstrap missing NotReady+annotated node-b; this is the deadlock-breaker case the function exists for; got %+v", got)
+	}
+	if gotIDs["node-c"] {
+		t.Errorf("SnapshotForBootstrap should exclude annotation-less peers (no useful bootstrap addr); got %+v", got)
+	}
+	if gotIDs["node-d"] {
+		t.Errorf("SnapshotForBootstrap should exclude non-Running pods; got %+v", got)
+	}
+
+	// The regular Snapshot must still be Ready-only for the serving
+	// path: NotReady pods get bootstrap dials but no transfer load.
+	serving := m.Snapshot()
+	for _, n := range serving {
+		if string(n.ID) == "node-b" {
+			t.Errorf("Snapshot leaked NotReady node-b into serving view: %+v", serving)
+		}
+	}
+}

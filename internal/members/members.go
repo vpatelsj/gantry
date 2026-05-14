@@ -271,6 +271,57 @@ func splitAnnotation(v string) []string {
 	return out
 }
 
+// SnapshotForBootstrap returns the membership view used for libp2p
+// bootstrap dialing: every Running pod matching the selector that has
+// published a gantry.io/p2p-addrs annotation, regardless of Ready
+// status. This intentionally diverges from Snapshot() because the
+// readiness probe depends on a populated DHT routing table, which
+// depends on libp2p bootstrap, which (under Snapshot's filter) would
+// depend on at least one peer already being Ready — a deadlock on
+// first-cluster boot and full-cluster restart. Bootstrap-time peers
+// are a strictly larger set than serving-time peers; we want any peer
+// we can reach, even a NotReady one, just to seed the DHT.
+//
+// The serving path (HRW choice, transfer destinations) MUST keep
+// using Snapshot() so unready peers don't receive request traffic.
+func (m *Manager) SnapshotForBootstrap() []ifaces.Node {
+	out := []ifaces.Node{}
+	for _, obj := range m.podInf.GetStore().List() {
+		p, ok := obj.(*corev1.Pod)
+		if !ok {
+			continue
+		}
+		if p.Status.Phase != corev1.PodRunning {
+			continue
+		}
+		if p.Spec.NodeName == "" || p.Status.PodIP == "" {
+			continue
+		}
+		// Bootstrap is only useful when the peer has published its
+		// libp2p multiaddrs. Pods that haven't AnnounceSelf'd yet
+		// contribute nothing to a dial seed.
+		p2p := splitAnnotation(p.Annotations[AnnotationP2PAddrs])
+		if len(p2p) == 0 {
+			continue
+		}
+		addr := p.Status.PodIP
+		if m.transferPort > 0 {
+			addr = fmt.Sprintf("%s:%d", p.Status.PodIP, m.transferPort)
+		}
+		if a := p.Annotations[AnnotationTransferAddr]; a != "" {
+			addr = a
+		}
+		out = append(out, ifaces.Node{
+			ID:       ifaces.NodeID(p.Spec.NodeName),
+			Addr:     addr,
+			PeerID:   p.Annotations[AnnotationPeerID],
+			P2PAddrs: p2p,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out
+}
+
 // podReady reports whether a pod is in Running phase with a Ready=True
 // condition. Pending/Terminating pods are excluded from the membership view
 // so HRW does not score nodes that cannot serve traffic.

@@ -22,6 +22,7 @@ import (
 	"os/signal"
 	"runtime"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -1020,24 +1021,38 @@ func membershipPeerIDResolver(mv ifaces.Members, logger *slog.Logger) func(iface
 
 // announceSelfAndBootstrap publishes this agent's libp2p identity into
 // its own Pod's annotations, then dials every peer announcement in the
-// initial membership snapshot to seed the kad-dht routing table. The
+// membership snapshot to seed the kad-dht routing table. The
 // announcement is retried with exponential backoff on transient API
-// errors; bootstrap dials run once after the informer's initial sync
-// (kad-dht re-bootstraps periodically on its own thereafter).
+// errors; bootstrap dials run on a periodic loop (not once) so a
+// rolling deploy where peers patch their annotations at staggered
+// times still produces a populated routing table.
+//
+// The bootstrap snapshot intentionally includes NotReady pods
+// (SnapshotForBootstrap) because readiness depends on RoutingTableSize
+// being > 0 — a deadlock if every peer is waiting for every other
+// peer to be Ready first.
 func announceSelfAndBootstrap(ctx context.Context, mgr *members.Manager, disco *discovery.Host, c *config.Config, logger *slog.Logger) {
-	// Build the announcement.
+	// Build the announcement. Wildcard listen addresses (0.0.0.0,
+	// ::) are not dialable from other pods; substitute the agent's
+	// Pod IP so the published p2p-addrs are usable.
 	listenAddrs := disco.Addrs()
 	peerID := disco.PeerID()
 	multiaddrs := make([]string, 0, len(listenAddrs))
 	for _, la := range listenAddrs {
+		ma := rewriteWildcardMultiaddr(la.String(), c.PodIP)
+		if ma == "" {
+			// Skip wildcards we can't rewrite — better no entry
+			// than an undialable one.
+			continue
+		}
 		// Format /ip4/.../tcp/.../p2p/<peerID> so peers can dial
 		// directly without a separate ID resolution step.
-		multiaddrs = append(multiaddrs, la.String()+"/p2p/"+peerID.String())
+		multiaddrs = append(multiaddrs, ma+"/p2p/"+peerID.String())
 	}
 	ann := members.SelfAnnouncement{
 		PeerID:       peerID.String(),
 		P2PAddrs:     multiaddrs,
-		TransferAddr: c.TransferListen,
+		TransferAddr: advertisedTransferAddr(c.TransferListen, c.PodIP),
 	}
 
 	// Retry the patch with capped exponential backoff. The pod
@@ -1070,21 +1085,112 @@ func announceSelfAndBootstrap(ctx context.Context, mgr *members.Manager, disco *
 		}
 	}
 
-	// Seed libp2p bootstrap from the membership snapshot so DHT
-	// converges without operator-supplied bootstrap_peers config.
-	peerAddrs := make([]string, 0)
-	for _, n := range mgr.Snapshot() {
+	// Periodic bootstrap loop. A single ConnectPeers call at startup
+	// can miss peers whose AnnounceSelf hasn't completed yet (cold
+	// cluster boot, rolling deploys). We poll the bootstrap snapshot
+	// every 5s for the first minute, then back off to every 30s
+	// while RoutingTableSize is still below a healthy threshold, and
+	// stop entirely once the table is populated. kad-dht handles
+	// ongoing refresh from there.
+	const (
+		aggressiveInterval = 5 * time.Second
+		relaxedInterval    = 30 * time.Second
+		aggressiveBudget   = 60 * time.Second
+		healthyRTSize      = 5
+	)
+	bootstrapStart := time.Now()
+	for {
+		peerAddrs := bootstrapPeerAddrs(mgr)
+		if len(peerAddrs) > 0 {
+			connected := disco.ConnectPeers(ctx, peerAddrs)
+			logger.Debug("members: bootstrap dial pass",
+				slog.Int("connected", connected),
+				slog.Int("candidates", len(peerAddrs)),
+				slog.Int("routing_table", disco.RoutingTableSize()),
+			)
+		}
+		if disco.RoutingTableSize() >= healthyRTSize {
+			logger.Info("members: bootstrap converged; ceasing periodic dials",
+				slog.Int("routing_table", disco.RoutingTableSize()),
+				slog.Duration("elapsed", time.Since(bootstrapStart)),
+			)
+			return
+		}
+		interval := aggressiveInterval
+		if time.Since(bootstrapStart) > aggressiveBudget {
+			interval = relaxedInterval
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(interval):
+		}
+	}
+}
+
+// bootstrapPeerAddrs collects every published p2p multiaddr across all
+// peers in the bootstrap-view snapshot, excluding self.
+func bootstrapPeerAddrs(mgr *members.Manager) []string {
+	peers := mgr.SnapshotForBootstrap()
+	out := make([]string, 0, len(peers))
+	for _, n := range peers {
 		if n.ID == mgr.Self() || len(n.P2PAddrs) == 0 {
 			continue
 		}
-		peerAddrs = append(peerAddrs, n.P2PAddrs...)
+		out = append(out, n.P2PAddrs...)
 	}
-	if connected := disco.ConnectPeers(ctx, peerAddrs); connected > 0 {
-		logger.Info("members: bootstrap dial seeded from snapshot",
-			slog.Int("connected", connected),
-			slog.Int("candidates", len(peerAddrs)),
-		)
+	return out
+}
+
+// rewriteWildcardMultiaddr returns ma with any wildcard IP component
+// (/ip4/0.0.0.0 or /ip6/::) replaced by /ip4/<podIP> when podIP is
+// non-empty and parseable as an IPv4. Non-wildcard multiaddrs are
+// returned unchanged. Returns "" when the address is a wildcard and
+// no usable pod IP is available (signal to the caller to skip
+// publishing this entry).
+func rewriteWildcardMultiaddr(ma, podIP string) string {
+	switch {
+	case strings.HasPrefix(ma, "/ip4/0.0.0.0/"):
+		if podIP == "" {
+			return ""
+		}
+		return "/ip4/" + podIP + ma[len("/ip4/0.0.0.0"):]
+	case strings.HasPrefix(ma, "/ip6/::/"):
+		if podIP == "" {
+			return ""
+		}
+		// IPv6 wildcard → IPv4 pod IP requires the /ip4/ prefix; the
+		// /ip6/:: component is dropped (libp2p will pick the matching
+		// transport from the protocol stack after this prefix).
+		rest := ma[len("/ip6/::"):]
+		return "/ip4/" + podIP + rest
+	default:
+		return ma
 	}
+}
+
+// advertisedTransferAddr returns the transfer endpoint to publish on
+// the pod's gantry.io/transfer-addr annotation. Wildcard binds map to
+// "" so members.Snapshot() composes podIP:transferPort instead (the
+// Snapshot fallback path); concrete binds (e.g. a NodePort override)
+// are published verbatim.
+func advertisedTransferAddr(transferListen, podIP string) string {
+	host, port, err := net.SplitHostPort(transferListen)
+	if err != nil {
+		return transferListen
+	}
+	if host == "" || host == "0.0.0.0" || host == "::" {
+		if podIP == "" {
+			// Outside Kubernetes: leave empty so Snapshot's
+			// podIP:transferPort fallback fires (which itself is
+			// a no-op without a Pod IP — but that's the right
+			// failure mode: no advertised address at all rather
+			// than an unreachable 0.0.0.0).
+			return ""
+		}
+		return net.JoinHostPort(podIP, port)
+	}
+	return transferListen
 }
 
 // coldStartAdapter bridges *coldstart.Resolver to mirror.ColdStartResolver
