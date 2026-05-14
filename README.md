@@ -36,7 +36,7 @@ flowchart LR
 
 - [docs/archecture.md](docs/archecture.md) — system overview, requirements, scenarios.
 - [docs/detailed-design.md](docs/detailed-design.md) — protocols, timeouts, failure modes, §7 metric catalogue.
-- [docs/implementation-plan.md](docs/implementation-plan.md) — phased build plan.
+
 
 
 ## Building
