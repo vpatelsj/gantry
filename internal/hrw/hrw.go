@@ -75,9 +75,13 @@ func TopK(candidates []ifaces.Node, d digest.Digest, k int) []Scored {
 			heap.Push(h, s)
 			continue
 		}
-		// Replace heap root if the new score is higher than the current
-		// minimum (root of the min-heap).
-		if scoreLess(h.peek().Score, s.Score) {
+		// Replace heap root if the new candidate is strictly better than
+		// the current minimum (root of the min-heap). "Better" here
+		// matches RankOf's tie-break: higher score, OR equal score with a
+		// lexicographically larger node ID. Misaligning the two paths
+		// would let an equal-score pair appear in TopK on one node but
+		// not another, breaking the §5.3 informer-divergence invariant.
+		if scoredLess(h.peek(), s) {
 			h.items[0] = s
 			heap.Fix(h, 0)
 		}
@@ -139,7 +143,7 @@ type minHeap struct{ items []Scored }
 
 func (h *minHeap) Len() int { return len(h.items) }
 func (h *minHeap) Less(i, j int) bool {
-	return scoreLess(h.items[i].Score, h.items[j].Score)
+	return scoredLess(h.items[i], h.items[j])
 }
 func (h *minHeap) Swap(i, j int)      { h.items[i], h.items[j] = h.items[j], h.items[i] }
 func (h *minHeap) Push(x interface{}) { h.items = append(h.items, x.(Scored)) }
@@ -153,3 +157,13 @@ func (h *minHeap) peek() Scored { return h.items[0] }
 
 func scoreLess(a, b [sha256.Size]byte) bool { return bytes.Compare(a[:], b[:]) < 0 }
 func scoreCmp(a, b [sha256.Size]byte) int   { return bytes.Compare(a[:], b[:]) }
+
+// scoredLess is the ID-aware less-than used by TopK's heap. Equal
+// SHA-256 scores resolve by lexicographic node-ID ordering (the
+// lex-LARGER ID wins, mirroring RankOf's tie-break). See package doc.
+func scoredLess(a, b Scored) bool {
+	if c := bytes.Compare(a.Score[:], b.Score[:]); c != 0 {
+		return c < 0
+	}
+	return string(a.Node.ID) < string(b.Node.ID)
+}

@@ -8,14 +8,19 @@
 //     containerd socket on the node). To keep the announce-loop testable
 //     on darwin/CI without a real containerd, the package depends on a
 //     small ImageSource interface. The concrete containerd implementation
-//     lives in internal/cdsub/containerd_source.go behind a Linux build
+//     lives in internal/cdsub/source_containerd.go behind a Linux build
 //     tag. Tests in this file exercise the loop against a fake source.
 //
-//   - On every Image.Create / Image.Update event, the loop walks the
-//     manifest tree (manifest list → per-arch manifests → blobs) and
-//     calls dht.Provide(digest) for every node. Duplicate Provide calls
-//     for the same digest are idempotent at the DHT layer (libp2p
-//     handles refresh internally) so self-events are safe.
+//   - On every Image.Create / Image.Update event, the loop calls
+//     dht.Provide(digest) for every digest the ImageSource includes in
+//     ImageEvent.Digests. The manifest-tree walk (manifest list →
+//     per-arch manifests → blobs) lives in the ImageSource
+//     implementation, not in this package — see
+//     internal/cdsub/source_containerd.go (walkBlobs) for the real
+//     containerd version. Tests in this file use a fake source that
+//     emits digests directly. Duplicate Provide calls for the same
+//     digest are idempotent at the DHT layer (libp2p handles refresh
+//     internally) so self-events are safe.
 //
 //   - On Image.Delete the loop does NOT explicitly un-Provide. libp2p
 //     provider records expire after 24 h with a 12 h refresh; the cache
