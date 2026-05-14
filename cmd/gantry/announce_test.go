@@ -1,6 +1,12 @@
 package main
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/gantry/gantry/internal/ifaces"
+	"github.com/gantry/gantry/internal/ifaces/fakes"
+	"github.com/gantry/gantry/internal/members"
+)
 
 // rewriteWildcardMultiaddr substitutes a Pod IP into wildcard listen
 // addresses so the agent publishes dialable p2p multiaddrs in its
@@ -132,4 +138,31 @@ func TestAdvertisedTransferAddr(t *testing.T) {
 			}
 		})
 	}
+}
+
+// hasMultiNodeMembership controls whether the cold-start orchestrator
+// is wired at startup. On first-cluster boot the membership snapshot
+// is empty (no peer is Ready yet) — but cold-start must still be
+// enabled because that is exactly the situation it exists to handle.
+// The gate therefore looks at whether the membership view is backed
+// by the real K8s informer (cold-start ON) vs the dev-mode single-
+// self fake (cold-start OFF, no peers to coordinate with).
+func TestHasMultiNodeMembership(t *testing.T) {
+	t.Run("real manager with empty snapshot still enables cold-start", func(t *testing.T) {
+		// A *members.Manager with no Start() called yet has an empty
+		// snapshot — the first-cluster-boot scenario. The previous
+		// implementation returned false here and permanently disabled
+		// cold-start; the new implementation returns true.
+		var mgr *members.Manager // typed nil; only the dynamic type matters
+		got := hasMultiNodeMembership(mgr)
+		if !got {
+			t.Errorf("hasMultiNodeMembership(*members.Manager) = false, want true (first-cluster boot must enable cold-start)")
+		}
+	})
+	t.Run("single-self fake disables cold-start", func(t *testing.T) {
+		f := fakes.NewMembers(ifaces.NodeID("self"), ifaces.Node{ID: "self"})
+		if hasMultiNodeMembership(f) {
+			t.Errorf("hasMultiNodeMembership(single-self fake) = true, want false (no peers to coordinate)")
+		}
+	})
 }

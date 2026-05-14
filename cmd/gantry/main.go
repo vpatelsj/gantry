@@ -314,9 +314,12 @@ func runAgent(args []string) error {
 	)
 	coordServer.Bind(disco.LibP2P())
 
-	// Phase 3 cold-start orchestrator. Disabled when memberView is the
-	// single-self stub: in dev/test mode every cache miss with empty
-	// DHT must still reach origin via the Phase 1 path.
+	// Phase 3 cold-start orchestrator. Enabled whenever the real
+	// Kubernetes membership informer is in use; disabled only for
+	// the dev-mode single-self fake (where there are no peers to
+	// coordinate with by definition). The previous "Snapshot has
+	// non-self entry" gate broke first-cluster boot — see
+	// hasMultiNodeMembership for the full rationale.
 	var coldStartResolver mirror.ColdStartResolver
 	var layerPrefetcher mirror.LayerPrefetcher
 	if hasMultiNodeMembership(memberView) {
@@ -362,7 +365,7 @@ func runAgent(args []string) error {
 			slog.String("hrw_scope", c.HRWTopologyScope),
 		)
 	} else {
-		logger.Info("cold-start orchestrator disabled (single-node membership)")
+		logger.Info("cold-start orchestrator disabled (single-self membership; no Kubernetes informer)")
 	}
 
 	// Phase 5 — NF5 direct-origin fallback controller (§5.7). Wired
@@ -922,18 +925,26 @@ func singleSelfMembers(c *config.Config, disco *discovery.Host) ifaces.Members {
 	})
 }
 
-// hasMultiNodeMembership reports whether the membership snapshot has
-// any node other than self. Used to gate cold-start orchestrator
-// wiring: a single-node view degrades cold-start to "always 5xx" which
-// is wrong for dev mode.
+// hasMultiNodeMembership reports whether cold-start coordination
+// should be enabled. Previously this checked Snapshot() for any non-
+// self entry, which deadlocked first-cluster boot: on a fresh
+// cluster no peer is Ready yet, Snapshot() returns just self, cold-
+// start was disabled for the whole process lifetime, and the agent
+// silently degraded to direct-origin pulls forever — the exact
+// scenario cold-start is most needed for.
+//
+// Cold-start is now enabled whenever the membership view is backed
+// by the real Kubernetes informer (*members.Manager). The single-
+// self fake is the only mode that disables it: that mode is for
+// dev/test runs with no cluster at all, where there are no peers
+// to coordinate with by definition.
+//
+// The orchestrator itself handles an empty peer view internally
+// (NF5 / ErrColdStartExhausted fall-through), so it does not need
+// a populated snapshot at construction time.
 func hasMultiNodeMembership(m ifaces.Members) bool {
-	self := m.Self()
-	for _, n := range m.Snapshot() {
-		if n.ID != self {
-			return true
-		}
-	}
-	return false
+	_, isManager := m.(*members.Manager)
+	return isManager
 }
 
 // lookupSelfZone returns the zone label of this node from the members
