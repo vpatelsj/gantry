@@ -464,6 +464,34 @@ func (s *Server) serveDigest(w http.ResponseWriter, r *http.Request, upstream, r
 
 	writeBlobHeaders(w, d, psize, kind)
 	if r.Method == http.MethodHead {
+		// Intentional design choice (review §4): HEAD on a cache-miss
+		// path does NOT warm the cache. The origin reader is closed
+		// by the defer above without being drained, and the cache
+		// writer (already opened for streaming) is aborted via its
+		// own defer.
+		//
+		// Rationale:
+		//   - HEAD's distribution-spec contract is metadata only;
+		//     clients invoking HEAD are explicitly NOT asking for
+		//     bytes. Reading + caching the full blob here would
+		//     turn a 0-byte response into a multi-GB origin pull,
+		//     blowing the operator's bandwidth budget and the
+		//     transfer-endpoint inflight budget on a non-existent
+		//     "ask".
+		//   - The OCI distribution spec lets the server choose
+		//     whether HEAD knows the size up front. We chose to
+		//     query origin for it (psize above) because clients
+		//     that HEAD-then-GET want the size to size up their
+		//     buffer; quoting an unknown size would force a second
+		//     round-trip.
+		//   - A subsequent GET for the same digest follows the
+		//     normal cache-miss path and warms the cache then.
+		//
+		// Cost: an origin metadata round-trip per HEAD even when
+		// the next GET would have hit the cache anyway. Acceptable
+		// because the alternative (cache-warming on HEAD) is far
+		// worse for the bandwidth-amplification case it's meant to
+		// avoid.
 		return
 	}
 	written, err := io.Copy(dest, pr)

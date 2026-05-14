@@ -65,3 +65,33 @@ on its own; no restart needed.
 | Origin fallback is rare | `p2p_origin_fallback_total` stays at ~0 |
 
 See `docs/detailed-design.md` §7.6 for the full metric catalogue.
+
+## Production caveats
+
+A few configuration knobs that need operator attention before going
+to production:
+
+| Item | Where | What to change |
+| --- | --- | --- |
+| API server egress CIDR | `networkpolicy.yaml` | The egress to TCP/443 and TCP/6443 defaults to `0.0.0.0/0` because managed control planes (EKS / GKE / AKS) and self-hosted clusters reach the apiserver at IPs that don't match a `namespaceSelector`. Replace with the apiserver's actual CIDR — `kubectl get endpoints kubernetes -n default -o jsonpath='{.subsets[*].addresses[*].ip}'` for self-hosted clusters; the managed-service docs for hosted control planes. |
+| Origin registry egress | `networkpolicy.yaml` | The egress to TCP/443 for origin pulls also defaults to `0.0.0.0/0`. If the cluster only pulls from a known set of registry endpoints (your private registry, ghcr.io, etc.), restrict this rule to those IPs or labels. |
+| Kubelet probe source | `networkpolicy.yaml` | Metrics ingress on TCP/9095 currently allows `0.0.0.0/0` so kubelet liveness/readiness probes (sourced from the node IP) reach the pod on strict CNIs. Replace with the node CIDR — `kubectl get nodes -o jsonpath='{.items[*].status.addresses[?(@.type=="InternalIP")].address}'`. |
+| containerd socket access | `daemonset.yaml` | The pod runs as non-root (UID 65532); `containerd.sock` is typically root:root mode 0660. Set `spec.template.spec.securityContext.fsGroup` to a group with socket access, relax socket perms on the node, or clear `containerd_socket` in the ConfigMap to disable cdsub. |
+| Kubernetes RBAC scope | `serviceaccount.yaml` | The agent only consumes `pods.get/list/watch` in its own namespace via the informer; review `ClusterRole/Role` to confirm scope hasn't drifted. Membership setup failure is fatal in production mode (Downward-API env vars set), so an RBAC misconfig surfaces as a CrashLoop on rollout instead of a silent single-node fallback. |
+
+### HEAD semantics on cache miss
+
+`GET /v2/<repo>/blobs/<digest>` on a cache miss warms the cache as a
+side effect; `HEAD` on the same URL does NOT. This is intentional
+(see the comment block in `internal/mirror/mirror.go` at the HEAD
+return after `writeBlobHeaders`) — caching a multi-GB blob just
+because a client asked for its size would defeat the bandwidth
+amplification fix Gantry exists to provide. A subsequent GET for
+the same digest follows the cache-miss path normally and warms
+the cache then.
+
+If your client emits HEAD-then-GET patterns where you'd prefer to
+amortize the origin metadata round-trip, raise the issue upstream
+(containerd's puller, BuildKit's resolver, etc.) — those clients
+generally have a one-shot resolve-and-pull mode that skips the
+HEAD entirely.
