@@ -26,10 +26,17 @@ import (
 
 	"github.com/gantry/gantry/internal/cache"
 	"github.com/gantry/gantry/internal/cdsub"
+	"github.com/gantry/gantry/internal/coldstart"
 	"github.com/gantry/gantry/internal/config"
+	"github.com/gantry/gantry/internal/coord"
 	"github.com/gantry/gantry/internal/digest"
 	"github.com/gantry/gantry/internal/discovery"
 	gantrylog "github.com/gantry/gantry/internal/gantrylog"
+	"github.com/gantry/gantry/internal/hrw"
+	"github.com/gantry/gantry/internal/ifaces"
+	"github.com/gantry/gantry/internal/ifaces/fakes"
+	"github.com/gantry/gantry/internal/inflight"
+	"github.com/gantry/gantry/internal/members"
 	"github.com/gantry/gantry/internal/metrics"
 	"github.com/gantry/gantry/internal/mirror"
 	"github.com/gantry/gantry/internal/origin"
@@ -179,6 +186,67 @@ func runAgent(args []string) error {
 	}
 	logger.Info("transfer endpoint listening", slog.String("addr", c.TransferListen))
 
+	// Phase 3 — membership view + cold-start orchestrator. Members
+	// requires Kubernetes credentials (in-cluster or explicit
+	// kubeconfig); when neither is available we fall back to a
+	// single-self membership view that disables cold-start so the
+	// mirror keeps Phase 1 behaviour for local development.
+	memberView, membersStop := buildMembers(ctx, c, disco, logger)
+	defer membersStop()
+
+	// Phase 3 — in-flight map + coord client + coord server + metrics.
+	inflightMap := inflight.New(inflight.DefaultStalls(), nil)
+	p3 := newPhase3Metrics(reg, inflightMap)
+
+	coordClient := coord.NewClient(disco.LibP2P(),
+		coord.WithClientLogger(logger),
+	)
+	coordServer := coord.NewServer(cstore, memberView, inflightMap,
+		coord.WithLogger(logger),
+		coord.WithMetrics(coord.MetricsHooks{
+			OnPullIntentServed:  func() { p3.coordPullIntentServed.Inc() },
+			OnPleasePullServed:  func() { p3.coordPleasePullServed.Inc() },
+			OnPleasePullStarted: func() { p3.coordPleasePullStarted.Inc() },
+			OnStreamError:       func() { p3.coordStreamError.Inc() },
+		}),
+	)
+	coordServer.Bind(disco.LibP2P())
+
+	// Phase 3 cold-start orchestrator. Disabled when memberView is the
+	// single-self stub: in dev/test mode every cache miss with empty
+	// DHT must still reach origin via the Phase 1 path.
+	var coldStartResolver mirror.ColdStartResolver
+	if hasMultiNodeMembership(memberView) {
+		selfZone := lookupSelfZone(memberView)
+		realResolver := coldstart.New(coldstart.Options{
+			Members:   memberView,
+			Discovery: disco,
+			Coord:     coordClient,
+			Inflight:  inflightMap,
+			Logger:    logger,
+			HrwK:      c.HRWK,
+			HrwScope:  hrw.ParseScope(c.HRWTopologyScope),
+			SelfZone:  selfZone,
+			Metrics: coldstart.MetricsHooks{
+				OnRankMismatch: func(kindLabel string, _ ifaces.NodeID) {
+					p3.hrwRankMismatch.WithLabelValues(kindLabel).Inc()
+				},
+				OnDhtFalseEmpty: func() { p3.dhtFalseEmpty.Inc() },
+				OnTopKProbeHit:  func() { p3.topkProbeHit.Inc() },
+				OnColdStartDuration: func(kindLabel, outcome string, d time.Duration) {
+					p3.coldStartDuration.WithLabelValues(kindLabel, outcome).Observe(d.Seconds())
+				},
+			},
+		})
+		coldStartResolver = coldStartAdapter{r: realResolver}
+		logger.Info("cold-start orchestrator wired",
+			slog.Int("hrw_k", c.HRWK),
+			slog.String("hrw_scope", c.HRWTopologyScope),
+		)
+	} else {
+		logger.Info("cold-start orchestrator disabled (single-node membership)")
+	}
+
 	// Mirror with Phase 2 peer fallback.
 	mirrorSrv := mirror.New(c, cstore, originClient,
 		mirror.WithLogger(logger),
@@ -203,6 +271,7 @@ func runAgent(args []string) error {
 			p2.dhtLookup.WithLabelValues(outcome).Inc()
 			p2.dhtLookupDur.WithLabelValues(outcome).Observe(dur.Seconds())
 		}),
+		mirror.WithColdStart(coldStartResolver),
 	)
 
 	mirrorStop, err := mirrorSrv.ListenAndServe(c.MirrorListen)
@@ -447,4 +516,154 @@ func announceCachedDigests(ctx context.Context, ds []digest.Digest, dht *discove
 		slog.Int("announced", announced),
 		slog.Int("total", len(ds)),
 	)
+}
+
+// phase3Metrics groups the §7.6 instruments owned by Phase 3:
+// HRW-rank-mismatch detection, DHT-false-empty observability, top-K
+// probe hit rate, in-flight pull gauge, cold-start latency, and coord
+// stream counters.
+type phase3Metrics struct {
+	hrwRankMismatch        *prometheus.CounterVec
+	dhtFalseEmpty          prometheus.Counter
+	topkProbeHit           prometheus.Counter
+	coldStartDuration      *prometheus.HistogramVec
+	coordPullIntentServed  prometheus.Counter
+	coordPleasePullServed  prometheus.Counter
+	coordPleasePullStarted prometheus.Counter
+	coordStreamError       prometheus.Counter
+}
+
+func newPhase3Metrics(reg *metrics.Registry, infl *inflight.Map) *phase3Metrics {
+	// in_flight_pulls is a GaugeFunc that polls inflightMap.Len() on
+	// every scrape — no separate counter update path needed.
+	_ = reg.NewGaugeFunc("coord", prometheus.GaugeOpts{
+		Name: "p2p_in_flight_pulls",
+		Help: "Current count of in-flight digest pulls on this node.",
+	}, func() float64 { return float64(infl.Len()) })
+
+	return &phase3Metrics{
+		hrwRankMismatch: reg.NewCounterVec("coord", prometheus.CounterOpts{
+			Name: "p2p_hrw_rank_mismatch_total",
+			Help: "pull_intent_query responses where the responder's reported HRW rank disagrees with the requester's view (informer divergence, §5.3).",
+		}, []string{"digest_kind"}),
+		dhtFalseEmpty: reg.NewCounter("coord", prometheus.CounterOpts{
+			Name: "p2p_dht_false_empty_total",
+			Help: "Cases where DHT FindProviders returned 0 but a peer's pull_intent_query reported has_cached=true (DHT degradation indicator, §5.2).",
+		}),
+		topkProbeHit: reg.NewCounter("coord", prometheus.CounterOpts{
+			Name: "p2p_topk_probe_hit_total",
+			Help: "Cold-start cascade resolutions before reaching rule 7 (i.e., the top-K probe avoided an origin pull).",
+		}),
+		coldStartDuration: reg.NewHistogramVec("coord", prometheus.HistogramOpts{
+			Name:    "p2p_cold_start_duration_seconds",
+			Help:    "Wall-clock time spent in the cold-start orchestrator per Resolve call.",
+			Buckets: prometheus.ExponentialBuckets(0.05, 2, 10),
+		}, []string{"digest_kind", "outcome"}),
+		coordPullIntentServed: reg.NewCounter("coord", prometheus.CounterOpts{
+			Name: "p2p_coord_pull_intent_served_total",
+			Help: "pull_intent_query RPCs answered by this node's coord server.",
+		}),
+		coordPleasePullServed: reg.NewCounter("coord", prometheus.CounterOpts{
+			Name: "p2p_coord_please_pull_served_total",
+			Help: "please_pull RPCs answered by this node's coord server.",
+		}),
+		coordPleasePullStarted: reg.NewCounter("coord", prometheus.CounterOpts{
+			Name: "p2p_coord_please_pull_started_total",
+			Help: "Digests transitioned to in_flight via please_pull on this node.",
+		}),
+		coordStreamError: reg.NewCounter("coord", prometheus.CounterOpts{
+			Name: "p2p_coord_stream_error_total",
+			Help: "Malformed or oversized coord streams rejected by this node.",
+		}),
+	}
+}
+
+// buildMembers tries to construct a k8s-informer-backed Members
+// Manager. When required config is missing or the informer fails to
+// start, it falls back to a single-self stub (so dev/test runs stay
+// functional). Returns the Members impl plus a stop function the caller
+// MUST defer.
+func buildMembers(ctx context.Context, c *config.Config, disco *discovery.Host, logger *slog.Logger) (ifaces.Members, func()) {
+	// Required inputs for the real informer path.
+	if c.NodeName == "" || c.MembersLabelSelector == "" {
+		logger.Info("members: using single-self stub (NodeName/LabelSelector unset)")
+		return singleSelfMembers(c, disco), func() {}
+	}
+	mgr, err := members.New(members.Options{
+		NodeName:      c.NodeName,
+		Namespace:     c.MembersNamespace,
+		LabelSelector: c.MembersLabelSelector,
+		ZoneLabelKey:  c.ZoneLabelKey,
+		Kubeconfig:    c.MembersKubeconfig,
+	})
+	if err != nil {
+		logger.Warn("members.New failed; falling back to single-self stub", slog.Any("err", err))
+		return singleSelfMembers(c, disco), func() {}
+	}
+	if err := mgr.Start(ctx); err != nil {
+		logger.Warn("members.Start failed; falling back to single-self stub", slog.Any("err", err))
+		return singleSelfMembers(c, disco), func() {}
+	}
+	syncCtx, syncCancel := context.WithTimeout(ctx, 10*time.Second)
+	if err := mgr.WaitForSync(syncCtx); err != nil {
+		logger.Warn("members initial sync timed out", slog.Any("err", err))
+	}
+	syncCancel()
+	logger.Info("members informer ready",
+		slog.String("node_name", c.NodeName),
+		slog.Int("peers", len(mgr.Snapshot())),
+	)
+	return mgr, mgr.Stop
+}
+
+// singleSelfMembers returns a single-entry Members view for dev/test
+// runs that have no Kubernetes cluster behind them.
+func singleSelfMembers(c *config.Config, disco *discovery.Host) ifaces.Members {
+	id := c.NodeName
+	if id == "" {
+		id = disco.PeerID().String()
+	}
+	return fakes.NewMembers(ifaces.NodeID(id), ifaces.Node{
+		ID:   ifaces.NodeID(id),
+		Addr: c.TransferListen,
+	})
+}
+
+// hasMultiNodeMembership reports whether the membership snapshot has
+// any node other than self. Used to gate cold-start orchestrator
+// wiring: a single-node view degrades cold-start to "always 5xx" which
+// is wrong for dev mode.
+func hasMultiNodeMembership(m ifaces.Members) bool {
+	self := m.Self()
+	for _, n := range m.Snapshot() {
+		if n.ID != self {
+			return true
+		}
+	}
+	return false
+}
+
+// lookupSelfZone returns the zone label of this node from the members
+// snapshot, or "" if absent. Used to seed coldstart.Options.SelfZone
+// under HrwScope = "zone".
+func lookupSelfZone(m ifaces.Members) string {
+	self := m.Self()
+	for _, n := range m.Snapshot() {
+		if n.ID == self {
+			return n.Zone
+		}
+	}
+	return ""
+}
+
+// coldStartAdapter bridges *coldstart.Resolver to mirror.ColdStartResolver
+// without forcing the mirror package to import internal/coldstart.
+type coldStartAdapter struct{ r *coldstart.Resolver }
+
+func (a coldStartAdapter) Resolve(ctx context.Context, d digest.Digest, kind ifaces.OriginRefKind, expectedSize int64) (*mirror.ColdStartResolution, error) {
+	res, err := a.r.Resolve(ctx, d, kind, expectedSize)
+	if err != nil {
+		return nil, err
+	}
+	return &mirror.ColdStartResolution{Providers: res.Providers, Outcome: res.Outcome}, nil
 }

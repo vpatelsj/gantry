@@ -51,6 +51,11 @@ type Server struct {
 	dht  ifaces.DHT
 	peer ifaces.PeerDialer
 
+	// Phase 3 cold-start orchestrator (§5.2 7-rule cascade). When set,
+	// it is consulted when DHT.FindProviders returns an empty provider
+	// set, before the request falls through to origin.
+	coldStart ColdStartResolver
+
 	// Phase 2 tunables (zero values fall back to package defaults).
 	peerLookupBudget time.Duration
 	peerFetchBudget  time.Duration
@@ -132,6 +137,28 @@ func WithPeerBudgets(lookup, fetch time.Duration, maxAttempts int) Option {
 		s.peerFetchBudget = fetch
 		s.maxPeerAttempts = maxAttempts
 	}
+}
+
+// ColdStartResolver is the subset of *coldstart.Resolver that mirror
+// needs. Kept narrow for testability — production wires the concrete
+// resolver via WithColdStart.
+type ColdStartResolver interface {
+	Resolve(ctx context.Context, d digest.Digest, kind ifaces.OriginRefKind, expectedSize int64) (*ColdStartResolution, error)
+}
+
+// ColdStartResolution mirrors *coldstart.Resolution at this boundary
+// so the mirror package does not import internal/coldstart (which
+// would import internal/mirror by transitivity through wiring).
+type ColdStartResolution struct {
+	Providers []ifaces.Provider
+	Outcome   string
+}
+
+// WithColdStart wires Phase 3 cold-start orchestration. When set, the
+// orchestrator is consulted on the DHT-empty branch of the cache-miss
+// path before falling through to origin.
+func WithColdStart(c ColdStartResolver) Option {
+	return func(s *Server) { s.coldStart = c }
 }
 
 // New builds a Server bound to the given cache and origin.
@@ -379,9 +406,27 @@ func (s *Server) tryPeerFallback(ctx context.Context, w http.ResponseWriter, r *
 	}
 	if len(providers) == 0 {
 		s.bumpDhtLookup("miss", lookupDur)
-		return peerFallbackUnused
+		// Phase 3: consult the cold-start orchestrator. If it produces
+		// providers (rules 2/3/7), feed them into the peer-fetch loop;
+		// if it returns a sentinel error (rules 1/4 or expansion
+		// exhaustion), return Exhausted so the mirror responds 5xx.
+		// If the orchestrator is unwired, fall through to origin (Phase
+		// 1 behavior).
+		if s.coldStart != nil {
+			res, csErr := s.coldStart.Resolve(ctx, d, kind, 0)
+			if csErr != nil {
+				logger.Debug("mirror: cold-start exhausted",
+					slog.Any("err", csErr),
+				)
+				return peerFallbackExhausted
+			}
+			providers = res.Providers
+		} else {
+			return peerFallbackUnused
+		}
+	} else {
+		s.bumpDhtLookup("hit", lookupDur)
 	}
-	s.bumpDhtLookup("hit", lookupDur)
 
 	tried := 0
 	for _, p := range providers {
