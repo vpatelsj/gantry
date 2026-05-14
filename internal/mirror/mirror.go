@@ -417,7 +417,7 @@ func (s *Server) serveDigest(w http.ResponseWriter, r *http.Request, upstream, r
 	defer func() { _ = pr.Close() }()
 
 	cw, cwerr := s.cache.Writer(ctx, d)
-	var dest io.Writer = w
+	var dest io.Writer
 	var directVerifier *digestpipe.Writer // non-nil only when caching is unavailable
 	if cwerr == nil {
 		defer func() { _ = cw.Abort(ctx) }() // no-op after Commit

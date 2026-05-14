@@ -1270,10 +1270,22 @@ func runOriginPull(originClient ifaces.OriginPuller, cstore ifaces.Cache, disco 
 	defer h.Done()
 
 	// Background context: the requesting peer's stream is already
-	// closed by the time we get here. We bound the pull by a generous
-	// ceiling so a hung origin can't leak the in-flight slot forever.
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	// closed by the time we get here. We bound the pull by a budget
+	// so a hung origin can't leak the in-flight slot forever, but
+	// the 5-minute fixed ceiling from earlier was too tight for
+	// real-world image sizes (e.g. a 5 GB GPU image at the §7-default
+	// 10 MB/s throughput floor needs ~8.5 min on its own). Start with
+	// a default budget that covers HEAD/auth and small blobs, then
+	// extend post-Pull once we know expectedSize.
+	const (
+		originPullDefaultBudget = 5 * time.Minute
+		originPullMinThroughput = 10 * 1024 * 1024 // 10 MB/s, matches the §7 stall-detection floor
+		originPullCeiling       = 30 * time.Minute // absolute ceiling so a stuck pull still releases the slot
+	)
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	budget := time.AfterFunc(originPullDefaultBudget, cancel)
+	defer budget.Stop()
 
 	ref := ifaces.OriginRef{
 		Registry:   registry,
@@ -1281,12 +1293,25 @@ func runOriginPull(originClient ifaces.OriginPuller, cstore ifaces.Cache, disco 
 		Digest:     d,
 		Kind:       kind,
 	}
-	rc, _, err := originClient.Pull(ctx, ref)
+	rc, expectedSize, err := originClient.Pull(ctx, ref)
 	if err != nil {
 		recordOriginFailure(neg, d, err, lg, "origin pull failed", registry, repository)
 		return
 	}
 	defer func() { _ = rc.Close() }()
+
+	// Extend the budget based on expectedSize / floor-throughput. The
+	// default-budget slack is kept on top so the io.Copy starts with
+	// at least originPullDefaultBudget of headroom regardless of size.
+	if expectedSize > 0 {
+		needed := time.Duration(expectedSize/originPullMinThroughput)*time.Second + originPullDefaultBudget
+		if needed > originPullCeiling {
+			needed = originPullCeiling
+		}
+		if needed > originPullDefaultBudget {
+			budget.Reset(needed)
+		}
+	}
 
 	w, err := cstore.Writer(ctx, d)
 	if err != nil {
