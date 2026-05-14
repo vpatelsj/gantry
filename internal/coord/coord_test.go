@@ -333,6 +333,53 @@ func TestClient_ResolvePeerIDCache(t *testing.T) {
 // silence "imported and not used" for peer in some build matrices.
 var _ peer.ID
 
+// TestServer_IdleStreamHitsDeadline asserts the server-side handshake
+// timeout: a peer that opens a coord stream and never writes the
+// length-delimited envelope must not pin a goroutine indefinitely. We
+// configure a short StreamHandshakeTimeout, open a raw stream, write
+// nothing, and verify the server-side close lands well inside the
+// test's own deadline.
+func TestServer_IdleStreamHitsDeadline(t *testing.T) {
+	hClient, hServer := makeHostPair(t)
+
+	c, err := cache.Open(t.TempDir(), 1<<30)
+	if err != nil {
+		t.Fatalf("cache.Open: %v", err)
+	}
+	members := fakes.NewMembers(ifaces.NodeID(hServer.ID().String()))
+	infl := inflight.New(inflight.DefaultStalls(), nil)
+
+	srv := coord.NewServer(c, members, infl,
+		coord.WithStreamHandshakeTimeout(150*time.Millisecond),
+	)
+	srv.Bind(hServer)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	str, err := hClient.NewStream(ctx, hServer.ID(), coord.ProtocolID)
+	if err != nil {
+		t.Fatalf("NewStream: %v", err)
+	}
+	defer func() { _ = str.Close() }()
+
+	// Write nothing. The server must hit its read deadline and close
+	// the stream; the client-side Read should observe EOF / reset.
+	buf := make([]byte, 4)
+	readDone := make(chan error, 1)
+	go func() {
+		_, rerr := str.Read(buf)
+		readDone <- rerr
+	}()
+
+	select {
+	case <-readDone:
+		// Good \u2014 server closed the stream within the handshake window.
+	case <-time.After(2 * time.Second):
+		t.Fatal("server did not close idle stream within deadline; slowloris guard regressed")
+	}
+}
+
 func rep(c byte, n int) string {
 	b := make([]byte, n)
 	for i := range b {

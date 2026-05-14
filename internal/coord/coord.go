@@ -60,6 +60,20 @@ const ProtocolID protocol.ID = "/gantry/coord/1.0.0"
 // bounded under malformed input.
 const MaxMessageBytes = 1 << 20
 
+// DefaultStreamHandshakeTimeout bounds how long the server is willing
+// to wait for the *first* envelope on an inbound stream and how long
+// it gives itself to write the response. A peer that opens a stream
+// and never sends bytes — accidental (NAT death) or malicious
+// (slowloris-style resource exhaustion) — must not pin a goroutine
+// indefinitely.
+//
+// 5s comfortably covers a healthy in-cluster round-trip while still
+// bounding the worst case. The deadline is set on the underlying
+// libp2p stream so both r.ReadMsg and w.WriteMsg observe it; dispatch
+// runs under its own 2s context (see handleStream). Override via
+// WithStreamHandshakeTimeout for tests.
+const DefaultStreamHandshakeTimeout = 5 * time.Second
+
 // MetricsHooks lets callers wire Prometheus counters/gauges without
 // importing the metrics package. All fields may be nil.
 type MetricsHooks struct {
@@ -94,6 +108,9 @@ type Server struct {
 	// stream handler). nil disables please_pull semantically — the
 	// handler still acks but with OUTCOME_UNSPECIFIED.
 	pullerPump PullerPump
+	// streamHandshakeTimeout caps a single inbound stream's wire
+	// lifetime (see DefaultStreamHandshakeTimeout).
+	streamHandshakeTimeout time.Duration
 }
 
 // NegativeCache is the read interface coord needs from the §5.8
@@ -150,14 +167,25 @@ func WithPullerPump(p PullerPump) Option {
 	return func(s *Server) { s.pullerPump = p }
 }
 
+// WithStreamHandshakeTimeout overrides DefaultStreamHandshakeTimeout.
+// Intended for tests; non-positive values are ignored.
+func WithStreamHandshakeTimeout(d time.Duration) Option {
+	return func(s *Server) {
+		if d > 0 {
+			s.streamHandshakeTimeout = d
+		}
+	}
+}
+
 // NewServer constructs a coord server. The cache + members + inflight
 // dependencies are required (everything else is optional via Option).
 func NewServer(cache ifaces.Cache, members ifaces.Members, inflight *inflight.Map, opts ...Option) *Server {
 	s := &Server{
-		logger:   slog.Default().With(slog.String("subsystem", "coord")),
-		cache:    cache,
-		members:  members,
-		inflight: inflight,
+		logger:                 slog.Default().With(slog.String("subsystem", "coord")),
+		cache:                  cache,
+		members:                members,
+		inflight:               inflight,
+		streamHandshakeTimeout: DefaultStreamHandshakeTimeout,
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -176,6 +204,15 @@ func (s *Server) Bind(h host.Host) {
 // length-delimited envelope, dispatch, write one envelope, close.
 func (s *Server) handleStream(str network.Stream) {
 	defer func() { _ = str.Close() }()
+
+	// Bound the entire request/response cycle on the wire. Without
+	// this an idle peer can pin a goroutine forever; the dispatch
+	// context below only bounds work *after* a full envelope arrives.
+	if err := str.SetDeadline(time.Now().Add(s.streamHandshakeTimeout)); err != nil {
+		s.bumpStreamErr()
+		s.logger.Debug("coord: set stream deadline", slog.Any("err", err))
+		return
+	}
 
 	r := msgio.NewVarintReaderSize(str, MaxMessageBytes)
 	w := msgio.NewVarintWriter(str)
