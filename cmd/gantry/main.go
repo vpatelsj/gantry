@@ -285,7 +285,9 @@ func runAgent(args []string) error {
 	// outstanding goroutines so graceful shutdown can wait for
 	// dht.Provide calls to flush before disco.Close fires (§Phase 6).
 	var pullerPumpWG sync.WaitGroup
-	pullerPump := newPullerPump(inflightMap, originClient, cstore, disco, negCache, logger, &pullerPumpWG)
+	pullerPump := newPullerPump(inflightMap, originClient, cstore, disco, negCache, logger, &pullerPumpWG, func() {
+		p2.dhtProvideErr.WithLabelValues("origin_pull_announce").Inc()
+	})
 	coordServer := coord.NewServer(cstore, memberView, inflightMap,
 		coord.WithLogger(logger),
 		coord.WithMetrics(coord.MetricsHooks{
@@ -420,6 +422,9 @@ func runAgent(args []string) error {
 			p2.dhtLookup.WithLabelValues(outcome).Inc()
 			p2.dhtLookupDur.WithLabelValues(outcome).Observe(dur.Seconds())
 		}),
+		mirror.WithProvideErrorMetric(func(op string) {
+			p2.dhtProvideErr.WithLabelValues(op).Inc()
+		}),
 		mirror.WithColdStart(coldStartResolver),
 		mirror.WithLayerPrefetcher(layerPrefetcher),
 		mirror.WithNF5(nf5Ctrl),
@@ -441,7 +446,7 @@ func runAgent(args []string) error {
 		cdsub.WithLogger(logger),
 		cdsub.WithMetrics(
 			func() { p2.dhtProvide.Inc() },
-			func() { p2.dhtProvideErr.Inc() },
+			func() { p2.dhtProvideErr.WithLabelValues("cdsub_announce").Inc() },
 			func(int) { p2.dhtReconcile.Inc() },
 			func() { p2.cdsubReconnect.Inc() },
 		),
@@ -669,7 +674,7 @@ type phase2Metrics struct {
 	peerDialSuccess prometheus.Counter
 	peerDialFailure prometheus.Counter
 	dhtProvide      prometheus.Counter
-	dhtProvideErr   prometheus.Counter
+	dhtProvideErr   *prometheus.CounterVec
 	dhtReconcile    prometheus.Counter
 	dhtLookup       *prometheus.CounterVec
 	dhtLookupDur    *prometheus.HistogramVec
@@ -703,10 +708,10 @@ func newPhase2Metrics(reg *metrics.Registry) *phase2Metrics {
 			Name: "p2p_dht_provide_total",
 			Help: "DHT Provide calls that succeeded.",
 		}),
-		dhtProvideErr: reg.NewCounter("discovery", prometheus.CounterOpts{
+		dhtProvideErr: reg.NewCounterVec("discovery", prometheus.CounterOpts{
 			Name: "p2p_dht_provide_error_total",
-			Help: "DHT Provide calls that errored.",
-		}),
+			Help: "DHT Provide calls that errored, labelled by call site (cdsub_announce, peer_fetch_readvertise, cache_reannounce, origin_pull_announce). Without the label a hung kad-dht is indistinguishable from a misbehaving cdsub source.",
+		}, []string{"op"}),
 		dhtReconcile: reg.NewCounter("discovery", prometheus.CounterOpts{
 			Name: "p2p_dht_reconcile_total",
 			Help: "cdsub reconciliation cycles completed.",
@@ -750,6 +755,9 @@ func announceCachedDigests(ctx context.Context, ds []digest.Digest, dht *discove
 		err := dht.Provide(pctx, d)
 		cancel()
 		if err != nil {
+			if p2 != nil {
+				p2.dhtProvideErr.WithLabelValues("cache_reannounce").Inc()
+			}
 			logger.Debug("re-announce failed",
 				slog.String("digest", d.String()),
 				slog.Any("err", err),
@@ -1212,7 +1220,7 @@ func (p *layerPrefetchAdapter) OnManifestServed(ctx context.Context, registry, r
 //   - On terminal origin failure, the goroutine classifies via the
 //     *ifaces.OriginError wrapper and records the failure so the next
 //     pull_intent_query response surfaces recently_failed.
-func newPullerPump(infl *inflight.Map, originClient ifaces.OriginPuller, cstore ifaces.Cache, disco *discovery.Host, neg *negcache.Cache, logger *slog.Logger, wg *sync.WaitGroup) coord.PullerPump {
+func newPullerPump(infl *inflight.Map, originClient ifaces.OriginPuller, cstore ifaces.Cache, disco *discovery.Host, neg *negcache.Cache, logger *slog.Logger, wg *sync.WaitGroup, onProvideErr func()) coord.PullerPump {
 	lg := logger.With(slog.String("subsystem", "puller-pump"))
 	return func(_ context.Context, registry, repository string, d digest.Digest, kind ifaces.OriginRefKind) (time.Time, bool, *coord.NegativeEntry) {
 		// §5.8 short-circuit: if we're inside a cooldown window, refuse
@@ -1246,7 +1254,7 @@ func newPullerPump(infl *inflight.Map, originClient ifaces.OriginPuller, cstore 
 			if wg != nil {
 				defer wg.Done()
 			}
-			runOriginPull(originClient, cstore, disco, neg, lg, h, registry, repository, d, kind)
+			runOriginPull(originClient, cstore, disco, neg, lg, h, registry, repository, d, kind, onProvideErr)
 		}()
 		return startedAt, false, nil
 	}
@@ -1266,7 +1274,7 @@ func newPullerPump(infl *inflight.Map, originClient ifaces.OriginPuller, cstore 
 //     puller on a flapping local disk while still self-healing.
 //   - On commit success, we clear any prior entry so the ladder resets
 //     for the next failure run.
-func runOriginPull(originClient ifaces.OriginPuller, cstore ifaces.Cache, disco *discovery.Host, neg *negcache.Cache, lg *slog.Logger, h *inflight.Handle, registry, repository string, d digest.Digest, kind ifaces.OriginRefKind) {
+func runOriginPull(originClient ifaces.OriginPuller, cstore ifaces.Cache, disco *discovery.Host, neg *negcache.Cache, lg *slog.Logger, h *inflight.Handle, registry, repository string, d digest.Digest, kind ifaces.OriginRefKind, onProvideErr func()) {
 	defer h.Done()
 
 	// Background context: the requesting peer's stream is already
@@ -1340,6 +1348,9 @@ func runOriginPull(originClient ifaces.OriginPuller, cstore ifaces.Cache, disco 
 	provCtx, provCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer provCancel()
 	if err := disco.Provide(provCtx, d); err != nil {
+		if onProvideErr != nil {
+			onProvideErr()
+		}
 		lg.Debug("dht.Provide failed",
 			slog.String("digest", d.String()),
 			slog.Any("err", err),

@@ -104,6 +104,7 @@ type metricsHooks struct {
 	onPeerFetch      func(outcome string)
 	onPeerDialResult func(success bool)
 	onDhtLookup      func(outcome string, dur time.Duration)
+	onProvideError   func(op string)
 }
 
 // Option configures Server construction.
@@ -145,6 +146,16 @@ func WithPeerMetrics(peerFetchOutcome func(outcome string), peerDialResult func(
 func WithDhtLookupMetric(onLookup func(outcome string, dur time.Duration)) Option {
 	return func(s *Server) {
 		s.metrics.onDhtLookup = onLookup
+	}
+}
+
+// WithProvideErrorMetric registers a hook that fires when the mirror's
+// post-peer-fetch dht.Provide call fails. The hook receives a stable
+// label string identifying the call site so a CounterVec keyed by `op`
+// can distinguish mirror-internal Provide failures from other sites.
+func WithProvideErrorMetric(onProvideErr func(op string)) Option {
+	return func(s *Server) {
+		s.metrics.onProvideError = onProvideErr
 	}
 }
 
@@ -681,6 +692,9 @@ func (s *Server) fetchOneProvider(ctx context.Context, w http.ResponseWriter, r 
 			provCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
 			if perr := s.dht.Provide(provCtx, dHash); perr != nil {
+				if s.metrics.onProvideError != nil {
+					s.metrics.onProvideError("peer_fetch_readvertise")
+				}
 				logger.Debug("mirror: post-peer-fetch dht.Provide failed",
 					slog.String("digest", dHash.String()),
 					slog.Any("err", perr),
