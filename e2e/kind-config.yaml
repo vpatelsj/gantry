@@ -1,0 +1,17 @@
+# kind cluster topology for the gantry e2e suite.
+#
+# One control-plane + two workers — enough to exercise inter-pod
+# coord paths (HRW top-K=3 means the requester picks a peer that's
+# not itself, which requires ≥2 peers in the membership view).
+#
+# Each worker maps the host's containerd socket through so the gantry
+# cdsub source has something to talk to. The host directory chosen is
+# kind's own /var/lib/containerd, which is per-cluster and gets
+# cleaned up by `kind delete cluster`.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: gantry-e2e
+nodes:
+  - role: control-plane
+  - role: worker
+  - role: worker

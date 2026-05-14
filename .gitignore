@@ -5,6 +5,9 @@
 *.out
 coverage.txt
 
+# e2e suite artifacts (kubectl logs / describe output dumped on failure)
+/e2e/.artifacts/
+
 # Go workspace
 go.work
 go.work.sum

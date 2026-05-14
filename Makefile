@@ -75,6 +75,35 @@ proto-check: proto
 .PHONY: check
 check: vet test
 
+## ---- e2e ---------------------------------------------------------------
+
+# tools-e2e: verify the kind-based suite's CLI prereqs are on PATH.
+# Run once after cloning; not chained into `make check` because it
+# requires docker to be running.
+.PHONY: tools-e2e
+tools-e2e:
+	@missing=""; \
+	for bin in docker kind kubectl; do \
+		command -v $$bin >/dev/null 2>&1 || missing="$$missing $$bin"; \
+	done; \
+	if [ -n "$$missing" ]; then \
+		echo "missing e2e prereqs:$$missing"; \
+		echo "install instructions: e2e/README.md#prereqs"; \
+		exit 1; \
+	fi; \
+	docker info >/dev/null 2>&1 || { echo "docker engine not running"; exit 1; }; \
+	echo "e2e prereqs OK"
+
+# e2e: full kind-based integration run. Sets the e2e build tag so
+# the suite (gated by //go:build e2e) is compiled in. Timeout is
+# generous because kind cluster boot dominates.
+#
+# Operator knobs:
+#   E2E_KEEP=1 make e2e   leaves the cluster alive after the test
+.PHONY: e2e
+e2e:
+	@$(GO) test -tags=e2e -count=1 -timeout=20m -v ./e2e/...
+
 .PHONY: clean
 clean:
-	@rm -rf $(BIN_DIR) $(COVER_FILE)
+	@rm -rf $(BIN_DIR) $(COVER_FILE) e2e/.artifacts
