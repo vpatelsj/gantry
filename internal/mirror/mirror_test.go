@@ -292,7 +292,9 @@ func TestMirror_HeadRequest(t *testing.T) {
 }
 
 func TestParseV2Path(t *testing.T) {
-	// Exercise via the HTTP handler since parseV2Path is unexported.
+	// Direct unit-test coverage lives in internal/oci/path_test.go; this
+	// case keeps an end-to-end smoke check that the mirror handler still
+	// routes through the shared helper.
 	f := newFixture(t, nil)
 	// Junk path should be 404.
 	resp, _ := http.Get(f.server.URL + "/v2/totally-bogus")

@@ -41,6 +41,7 @@ import (
 
 	"github.com/gantry/gantry/internal/digest"
 	"github.com/gantry/gantry/internal/ifaces"
+	"github.com/gantry/gantry/internal/oci"
 )
 
 // MirroredHeader is the OCI-extension header peers MUST include on every
@@ -129,7 +130,7 @@ func (s *Server) handleV2(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_, _, ref, ok := parseV2Path(path)
+	_, _, ref, ok := oci.ParseV2Path(path)
 	if !ok {
 		http.NotFound(w, r)
 		return
@@ -222,25 +223,6 @@ func (s *Server) bumpServe() {
 	if s.metrics.onPeerServe != nil {
 		s.metrics.onPeerServe()
 	}
-}
-
-// parseV2Path is the same shape-check as the mirror; duplicated here so the
-// two packages can evolve independently if needed.
-func parseV2Path(path string) (repo, kind, ref string, ok bool) {
-	const prefix = "/v2/"
-	if !strings.HasPrefix(path, prefix) {
-		return "", "", "", false
-	}
-	rest := path[len(prefix):]
-	idx := strings.LastIndex(rest, "/manifests/")
-	if idx >= 0 {
-		return rest[:idx], "manifests", rest[idx+len("/manifests/"):], true
-	}
-	idx = strings.LastIndex(rest, "/blobs/")
-	if idx >= 0 {
-		return rest[:idx], "blobs", rest[idx+len("/blobs/"):], true
-	}
-	return "", "", "", false
 }
 
 // parseSingleRange parses an RFC 7233 single-range header like

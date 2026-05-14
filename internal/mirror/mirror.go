@@ -38,6 +38,7 @@ import (
 	"github.com/gantry/gantry/internal/digest"
 	"github.com/gantry/gantry/internal/digestpipe"
 	"github.com/gantry/gantry/internal/ifaces"
+	"github.com/gantry/gantry/internal/oci"
 )
 
 // Server is the mirror HTTP handler.
@@ -308,7 +309,7 @@ func (s *Server) handleV2(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	repo, kind, ref, ok := parseV2Path(path)
+	repo, kind, ref, ok := oci.ParseV2Path(path)
 	if !ok {
 		http.NotFound(w, r)
 		return
@@ -853,28 +854,6 @@ func writeOriginError(w http.ResponseWriter, err error, logger *slog.Logger) {
 	default:
 		http.Error(w, "upstream unavailable", http.StatusServiceUnavailable)
 	}
-}
-
-// parseV2Path matches /v2/<repo>/(manifests|blobs)/<reference>. Returns
-// the repository, the URL kind (manifest vs blob), the reference (tag or
-// digest), and ok=false if the path doesn't match the OCI shape.
-func parseV2Path(path string) (repo string, kind ifaces.OriginRefKind, ref string, ok bool) {
-	const prefix = "/v2/"
-	if !strings.HasPrefix(path, prefix) {
-		return "", 0, "", false
-	}
-	rest := path[len(prefix):]
-	// Find the last `/manifests/` or `/blobs/` separator; repo names can
-	// contain slashes (e.g. library/nginx).
-	idx := strings.LastIndex(rest, "/manifests/")
-	if idx >= 0 {
-		return rest[:idx], ifaces.KindManifest, rest[idx+len("/manifests/"):], true
-	}
-	idx = strings.LastIndex(rest, "/blobs/")
-	if idx >= 0 {
-		return rest[:idx], ifaces.KindBlob, rest[idx+len("/blobs/"):], true
-	}
-	return "", 0, "", false
 }
 
 func isDigestRef(ref string) bool { return strings.HasPrefix(ref, "sha256:") }
