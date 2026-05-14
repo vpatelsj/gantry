@@ -385,6 +385,9 @@ func runAgent(args []string) error {
 				return err == nil && len(prov) > 0
 			},
 			OnFallback: func() { p5.originFallbackTotal.Inc() },
+			OnDecline: func(reason string) {
+				p5.originFallbackDeclineTotal.WithLabelValues(reason).Inc()
+			},
 		})
 		logger.Info("NF5 origin-fallback wired",
 			slog.Duration("jitter_base", c.NF5JitterBase),
@@ -1418,8 +1421,9 @@ func failureClassLabel(c ifaces.FailureClass) string {
 // DHT health gauge, NF5 direct-origin fallback counter, and top-K
 // expansion counter.
 type phase5Metrics struct {
-	originFallbackTotal prometheus.Counter
-	topkExpansionTotal  *prometheus.CounterVec
+	originFallbackTotal        prometheus.Counter
+	originFallbackDeclineTotal *prometheus.CounterVec
+	topkExpansionTotal         *prometheus.CounterVec
 }
 
 func newPhase5Metrics(reg *metrics.Registry, healthScore func() float64) *phase5Metrics {
@@ -1432,6 +1436,10 @@ func newPhase5Metrics(reg *metrics.Registry, healthScore func() float64) *phase5
 		Name: "p2p_origin_fallback_total",
 		Help: "§5.7 NF5 direct-origin fallback pulls (last-resort path after cold-start exhaustion).",
 	})
+	p.originFallbackDeclineTotal = reg.NewCounterVec("mirror", prometheus.CounterOpts{
+		Name: "p2p_origin_fallback_decline_total",
+		Help: "§5.7 NF5 gating-sequence declines by reason. Without this counter a never-firing NF5 looks identical in metrics to a never-eligible NF5.",
+	}, []string{"reason"})
 	p.topkExpansionTotal = reg.NewCounterVec("coord", prometheus.CounterOpts{
 		Name: "p2p_topk_expansion_total",
 		Help: "Cold-start cascade expansions from top-K to top-(K × factor) by reason (degraded DHT, all top-K unreachable).",
