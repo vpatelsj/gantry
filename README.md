@@ -13,19 +13,23 @@ back to the upstream registry — so a 10,000-node rollout pulls each
 unique blob from the origin a small number of times rather than 10,000
 times.
 
-```
-        kubelet ──▶ containerd ──▶ 127.0.0.1:5000  (gantry mirror, this node)
-                                          │
-                                          │  cache hit ─────────────▶ bytes
-                                          │
-                                          │  miss ──▶ libp2p DHT lookup
-                                          │            │
-                                          │            ▼
-                                          │      peer:5001   (gantry transfer, another node)
-                                          │            │
-                                          │            ▼   bytes streamed P2P
-                                          │
-                                          └─ all peers down ──▶ upstream registry
+```mermaid
+flowchart LR
+    kubelet[kubelet] --> containerd[containerd]
+    containerd -->|"/v2/ mirror"| mirror["gantry mirror<br/>127.0.0.1:5000<br/>(this node)"]
+    mirror -->|cache hit| bytes1([bytes])
+    mirror -->|miss| dht{{libp2p DHT lookup}}
+    dht -->|provider found| peer["gantry transfer<br/>peer:5001<br/>(another node)"]
+    peer -->|bytes streamed P2P| bytes2([bytes])
+    dht -.->|all peers down<br/>or unreachable| origin[(upstream registry)]
+    origin -.-> bytes3([bytes])
+
+    classDef node fill:#eef,stroke:#447,color:#000;
+    classDef sink fill:#efe,stroke:#474,color:#000;
+    classDef fallback fill:#fee,stroke:#744,color:#000;
+    class mirror,peer node;
+    class bytes1,bytes2,bytes3 sink;
+    class origin fallback;
 ```
 
 ## Design references
