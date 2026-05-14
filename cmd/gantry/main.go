@@ -135,20 +135,7 @@ func runAgent(args []string) error {
 	reg.RegisterDefaultCollectors()
 	inst := newPhase1Metrics(reg)
 	p2 := newPhase2Metrics(reg)
-
-	// Cache.
-	cstore, err := cache.Open(c.CacheDir, c.CacheBudgetBytes,
-		cache.WithLogger(logger),
-		cache.WithMetrics(
-			func() { inst.cacheHit.Inc() },
-			func() { inst.cacheMiss.Inc() },
-			func(int64) { /* eviction count owned by Phase 6 */ },
-		),
-	)
-	if err != nil {
-		return fmt.Errorf("cache: %w", err)
-	}
-	defer func() { _ = cstore.Close() }()
+	p6 := newPhase6Metrics(reg)
 
 	// Origin.
 	originClient, err := origin.New(c,
@@ -173,6 +160,36 @@ func runAgent(args []string) error {
 	}
 	defer func() { _ = disco.Close() }()
 	logger.Info("libp2p host ready", slog.String("peer_id", disco.PeerID().String()))
+
+	// Cache. §7.4: LRU at the layer level with provider-count
+	// deferral and forced-eviction headroom. The DHT-backed callback
+	// is wired now that disco is up; statfs probes the cache volume
+	// for the forced-eviction floor.
+	cstore, err := cache.Open(c.CacheDir, c.CacheBudgetBytes,
+		cache.WithLogger(logger),
+		cache.WithMetrics(
+			func() { inst.cacheHit.Inc() },
+			func() { inst.cacheMiss.Inc() },
+			func(int64) { /* per-eviction byte counter intentionally unbound */ },
+		),
+		cache.WithEviction(cache.EvictionPolicy{
+			ProviderCount: func(ctx context.Context, d digest.Digest) (int, error) {
+				ps, perr := disco.FindProviders(ctx, d)
+				if perr != nil {
+					return 0, perr
+				}
+				return len(ps), nil
+			},
+			Threshold:        c.EvictionProviderCountThreshold,
+			HeadroomPct:      c.CacheForcedEvictionHeadroomPct,
+			DiskFree:         cache.DefaultDiskFree(c.CacheDir),
+			OnForcedEviction: func() { p6.cacheForcedEvictionTotal.Inc() },
+		}),
+	)
+	if err != nil {
+		return fmt.Errorf("cache: %w", err)
+	}
+	defer func() { _ = cstore.Close() }()
 
 	// Phase 2 — peer dialer + transfer endpoint.
 	peerClient := transfer.NewClient()
@@ -399,9 +416,46 @@ func runAgent(args []string) error {
 	// the background; failures are logged but never fatal.
 	go announceCachedDigests(ctx, cstore.Digests(), disco, logger, p2)
 
+	// Phase 6 — readiness state. Members.WaitForSync may block on
+	// initial informer sync; we run it in the background and flip an
+	// atomic once it returns. /healthz checks this + DHT bootstrap.
+	var (
+		membersReady atomic.Bool
+	)
+	go func() {
+		if err := memberView.WaitForSync(ctx); err == nil {
+			membersReady.Store(true)
+		}
+	}()
+
+	// Phase 6 — operations HTTP listener. Exposes Prometheus scrape
+	// at /metrics and liveness/readiness at /livez and /readyz.
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", reg.Handler())
+	mux.HandleFunc("/livez", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	})
+	// /healthz is an alias for /livez (Kubernetes convention).
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	})
+	mux.HandleFunc("/readyz", func(w http.ResponseWriter, _ *http.Request) {
+		if !membersReady.Load() {
+			http.Error(w, "members informer not synced", http.StatusServiceUnavailable)
+			return
+		}
+		if disco.RoutingTableSize() < 1 {
+			http.Error(w, "dht routing table empty", http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ready"))
+	})
 	metricsHTTP := &http.Server{
 		Addr:              c.MetricsListen,
-		Handler:           reg.Handler(),
+		Handler:           mux,
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 	metricsErr := make(chan error, 1)
@@ -412,7 +466,8 @@ func runAgent(args []string) error {
 		}
 		close(metricsErr)
 	}()
-	logger.Info("metrics endpoint listening", slog.String("addr", c.MetricsListen))
+	logger.Info("ops endpoint listening", slog.String("addr", c.MetricsListen),
+		slog.String("paths", "/metrics, /livez, /healthz, /readyz"))
 
 	// Block until signal or metrics-server crash.
 	select {
@@ -424,12 +479,27 @@ func runAgent(args []string) error {
 		logger.Error("cdsub loop exited unexpectedly", slog.Any("err", err))
 	}
 
-	// Graceful shutdown with a 10s budget. Stop accepting new requests
-	// first (mirror + transfer), then close libp2p.
+	// Graceful shutdown (§Phase 6). Order:
+	//   1. Mirror.Shutdown — stops accepting new mirror requests (new
+	//      connections get 503) and drains in-flight handlers, up to
+	//      the shutdown deadline.
+	//   2. Wait for cdsub.Run to return — gives any in-flight DHT
+	//      Provide call a chance to flush before libp2p is closed.
+	//   3. Transfer.Shutdown — drains in-flight peer transfers.
+	//   4. Ops endpoint (Shutdown) — last so /readyz can keep
+	//      reporting NotReady while we drain.
+	//   5. discovery.Close (deferred above) — closes the libp2p host.
 	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancelShutdown()
 	if err := mirrorStop(shutdownCtx); err != nil {
 		logger.Warn("mirror shutdown error", slog.Any("err", err))
+	}
+	// cdsub already cancelled by the outer ctx; wait briefly for its
+	// pending Provide calls to flush.
+	select {
+	case <-cdsubDone:
+	case <-shutdownCtx.Done():
+		logger.Warn("cdsub did not drain within shutdown budget")
 	}
 	if err := transferStop(shutdownCtx); err != nil {
 		logger.Warn("transfer shutdown error", slog.Any("err", err))
@@ -1008,4 +1078,21 @@ func newPhase5Metrics(reg *metrics.Registry, healthScore func() float64) *phase5
 		Help: "Cold-start cascade expansions from top-K to top-(K × factor) by reason (degraded DHT, all top-K unreachable).",
 	}, []string{"reason"})
 	return p
+}
+
+// phase6Metrics groups the §7.6 instruments owned by Phase 6. Currently
+// just the forced-eviction counter described in §7.4: every increment
+// records one §7.4-headroom-driven eviction that bypassed the
+// provider-count deferral.
+type phase6Metrics struct {
+	cacheForcedEvictionTotal prometheus.Counter
+}
+
+func newPhase6Metrics(reg *metrics.Registry) *phase6Metrics {
+	return &phase6Metrics{
+		cacheForcedEvictionTotal: reg.NewCounter("cache", prometheus.CounterOpts{
+			Name: "p2p_cache_forced_eviction_total",
+			Help: "§7.4 forced cache evictions: increments when free disk fell below cache_budget × cache_forced_eviction_headroom_pct and the agent evicted an LRU candidate regardless of its provider count.",
+		}),
+	}
 }

@@ -1,21 +1,18 @@
-# Phase 2 stub NetworkPolicy for the Gantry agent DaemonSet.
+# NetworkPolicy restricting transfer (5001), libp2p (4001), and
+# metrics (9095) ports per §7.5.
 #
-# Scope (per implementation-plan.md Phase 2 and detailed-design §7.5):
-#   - Allow the peer-facing transfer endpoint (:5001) and libp2p ports
-#     (TCP+QUIC, the operator picks the port range) only from other
-#     Gantry agent pods. Cluster nodes outside the DaemonSet must not
-#     be able to dial these endpoints.
-#   - The loopback mirror endpoint (:5000) is reachable from the host
-#     network namespace (containerd) but not from the pod network; it
-#     is bound to 127.0.0.1 by config validation and therefore does
-#     not appear in this policy.
-#   - The metrics endpoint (:9100 by default) is allowed from the
-#     monitoring namespace only.
+# Phase 6: the policy was upgraded from the Phase 2 stub (ingress
+# only) to include explicit egress restrictions. Egress is allowed to
+# DNS, the Kubernetes API server (for the informer), peer gantry
+# pods (transfer + libp2p), and TCP/443 for origin registry pulls.
+# Operators with explicit registry endpoints should tighten the last
+# rule to their registry IPs or labels.
 #
-# The full hardened manifest (with explicit egress restrictions, NF5
-# fallback handling, and PodSecurityPolicy / PodSecurityAdmission tags)
-# lands in Phase 6 alongside the deployment bundle. This stub exists
-# so the Phase 2 cluster bring-up has *some* policy in place.
+# The loopback mirror endpoint (:5000) is bound to 127.0.0.1 by the
+# agent and never reachable from the pod network, so it doesn't
+# appear in this policy.
+#
+# Requires a CNI that enforces NetworkPolicy (Calico, Cilium, etc.).
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -31,6 +28,7 @@ spec:
       app.kubernetes.io/component: agent
   policyTypes:
     - Ingress
+    - Egress
   ingress:
     # Peer-facing transfer endpoint (HTTP/2 cleartext over :5001) and
     # libp2p transports. Only other Gantry agent pods are allowed.
@@ -42,19 +40,57 @@ spec:
       ports:
         - protocol: TCP
           port: 5001
-        # libp2p TCP listener (operator-configurable; reserving a stable
-        # range here so the NetworkPolicy can be reviewed without
-        # chasing config drift).
+        # libp2p TCP + QUIC listener (operator-configurable; reserving
+        # a stable range here so the NetworkPolicy can be reviewed
+        # without chasing config drift).
         - protocol: TCP
           port: 4001
         - protocol: UDP
           port: 4001
-    # Metrics endpoint scraped by Prometheus running in the monitoring
-    # namespace. Adjust the namespace selector to match your cluster.
+    # Metrics + healthz scraped by Prometheus / Kubernetes from the
+    # monitoring namespace.
     - from:
         - namespaceSelector:
             matchLabels:
               kubernetes.io/metadata.name: monitoring
       ports:
         - protocol: TCP
-          port: 9100
+          port: 9095
+  egress:
+    # DNS for Service / Node lookups.
+    - to:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # Kubernetes API server (informer; §7.3).
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: default
+      ports:
+        - protocol: TCP
+          port: 443
+    # Peer transfer + libp2p ports on other gantry agents.
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: gantry
+              app.kubernetes.io/component: agent
+      ports:
+        - protocol: TCP
+          port: 5001
+        - protocol: TCP
+          port: 4001
+        - protocol: UDP
+          port: 4001
+    # Origin registries (port 443). Operators with stable registry
+    # endpoints should tighten this to explicit IPs or labels.
+    - ports:
+        - protocol: TCP
+          port: 443

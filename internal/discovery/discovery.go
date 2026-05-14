@@ -214,6 +214,10 @@ func (h *Host) Addrs() []multiaddr.Multiaddr { return h.h.Addrs() }
 // coord-stream wiring.
 func (h *Host) LibP2P() host.Host { return h.h }
 
+// RoutingTableSize returns the current kad-dht routing-table size.
+// Used by readiness probes (§Phase 6) and the §7.7 health score.
+func (h *Host) RoutingTableSize() int { return h.d.RoutingTable().Size() }
+
 // Provide implements ifaces.DHT.
 func (h *Host) Provide(ctx context.Context, d digest.Digest) error {
 	c, err := DigestToCID(d)

@@ -1,0 +1,164 @@
+# gantry — Kubernetes DaemonSet (one agent per worker node).
+#
+# §Phase 6 design notes:
+#   - hostNetwork: false (§7.5) — pods use the cluster Pod network and
+#     dial each other directly via Pod IPs. peering ports (5001 +
+#     libp2p) are restricted by the NetworkPolicy in
+#     deploy/networkpolicy.yaml.
+#   - hostPath mounts:
+#       /var/lib/gantry/cache   — content-addressed cache (§4.1).
+#                                  HostPath chosen over PVC because
+#                                  the cache is node-local and should
+#                                  survive pod restarts but never
+#                                  follow the pod.
+#       /var/lib/gantry/libp2p  — persistent libp2p identity key, so
+#                                  the same peer ID survives restarts
+#                                  and DHT routing tables don't churn.
+#   - Mirror port (5000) binds 127.0.0.1 only and is reached by
+#     containerd through the hosts.toml entry; nothing outside the
+#     node should ever talk to it.
+#   - Resource requests are placeholders (NF6 validation pending).
+#     Operators should size them after observing
+#     p2p_in_flight_pulls / cache_budget under their workload.
+#   - The registry-credentials Secret is mounted read-only into
+#     /etc/gantry/registry; CredentialsPath in the agent config
+#     points at files inside it.
+#
+# Apply with:
+#   kubectl apply -f deploy/serviceaccount.yaml
+#   kubectl apply -f deploy/registry-secret.yaml   # operator-supplied
+#   kubectl apply -f deploy/networkpolicy.yaml
+#   kubectl apply -f deploy/daemonset.yaml
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: gantry
+  namespace: gantry-system
+  labels:
+    app.kubernetes.io/name: gantry
+    app.kubernetes.io/component: agent
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: gantry
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # Limit blast radius: at most 10% of nodes lose their agent at
+      # any one time during an update. The mirror endpoint is per-node
+      # and containerd falls back to origin on connection failure, so
+      # a node losing its agent only affects pulls happening during
+      # the window.
+      maxUnavailable: 10%
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: gantry
+        app.kubernetes.io/component: agent
+    spec:
+      serviceAccountName: gantry
+      # Disabling hostNetwork is a deliberate §7.5 decision: the agent
+      # is reached on its Pod IP by other agents (libp2p) and on
+      # 127.0.0.1 by the local containerd via hosts.toml.
+      hostNetwork: false
+      dnsPolicy: ClusterFirst
+      # Run as low priority so workload pods can preempt during
+      # cluster pressure. The agent's failure mode (containerd falls
+      # back to origin) is graceful.
+      priorityClassName: gantry-low
+      tolerations:
+        - operator: Exists
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: gantry
+          image: ghcr.io/vpatelsj/gantry:latest   # build.sh fills this with `git describe`
+          imagePullPolicy: IfNotPresent
+          args:
+            - --config=/etc/gantry/config.yaml
+          env:
+            # NODE_NAME → membership informer's "self" lookup (§7.3).
+            - name: GANTRY_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: GANTRY_MEMBERS_NAMESPACE
+              value: gantry-system
+          ports:
+            # mirror (loopback only) — listed here for documentation.
+            - name: mirror
+              containerPort: 5000
+              hostPort: 5000
+              hostIP: 127.0.0.1
+              protocol: TCP
+            - name: transfer
+              containerPort: 5001
+              protocol: TCP
+            - name: libp2p-tcp
+              containerPort: 4001
+              protocol: TCP
+            - name: metrics
+              containerPort: 9095
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: metrics
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 6
+          livenessProbe:
+            httpGet:
+              path: /livez
+              port: metrics
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "2"
+              memory: 1Gi
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            runAsGroup: 65532
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          volumeMounts:
+            - name: cache
+              mountPath: /var/lib/gantry/cache
+            - name: libp2p
+              mountPath: /var/lib/gantry/libp2p
+            - name: config
+              mountPath: /etc/gantry
+              readOnly: true
+            - name: registry-creds
+              mountPath: /etc/gantry/registry
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: cache
+          hostPath:
+            path: /var/lib/gantry/cache
+            type: DirectoryOrCreate
+        - name: libp2p
+          hostPath:
+            path: /var/lib/gantry/libp2p
+            type: DirectoryOrCreate
+        - name: config
+          configMap:
+            name: gantry-config
+        - name: registry-creds
+          secret:
+            secretName: gantry-registry-credentials
+            optional: true
+        - name: tmp
+          emptyDir: {}

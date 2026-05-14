@@ -5,17 +5,27 @@
 //	{CacheDir}/blobs/sha256/<ab>/<hex>      committed blobs (sharded by first 2 hex chars)
 //	{CacheDir}/tmp/<random>.partial         staging files for in-progress writes
 //
-// Phase 1 semantics:
+// Phase 6 semantics (§7.4):
 //
 //   - Writes go through a digest-verifying CacheWriter. Commit renames the
 //     temp file into place atomically. The expected digest is recomputed
 //     incrementally during Write so Commit's hash check is constant-time
 //     and the entry never appears under the wrong digest.
 //
-//   - Eviction is a simple bounded LRU at cfg.CacheBudgetBytes. The §7.4
-//     provider-count deferral lands in Phase 6 once DHT.FindProviders is
-//     real; Phase 1's strict LRU is correct because there are no peers to
-//     defer for yet.
+//   - Eviction is LRU at the layer level with provider-count deferral.
+//     Before evicting an entry, the agent queries the configured
+//     ProviderCount callback (typically dht.FindProviders). When the
+//     local node is one of fewer than EvictionThreshold providers,
+//     eviction is deferred and the loop moves on to the next-oldest
+//     candidate. A short-interval local count cache (ProviderCountTTL)
+//     prevents DHT storms.
+//
+//   - Forced-eviction headroom: when free disk on the cache volume
+//     falls below cache_budget × ForcedHeadroomPct / 100 (default 5%),
+//     eviction proceeds against the LRU candidate regardless of
+//     provider count. The eviction is logged at WARN level with the
+//     CID and provider count and increments
+//     p2p_cache_forced_eviction_total.
 //
 //   - On startup, Open walks the on-disk content tree and seeds the LRU
 //     order by mtime (oldest first) so the in-memory size accounting
@@ -37,6 +47,8 @@ import (
 	"path/filepath"
 	"sort"
 	"sync"
+	"syscall"
+	"time"
 
 	"github.com/gantry/gantry/internal/digest"
 	"github.com/gantry/gantry/internal/ifaces"
@@ -50,11 +62,17 @@ type Cache struct {
 	budgetBytes int64
 	logger      *slog.Logger
 	metrics     metricsHooks
+	policy      evictionPolicy
 
 	mu      sync.Mutex
 	size    int64
 	entries map[string]*list.Element // key: digest.String()
 	lru     *list.List               // front = MRU, back = LRU
+
+	pcMu  sync.Mutex
+	pcCnt map[string]providerCount
+
+	evictMu sync.Mutex // serialises eviction sweeps
 }
 
 type entry struct {
@@ -62,13 +80,31 @@ type entry struct {
 	size   int64
 }
 
+type providerCount struct {
+	count int
+	at    time.Time
+}
+
+// evictionPolicy captures the §7.4 knobs. All fields are optional;
+// nil/zero defaults preserve the simple-LRU behaviour used by tests.
+type evictionPolicy struct {
+	providerCount    func(context.Context, digest.Digest) (int, error)
+	threshold        int
+	headroomPct      int
+	diskFree         func() (uint64, error)
+	providerCountTTL time.Duration
+	now              func() time.Time
+}
+
 // metricsHooks lets the cache emit counters without importing the metrics
 // package directly (keeps the cache testable without Prometheus). Each
 // hook is allowed to be nil.
 type metricsHooks struct {
-	onHit     func()
-	onMiss    func()
-	onEvicted func(bytes int64)
+	onHit            func()
+	onMiss           func()
+	onEvicted        func(bytes int64)
+	onForcedEviction func()
+	onDeferredEvict  func()
 }
 
 // Option configures a Cache at Open time.
@@ -93,6 +129,82 @@ func WithMetrics(onHit, onMiss func(), onEvicted func(bytes int64)) Option {
 	}
 }
 
+// EvictionPolicy bundles the §7.4 knobs that turn on provider-count
+// deferral and forced-headroom eviction. A zero value is a valid
+// "preserve simple LRU" configuration.
+type EvictionPolicy struct {
+	// ProviderCount returns the number of distinct providers known
+	// to the DHT for a digest. Nil disables deferral (simple LRU).
+	// The callback is invoked WITHOUT the cache lock held but may
+	// block on DHT I/O; the cache memoises the result for
+	// ProviderCountTTL to avoid eviction-time storms.
+	ProviderCount func(context.Context, digest.Digest) (int, error)
+
+	// Threshold is the §7.4 deferral cut-off. Eviction is deferred
+	// when ProviderCount returns a value < Threshold. Zero defaults
+	// to 3.
+	Threshold int
+
+	// HeadroomPct is the percentage of the cache budget that acts as
+	// the forced-eviction floor: when DiskFree() < budget * pct/100
+	// eviction proceeds regardless of provider count. Zero defaults
+	// to 5.
+	HeadroomPct int
+
+	// DiskFree returns the bytes free on the cache volume. Nil
+	// disables forced-headroom logic.
+	DiskFree func() (uint64, error)
+
+	// ProviderCountTTL bounds how long a provider-count answer is
+	// reused before a fresh DHT lookup is issued. Zero defaults to
+	// 60 seconds.
+	ProviderCountTTL time.Duration
+
+	// OnForcedEviction is invoked once per forced-eviction event for
+	// the p2p_cache_forced_eviction_total metric.
+	OnForcedEviction func()
+
+	// OnDeferredEvict is invoked once per deferred candidate (low
+	// provider count, no forced pressure). Optional; used by tests.
+	OnDeferredEvict func()
+
+	// Now is a clock override for the count cache; nil uses
+	// time.Now.
+	Now func() time.Time
+}
+
+// WithEviction wires §7.4's provider-count deferral and forced-headroom
+// eviction. Passing a zero EvictionPolicy is a no-op.
+func WithEviction(p EvictionPolicy) Option {
+	return func(c *Cache) {
+		c.policy.providerCount = p.ProviderCount
+		c.policy.threshold = p.Threshold
+		c.policy.headroomPct = p.HeadroomPct
+		c.policy.diskFree = p.DiskFree
+		c.policy.providerCountTTL = p.ProviderCountTTL
+		c.policy.now = p.Now
+		c.metrics.onForcedEviction = p.OnForcedEviction
+		c.metrics.onDeferredEvict = p.OnDeferredEvict
+	}
+}
+
+// DefaultDiskFree returns the bytes free on the volume containing dir
+// via Statfs. Suitable for plugging into EvictionPolicy.DiskFree on
+// any POSIX host (Linux + Darwin tested).
+func DefaultDiskFree(dir string) func() (uint64, error) {
+	return func() (uint64, error) {
+		var st syscall.Statfs_t
+		if err := syscall.Statfs(dir, &st); err != nil {
+			return 0, fmt.Errorf("cache: statfs %s: %w", dir, err)
+		}
+		// Bavail = blocks available to unprivileged user; the safe
+		// choice (Bfree includes root-reserved blocks). Bavail is
+		// uint64 on every supported platform, Bsize is signed (int32
+		// on darwin, int64 on linux), so we widen only that side.
+		return st.Bavail * uint64(st.Bsize), nil
+	}
+}
+
 // Open returns a Cache rooted at dir with the given byte budget. The
 // directory is created if needed. Existing content is enrolled into the
 // in-memory LRU; corrupted entries (wrong digest or filename) are removed.
@@ -109,9 +221,22 @@ func Open(dir string, budgetBytes int64, opts ...Option) (*Cache, error) {
 		logger:      slog.Default().With(slog.String("subsystem", "cache")),
 		entries:     map[string]*list.Element{},
 		lru:         list.New(),
+		pcCnt:       map[string]providerCount{},
 	}
 	for _, opt := range opts {
 		opt(c)
+	}
+	if c.policy.threshold <= 0 {
+		c.policy.threshold = 3
+	}
+	if c.policy.headroomPct <= 0 {
+		c.policy.headroomPct = 5
+	}
+	if c.policy.providerCountTTL <= 0 {
+		c.policy.providerCountTTL = 60 * time.Second
+	}
+	if c.policy.now == nil {
+		c.policy.now = time.Now
 	}
 	if err := os.MkdirAll(c.tmpDir(), 0o755); err != nil {
 		return nil, fmt.Errorf("cache: mkdir tmp: %w", err)
@@ -124,6 +249,9 @@ func Open(dir string, budgetBytes int64, opts ...Option) (*Cache, error) {
 	}
 	// Drop any leftover .partial files from a previous crashed run.
 	_ = c.purgeStaleTmp()
+	// If we already exceed budget at startup (operator shrank it),
+	// drive a sweep through the full §7.4 path (deferral + headroom).
+	c.evictIfOver(context.Background())
 	return c, nil
 }
 
@@ -228,7 +356,8 @@ func (c *Cache) Digests() []digest.Digest {
 }
 
 // admit records a freshly-committed entry. Called by writer.Commit while
-// holding no locks. Triggers eviction if size > budget.
+// holding no locks. Triggers eviction if size > budget or if forced
+// headroom has been breached.
 func (c *Cache) admit(d digest.Digest, size int64) {
 	c.mu.Lock()
 	if existing, ok := c.entries[d.String()]; ok {
@@ -242,39 +371,181 @@ func (c *Cache) admit(d digest.Digest, size int64) {
 	el := c.lru.PushFront(e)
 	c.entries[d.String()] = el
 	c.size += size
-	c.evictIfOverLocked()
 	c.mu.Unlock()
+	c.evictIfOver(context.Background())
 }
 
-// evictIfOverLocked is called with c.mu held. Drops LRU-tail entries until
-// c.size <= c.budgetBytes.
-func (c *Cache) evictIfOverLocked() {
-	for c.size > c.budgetBytes {
-		el := c.lru.Back()
-		if el == nil {
+// evictIfOver runs the §7.4 eviction policy: LRU with provider-count
+// deferral and forced-headroom escape. Callers must NOT hold c.mu.
+// At most one sweep runs at a time; concurrent admits are coalesced
+// via c.evictMu.
+func (c *Cache) evictIfOver(ctx context.Context) {
+	c.evictMu.Lock()
+	defer c.evictMu.Unlock()
+
+	// visited entries during this sweep — entries we've decided to
+	// defer. Avoids re-querying their provider count in a tight loop
+	// and guarantees forward progress when every tail candidate
+	// defers.
+	visited := map[string]struct{}{}
+
+	for {
+		// Decide whether we need to evict at all.
+		c.mu.Lock()
+		overBudget := c.size > c.budgetBytes
+		c.mu.Unlock()
+
+		forced := c.forcedHeadroom()
+		if !overBudget && !forced {
 			return
 		}
-		e := el.Value.(*entry)
+
+		// Walk the LRU from oldest to newest, looking for an
+		// un-visited candidate.
+		c.mu.Lock()
+		var cand *entry
+		for e := c.lru.Back(); e != nil; e = e.Prev() {
+			candidate := e.Value.(*entry)
+			if _, seen := visited[candidate.digest.String()]; seen {
+				continue
+			}
+			cand = candidate
+			break
+		}
+		c.mu.Unlock()
+		if cand == nil {
+			// Every entry deferred; nothing more we can do without
+			// the forced-headroom path.
+			if overBudget && !forced {
+				c.logger.Warn("cache: over budget but every tail entry deferred",
+					slog.Int64("size", c.SizeBytes()),
+					slog.Int64("budget", c.budgetBytes),
+				)
+			}
+			return
+		}
+
+		// Provider-count check, only if we have a callback and we're
+		// not in forced mode.
+		evict := true
+		var pCount int
+		if !forced && c.policy.providerCount != nil {
+			n, err := c.providerCountCached(ctx, cand.digest)
+			pCount = n
+			switch {
+			case err != nil:
+				// DHT failed — defer (safer to keep low-replication
+				// content; forced-headroom will pick up slack).
+				visited[cand.digest.String()] = struct{}{}
+				c.logger.Debug("cache: provider-count failed; deferring",
+					slog.String("digest", cand.digest.String()),
+					slog.Any("err", err),
+				)
+				if c.metrics.onDeferredEvict != nil {
+					c.metrics.onDeferredEvict()
+				}
+				continue
+			case n < c.policy.threshold:
+				visited[cand.digest.String()] = struct{}{}
+				evict = false
+				if c.metrics.onDeferredEvict != nil {
+					c.metrics.onDeferredEvict()
+				}
+			}
+		}
+		if !evict {
+			continue
+		}
+
+		// Actually evict — re-acquire the lock and verify the entry
+		// is still the one we picked.
+		c.mu.Lock()
+		el, ok := c.entries[cand.digest.String()]
+		if !ok {
+			c.mu.Unlock()
+			continue
+		}
+		current := el.Value.(*entry)
 		c.lru.Remove(el)
-		delete(c.entries, e.digest.String())
-		c.size -= e.size
-		path := c.pathFor(e.digest)
+		delete(c.entries, cand.digest.String())
+		c.size -= current.size
+		c.mu.Unlock()
+
+		path := c.pathFor(cand.digest)
 		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 			c.logger.Warn("cache: evict remove failed",
-				slog.String("digest", e.digest.String()),
+				slog.String("digest", cand.digest.String()),
 				slog.Any("err", err),
 			)
 		}
-		c.logger.Warn("cache: evicted",
-			slog.String("digest", e.digest.String()),
-			slog.Int64("bytes", e.size),
-			slog.Int64("size_after", c.size),
-			slog.Int64("budget", c.budgetBytes),
-		)
+		// Drop any cached provider count so a future re-admit re-queries.
+		c.pcMu.Lock()
+		delete(c.pcCnt, cand.digest.String())
+		c.pcMu.Unlock()
+
+		if forced {
+			c.logger.Warn("cache: forced eviction (§7.4 headroom)",
+				slog.String("digest", cand.digest.String()),
+				slog.Int("provider_count", pCount),
+				slog.Int64("bytes", current.size),
+				slog.Int64("size_after", c.SizeBytes()),
+				slog.Int64("budget", c.budgetBytes),
+			)
+			if c.metrics.onForcedEviction != nil {
+				c.metrics.onForcedEviction()
+			}
+		} else {
+			c.logger.Info("cache: evicted",
+				slog.String("digest", cand.digest.String()),
+				slog.Int64("bytes", current.size),
+				slog.Int64("size_after", c.SizeBytes()),
+				slog.Int64("budget", c.budgetBytes),
+			)
+		}
 		if c.metrics.onEvicted != nil {
-			c.metrics.onEvicted(e.size)
+			c.metrics.onEvicted(current.size)
 		}
 	}
+}
+
+// forcedHeadroom returns true when free disk on the cache volume has
+// fallen below the §7.4 headroom floor.
+func (c *Cache) forcedHeadroom() bool {
+	if c.policy.diskFree == nil || c.policy.headroomPct <= 0 || c.budgetBytes <= 0 {
+		return false
+	}
+	floor := uint64(c.budgetBytes) * uint64(c.policy.headroomPct) / 100
+	free, err := c.policy.diskFree()
+	if err != nil {
+		c.logger.Debug("cache: diskFree failed; ignoring",
+			slog.Any("err", err),
+		)
+		return false
+	}
+	return free < floor
+}
+
+// providerCountCached returns the provider count for d, hitting the
+// per-cache local count cache when an entry is within
+// providerCountTTL. The DHT callback is invoked WITHOUT c.mu held.
+func (c *Cache) providerCountCached(ctx context.Context, d digest.Digest) (int, error) {
+	key := d.String()
+	now := c.policy.now()
+	c.pcMu.Lock()
+	if pc, ok := c.pcCnt[key]; ok && now.Sub(pc.at) < c.policy.providerCountTTL {
+		c.pcMu.Unlock()
+		return pc.count, nil
+	}
+	c.pcMu.Unlock()
+
+	n, err := c.policy.providerCount(ctx, d)
+	if err != nil {
+		return 0, err
+	}
+	c.pcMu.Lock()
+	c.pcCnt[key] = providerCount{count: n, at: now}
+	c.pcMu.Unlock()
+	return n, nil
 }
 
 func (c *Cache) blobsDir() string { return filepath.Join(c.root, "blobs", "sha256") }
@@ -345,8 +616,6 @@ func (c *Cache) scan() error {
 		c.entries[f.d.String()] = el
 		c.size += f.size
 	}
-	// If we already exceed budget at startup (operator shrank it), evict.
-	c.evictIfOverLocked()
 	return nil
 }
 
