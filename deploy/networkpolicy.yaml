@@ -1,0 +1,60 @@
+# Phase 2 stub NetworkPolicy for the Gantry agent DaemonSet.
+#
+# Scope (per implementation-plan.md Phase 2 and detailed-design §7.5):
+#   - Allow the peer-facing transfer endpoint (:5001) and libp2p ports
+#     (TCP+QUIC, the operator picks the port range) only from other
+#     Gantry agent pods. Cluster nodes outside the DaemonSet must not
+#     be able to dial these endpoints.
+#   - The loopback mirror endpoint (:5000) is reachable from the host
+#     network namespace (containerd) but not from the pod network; it
+#     is bound to 127.0.0.1 by config validation and therefore does
+#     not appear in this policy.
+#   - The metrics endpoint (:9100 by default) is allowed from the
+#     monitoring namespace only.
+#
+# The full hardened manifest (with explicit egress restrictions, NF5
+# fallback handling, and PodSecurityPolicy / PodSecurityAdmission tags)
+# lands in Phase 6 alongside the deployment bundle. This stub exists
+# so the Phase 2 cluster bring-up has *some* policy in place.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: gantry-agent
+  namespace: gantry-system
+  labels:
+    app.kubernetes.io/name: gantry
+    app.kubernetes.io/component: agent
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: gantry
+      app.kubernetes.io/component: agent
+  policyTypes:
+    - Ingress
+  ingress:
+    # Peer-facing transfer endpoint (HTTP/2 cleartext over :5001) and
+    # libp2p transports. Only other Gantry agent pods are allowed.
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: gantry
+              app.kubernetes.io/component: agent
+      ports:
+        - protocol: TCP
+          port: 5001
+        # libp2p TCP listener (operator-configurable; reserving a stable
+        # range here so the NetworkPolicy can be reviewed without
+        # chasing config drift).
+        - protocol: TCP
+          port: 4001
+        - protocol: UDP
+          port: 4001
+    # Metrics endpoint scraped by Prometheus running in the monitoring
+    # namespace. Adjust the namespace selector to match your cluster.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - protocol: TCP
+          port: 9100

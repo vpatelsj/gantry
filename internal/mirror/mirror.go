@@ -46,16 +46,29 @@ type Server struct {
 	logger  *slog.Logger
 	metrics metricsHooks
 
+	// Phase 2 dependencies — nil-safe. When both dht and peer are set,
+	// the cache miss path tries DHT-discovered providers before origin.
+	dht  ifaces.DHT
+	peer ifaces.PeerDialer
+
+	// Phase 2 tunables (zero values fall back to package defaults).
+	peerLookupBudget time.Duration
+	peerFetchBudget  time.Duration
+	maxPeerAttempts  int
+
 	// defaultUpstream is the upstream to use when exactly one is
 	// configured and ?ns= is absent.
 	defaultUpstream string
 }
 
 type metricsHooks struct {
-	onCacheHit      func()
-	onCacheMiss     func()
-	onOriginPull    func(kind string)
-	onOriginFailure func(class string)
+	onCacheHit       func()
+	onCacheMiss      func()
+	onOriginPull     func(kind string)
+	onOriginFailure  func(class string)
+	onPeerFetch      func(outcome string)
+	onPeerDialResult func(success bool)
+	onDhtLookup      func(outcome string, dur time.Duration)
 }
 
 // Option configures Server construction.
@@ -73,12 +86,51 @@ func WithLogger(l *slog.Logger) Option {
 // WithMetrics registers metric callbacks.
 func WithMetrics(cacheHit, cacheMiss func(), originPull func(kind string), originFailure func(class string)) Option {
 	return func(s *Server) {
-		s.metrics = metricsHooks{
-			onCacheHit:      cacheHit,
-			onCacheMiss:     cacheMiss,
-			onOriginPull:    originPull,
-			onOriginFailure: originFailure,
-		}
+		s.metrics.onCacheHit = cacheHit
+		s.metrics.onCacheMiss = cacheMiss
+		s.metrics.onOriginPull = originPull
+		s.metrics.onOriginFailure = originFailure
+	}
+}
+
+// WithPeerMetrics registers Phase 2 peer-fallback metric callbacks.
+// peerFetchOutcome is invoked with one of: "hit", "notfound", "error",
+// "stall". peerDialResult is invoked per attempted dial.
+func WithPeerMetrics(peerFetchOutcome func(outcome string), peerDialResult func(success bool)) Option {
+	return func(s *Server) {
+		s.metrics.onPeerFetch = peerFetchOutcome
+		s.metrics.onPeerDialResult = peerDialResult
+	}
+}
+
+// WithDhtLookupMetric registers a hook that fires once per FindProviders
+// call with the outcome label ("hit", "miss", "timeout", "error") and the
+// observed lookup duration. Used to populate p2p_dht_lookup_total and
+// p2p_dht_lookup_duration_seconds (§7.6).
+func WithDhtLookupMetric(onLookup func(outcome string, dur time.Duration)) Option {
+	return func(s *Server) {
+		s.metrics.onDhtLookup = onLookup
+	}
+}
+
+// WithDiscovery wires Phase 2 P2P fetch: cache miss → DHT FindProviders →
+// PeerDialer.FetchFromPeer (across up to 3 providers) → origin fallback.
+// Either argument nil disables P2P fallback entirely (Phase 1 behavior).
+func WithDiscovery(d ifaces.DHT, peer ifaces.PeerDialer) Option {
+	return func(s *Server) {
+		s.dht = d
+		s.peer = peer
+	}
+}
+
+// WithPeerBudgets overrides the default Phase 2 peer-path budgets.
+// lookup ≤ 0 means "use default 2s"; fetch ≤ 0 means "use default 10s";
+// maxAttempts ≤ 0 means "use default 3".
+func WithPeerBudgets(lookup, fetch time.Duration, maxAttempts int) Option {
+	return func(s *Server) {
+		s.peerLookupBudget = lookup
+		s.peerFetchBudget = fetch
+		s.maxPeerAttempts = maxAttempts
 	}
 }
 
@@ -209,9 +261,22 @@ func (s *Server) serveDigest(w http.ResponseWriter, r *http.Request, upstream, r
 	}
 
 	s.bumpCacheMiss()
+
+	// 2. Peer fallback (Phase 2). If both DHT and PeerDialer are wired,
+	// try up to maxPeerAttempts providers from FindProviders before
+	// falling through to origin. On any successful peer fetch the bytes
+	// are committed to the local cache (digest-verified) and re-served
+	// from cache, ensuring the client never sees unverified bytes even
+	// if the peer responds with corrupt content.
+	if s.dht != nil && s.peer != nil {
+		if s.tryPeerFallback(ctx, w, r, d, kind, upstream, repo, logger) {
+			return
+		}
+	}
+
 	s.bumpOriginPull(kind)
 
-	// 2. Origin pull, stream-and-cache.
+	// 3. Origin pull, stream-and-cache.
 	pRef := ifaces.OriginRef{Registry: upstream, Repository: repo, Digest: d, Kind: kind}
 	pr, psize, perr := s.origin.Pull(ctx, pRef)
 	if perr != nil {
@@ -248,6 +313,135 @@ func (s *Server) serveDigest(w http.ResponseWriter, r *http.Request, upstream, r
 	}
 }
 
+// tryPeerFallback attempts to satisfy a cache miss via a DHT-discovered
+// peer. Returns true if it served a response from a peer; false if the
+// caller should fall through to origin. No bytes are written to w until a
+// peer's body is digest-verified and committed to the local cache, so a
+// false return guarantees no partial response has been emitted.
+func (s *Server) tryPeerFallback(ctx context.Context, w http.ResponseWriter, r *http.Request, d digest.Digest, kind ifaces.OriginRefKind, upstream, repo string, logger *slog.Logger) bool {
+	lookupBudget := s.peerLookupBudget
+	if lookupBudget <= 0 {
+		lookupBudget = 2 * time.Second
+	}
+	fetchBudget := s.peerFetchBudget
+	if fetchBudget <= 0 {
+		fetchBudget = 10 * time.Second
+	}
+	maxAttempts := s.maxPeerAttempts
+	if maxAttempts <= 0 {
+		maxAttempts = 3
+	}
+
+	lookupCtx, cancel := context.WithTimeout(ctx, lookupBudget)
+	lookupStart := time.Now()
+	providers, err := s.dht.FindProviders(lookupCtx, d)
+	lookupDur := time.Since(lookupStart)
+	lookupCtxErr := lookupCtx.Err()
+	cancel()
+	if err != nil {
+		outcome := "error"
+		if errors.Is(lookupCtxErr, context.DeadlineExceeded) {
+			outcome = "timeout"
+		}
+		s.bumpDhtLookup(outcome, lookupDur)
+		logger.Debug("mirror: FindProviders error", slog.Any("err", err))
+		return false
+	}
+	if len(providers) == 0 {
+		s.bumpDhtLookup("miss", lookupDur)
+		return false
+	}
+	s.bumpDhtLookup("hit", lookupDur)
+
+	tried := 0
+	for _, p := range providers {
+		if tried >= maxAttempts {
+			break
+		}
+		tried++
+		if s.fetchOneProvider(ctx, w, r, d, kind, upstream, repo, p, fetchBudget, logger) {
+			return true
+		}
+	}
+	return false
+}
+
+// fetchOneProvider streams from one peer into the local cache (which
+// verifies the digest on Commit) and, on success, serves from cache. Any
+// failure path returns false so the caller can try the next provider; no
+// bytes are written to w until the digest verifies.
+func (s *Server) fetchOneProvider(ctx context.Context, w http.ResponseWriter, r *http.Request, d digest.Digest, kind ifaces.OriginRefKind, upstream, repo string, p ifaces.Provider, fetchBudget time.Duration, logger *slog.Logger) bool {
+	pCtx, cancel := context.WithTimeout(ctx, fetchBudget)
+	defer cancel()
+
+	pRef := ifaces.OriginRef{Registry: upstream, Repository: repo, Digest: d, Kind: kind}
+	rc, _, err := s.peer.FetchFromPeer(pCtx, p.Addr, pRef)
+	if err != nil {
+		var enf *ifaces.ErrNotFound
+		if errors.As(err, &enf) {
+			s.bumpPeerDial(true)
+			s.bumpPeerFetch("notfound")
+			logger.Debug("mirror: peer 404",
+				slog.String("peer", p.Addr),
+				slog.String("node", string(p.NodeID)),
+			)
+			return false
+		}
+		s.bumpPeerDial(false)
+		s.bumpPeerFetch("error")
+		logger.Debug("mirror: peer fetch error",
+			slog.String("peer", p.Addr),
+			slog.Any("err", err),
+		)
+		return false
+	}
+	defer func() { _ = rc.Close() }()
+	s.bumpPeerDial(true)
+
+	cw, cwerr := s.cache.Writer(pCtx, d)
+	if cwerr != nil {
+		s.bumpPeerFetch("error")
+		logger.Warn("mirror: cache writer unavailable for peer fetch", slog.Any("err", cwerr))
+		return false
+	}
+	defer func() { _ = cw.Abort(pCtx) }()
+
+	if _, err := io.Copy(cw, rc); err != nil {
+		s.bumpPeerFetch("stall")
+		logger.Debug("mirror: peer copy stalled",
+			slog.String("peer", p.Addr),
+			slog.Any("err", err),
+		)
+		return false
+	}
+	if err := cw.Commit(pCtx); err != nil {
+		s.bumpPeerFetch("error")
+		logger.Warn("mirror: peer commit failed (likely digest mismatch)",
+			slog.String("peer", p.Addr),
+			slog.Any("err", err),
+		)
+		return false
+	}
+
+	// Re-open from cache and stream verified bytes to the client.
+	rcLocal, size, err := s.cache.Open(ctx, d)
+	if err != nil {
+		s.bumpPeerFetch("error")
+		logger.Warn("mirror: post-commit cache open failed", slog.Any("err", err))
+		return false
+	}
+	defer func() { _ = rcLocal.Close() }()
+	s.bumpPeerFetch("hit")
+	writeBlobHeaders(w, d, size, kind)
+	if r.Method == http.MethodHead {
+		return true
+	}
+	if _, err := io.Copy(w, rcLocal); err != nil {
+		logger.Debug("mirror: copy from cache (post-peer) failed", slog.Any("err", err))
+	}
+	return true
+}
+
 // bumpCacheHit / bumpCacheMiss / bumpOriginPull / bumpOriginFailure are
 // no-ops if no metric hooks were registered.
 func (s *Server) bumpCacheHit() {
@@ -275,6 +469,24 @@ func (s *Server) bumpOriginFailure(err error) {
 		class = string(oe.Class)
 	}
 	s.metrics.onOriginFailure(class)
+}
+
+func (s *Server) bumpPeerFetch(outcome string) {
+	if s.metrics.onPeerFetch != nil {
+		s.metrics.onPeerFetch(outcome)
+	}
+}
+
+func (s *Server) bumpPeerDial(success bool) {
+	if s.metrics.onPeerDialResult != nil {
+		s.metrics.onPeerDialResult(success)
+	}
+}
+
+func (s *Server) bumpDhtLookup(outcome string, dur time.Duration) {
+	if s.metrics.onDhtLookup != nil {
+		s.metrics.onDhtLookup(outcome, dur)
+	}
 }
 
 // writeBlobHeaders sets the OCI distribution headers the client expects.

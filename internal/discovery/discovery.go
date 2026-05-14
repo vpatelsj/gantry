@@ -1,0 +1,412 @@
+// Package discovery wires Gantry's libp2p host and Kademlia DHT.
+//
+// Design (detailed-design.md §7.2):
+//
+//   - Each agent runs a libp2p host with TCP and (optionally) QUIC transports
+//     and Noise security. The host's identity is persisted to a hostPath so
+//     restarts don't churn the DHT routing table.
+//   - The host participates in a cluster-scoped Kademlia DHT (`/gantry/kad/1`
+//     protocol prefix) in **server mode**. Server mode is required because
+//     every Gantry agent is also a content provider; client-mode peers would
+//     not contribute provider records.
+//   - Provider records are keyed by a CIDv1 wrapping the OCI digest's raw
+//     32 bytes via SHA2-256 multihash. The CID derivation is deterministic
+//     and documented inline so any agent can re-derive the same CID from
+//     the same digest.
+//
+// Phase 2 scope:
+//
+//   - Host + DHT bring-up, Provide / FindProviders.
+//   - Health() returns 1.0 as a stub; the real geometric-mean health score
+//     (routing-table coverage, p95 lookup latency, self-test) lands in
+//     Phase 5 (internal/discovery/health.go).
+//   - Bootstrap pulls from the operator-supplied `Libp2pBootstrapPeers`
+//     static list. Dynamic bootstrap from K8s pod annotations is a planned
+//     follow-up (the protocol is: agents publish their own peer.AddrInfo
+//     on a pod annotation at startup; Members surfaces it; this package
+//     dials from that pool with the §7.2 8/5/32 cascade).
+package discovery
+
+import (
+	"context"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"log/slog"
+	mathrand "math/rand"
+	"os"
+	"path/filepath"
+	"sync"
+	"time"
+
+	"github.com/ipfs/go-cid"
+	"github.com/libp2p/go-libp2p"
+	dht "github.com/libp2p/go-libp2p-kad-dht"
+	"github.com/libp2p/go-libp2p/core/crypto"
+	"github.com/libp2p/go-libp2p/core/host"
+	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/core/peerstore"
+	"github.com/libp2p/go-libp2p/core/protocol"
+	"github.com/multiformats/go-multiaddr"
+	"github.com/multiformats/go-multihash"
+
+	"github.com/gantry/gantry/internal/config"
+	"github.com/gantry/gantry/internal/digest"
+	"github.com/gantry/gantry/internal/ifaces"
+)
+
+// Options configures the discovery host.
+type Options struct {
+	// IdentityPath is the on-disk persistence path for the libp2p key.
+	// Empty means generate a fresh ephemeral identity (test mode).
+	IdentityPath string
+
+	// ListenAddrs is the list of multiaddrs the host advertises. Empty
+	// uses libp2p's defaults (which include /ip4/0.0.0.0/tcp/0).
+	ListenAddrs []string
+
+	// BootstrapPeers is the static list of peer multiaddrs to seed the
+	// DHT routing table on startup. Each entry must include /p2p/<peer.ID>.
+	BootstrapPeers []string
+
+	// ProtocolPrefix is the kad-dht protocol prefix, e.g. "/gantry". Empty
+	// uses kad-dht's default ("/ipfs"). Production should set this to
+	// isolate the cluster's DHT from other libp2p networks.
+	ProtocolPrefix string
+
+	// Logger is the structured logger; nil uses slog.Default().
+	Logger *slog.Logger
+}
+
+// FromConfig builds Options from a *config.Config.
+func FromConfig(c *config.Config) Options {
+	return Options{
+		IdentityPath:   c.Libp2pIdentityPath,
+		ListenAddrs:    c.Libp2pListen,
+		BootstrapPeers: c.Libp2pBootstrapPeers,
+		ProtocolPrefix: "/gantry",
+	}
+}
+
+// Host wraps a libp2p host + kad-dht and implements ifaces.DHT.
+type Host struct {
+	logger *slog.Logger
+	h      host.Host
+	d      *dht.IpfsDHT
+
+	closeOnce sync.Once
+}
+
+// New builds a Host and joins the DHT in server mode. The returned Host is
+// already announcing — Provide/FindProviders are usable immediately, though
+// FindProviders may return empty until the routing table converges.
+func New(ctx context.Context, opts Options) (*Host, error) {
+	logger := opts.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+	logger = logger.With(slog.String("subsystem", "discovery"))
+
+	priv, err := loadOrCreateIdentity(opts.IdentityPath, logger)
+	if err != nil {
+		return nil, fmt.Errorf("discovery: identity: %w", err)
+	}
+
+	var listenOpt libp2p.Option
+	if len(opts.ListenAddrs) > 0 {
+		listenOpt = libp2p.ListenAddrStrings(opts.ListenAddrs...)
+	} else {
+		// Sensible defaults: TCP on a random port, plus QUIC.
+		listenOpt = libp2p.ListenAddrStrings(
+			"/ip4/0.0.0.0/tcp/0",
+			"/ip4/0.0.0.0/udp/0/quic-v1",
+		)
+	}
+
+	h, err := libp2p.New(
+		libp2p.Identity(priv),
+		listenOpt,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("discovery: libp2p new: %w", err)
+	}
+
+	dhtOpts := []dht.Option{dht.Mode(dht.ModeServer)}
+	if opts.ProtocolPrefix != "" {
+		dhtOpts = append(dhtOpts, dht.ProtocolPrefix(protocol.ID(opts.ProtocolPrefix)))
+	}
+	d, err := dht.New(ctx, h, dhtOpts...)
+	if err != nil {
+		_ = h.Close()
+		return nil, fmt.Errorf("discovery: dht new: %w", err)
+	}
+	if err := d.Bootstrap(ctx); err != nil {
+		// kad-dht bootstrap runs asynchronously; this only checks the
+		// initial configuration error path.
+		logger.Warn("dht bootstrap kickoff returned err", slog.Any("err", err))
+	}
+
+	host := &Host{logger: logger, h: h, d: d}
+	host.dialBootstrap(ctx, opts.BootstrapPeers)
+
+	logger.Info("libp2p host ready",
+		slog.String("peer_id", h.ID().String()),
+		slog.Int("listen_addrs", len(h.Addrs())),
+	)
+	return host, nil
+}
+
+// Close tears down the DHT and libp2p host. Safe to call multiple times.
+func (h *Host) Close() error {
+	var err error
+	h.closeOnce.Do(func() {
+		if cerr := h.d.Close(); cerr != nil {
+			err = cerr
+		}
+		if cerr := h.h.Close(); cerr != nil && err == nil {
+			err = cerr
+		}
+	})
+	return err
+}
+
+// PeerID returns the libp2p peer ID of this host.
+func (h *Host) PeerID() peer.ID { return h.h.ID() }
+
+// Addrs returns the libp2p listen multiaddrs (host-local view).
+func (h *Host) Addrs() []multiaddr.Multiaddr { return h.h.Addrs() }
+
+// LibP2P returns the underlying libp2p host. Reserved for Phase 3
+// coord-stream wiring.
+func (h *Host) LibP2P() host.Host { return h.h }
+
+// Provide implements ifaces.DHT.
+func (h *Host) Provide(ctx context.Context, d digest.Digest) error {
+	c, err := DigestToCID(d)
+	if err != nil {
+		return err
+	}
+	return h.d.Provide(ctx, c, true)
+}
+
+// FindProviders implements ifaces.DHT. Returns providers whose multiaddrs
+// expose at least one IP-based transport (TCP or QUIC). Provider.NodeID is
+// the libp2p peer.ID as a string; Provider.Addr is the first IP-based
+// multiaddr's IP, suffixed with the conventional transfer port `:5001`.
+// Phase 3's coord layer will reconcile peer.ID with k8s NodeID using
+// Members; Phase 2 callers (the mirror miss path) only need a dialable
+// transfer URL.
+func (h *Host) FindProviders(ctx context.Context, d digest.Digest) ([]ifaces.Provider, error) {
+	c, err := DigestToCID(d)
+	if err != nil {
+		return nil, err
+	}
+	// kad-dht's FindProviders is bounded by a default count internally;
+	// the synchronous variant collects until the routing layer signals
+	// done or ctx fires.
+	ais, err := h.d.FindProviders(ctx, c)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]ifaces.Provider, 0, len(ais))
+	for _, ai := range ais {
+		addr := transferAddr(ai)
+		if addr == "" {
+			continue
+		}
+		// Cache the addr info in the peerstore so subsequent dials don't
+		// require another DHT round-trip.
+		h.h.Peerstore().AddAddrs(ai.ID, ai.Addrs, peerstore.AddressTTL)
+		out = append(out, ifaces.Provider{
+			NodeID: ifaces.NodeID(ai.ID.String()),
+			Addr:   addr,
+		})
+	}
+	return out, nil
+}
+
+// Health is a Phase 2 stub returning 1.0. Phase 5 replaces it with the
+// §7.7 geometric-mean health score over routing-table coverage, p95
+// lookup latency, and self-test success rate.
+func (h *Host) Health() float64 { return 1.0 }
+
+// Compile-time check.
+var _ ifaces.DHT = (*Host)(nil)
+
+// dialBootstrap implements the §7.2 bootstrap cascade: randomly select 8
+// peers from the configured pool and dial them in parallel with a 5s
+// per-peer timeout. If fewer than 4 successfully connect, draw another
+// random subset of 8 from the remaining pool. The total number of dial
+// attempts is capped at 32. Failures are logged at DEBUG — kad-dht's own
+// bootstrap routine retries periodically.
+func (h *Host) dialBootstrap(ctx context.Context, peers []string) {
+	if len(peers) == 0 {
+		return
+	}
+
+	const (
+		batchSize       = 8
+		successQuorum   = 4
+		totalDialBudget = 32
+	)
+
+	// Parse all peers up-front; drop unparseable ones.
+	pool := make([]peer.AddrInfo, 0, len(peers))
+	for _, p := range peers {
+		ai, err := peer.AddrInfoFromString(p)
+		if err != nil {
+			h.logger.Warn("bootstrap peer parse failed",
+				slog.String("multiaddr", p),
+				slog.Any("err", err),
+			)
+			continue
+		}
+		pool = append(pool, *ai)
+	}
+	if len(pool) == 0 {
+		return
+	}
+
+	// Fisher–Yates shuffle for unbiased random subsets.
+	rng := newBootstrapRand()
+	rng.Shuffle(len(pool), func(i, j int) { pool[i], pool[j] = pool[j], pool[i] })
+
+	dialed := 0
+	cursor := 0
+	for cursor < len(pool) && dialed < totalDialBudget {
+		end := cursor + batchSize
+		if end > len(pool) {
+			end = len(pool)
+		}
+		if dialed+(end-cursor) > totalDialBudget {
+			end = cursor + (totalDialBudget - dialed)
+		}
+		batch := pool[cursor:end]
+		cursor = end
+
+		successes := h.dialBatch(ctx, batch)
+		dialed += len(batch)
+		if successes >= successQuorum {
+			return
+		}
+	}
+}
+
+// dialBatch fans out parallel Connect attempts against batch with a 5s
+// timeout each and returns the number that succeeded.
+func (h *Host) dialBatch(ctx context.Context, batch []peer.AddrInfo) int {
+	var wg sync.WaitGroup
+	var succ atomicInt
+	for _, ai := range batch {
+		wg.Add(1)
+		go func(ai peer.AddrInfo) {
+			defer wg.Done()
+			cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			defer cancel()
+			if err := h.h.Connect(cctx, ai); err != nil {
+				h.logger.Debug("bootstrap connect failed",
+					slog.String("peer", ai.ID.String()),
+					slog.Any("err", err),
+				)
+				return
+			}
+			succ.add(1)
+			h.logger.Info("bootstrap peer connected", slog.String("peer", ai.ID.String()))
+		}(ai)
+	}
+	wg.Wait()
+	return succ.load()
+}
+
+type atomicInt struct {
+	mu sync.Mutex
+	v  int
+}
+
+func (a *atomicInt) add(d int) { a.mu.Lock(); a.v += d; a.mu.Unlock() }
+func (a *atomicInt) load() int { a.mu.Lock(); defer a.mu.Unlock(); return a.v }
+
+// newBootstrapRand returns a seeded *math/rand.Rand. We deliberately
+// avoid global rand to keep tests deterministic when needed.
+func newBootstrapRand() *mathrand.Rand {
+	return mathrand.New(mathrand.NewSource(time.Now().UnixNano()))
+}
+
+// DigestToCID maps an OCI digest to the CIDv1 used as the DHT provider key.
+// CID derivation: Multihash(sha256, raw_digest_bytes) wrapped in CID v1 with
+// codec=raw. The derivation is deterministic so any agent re-derives the
+// same CID from the same digest.
+func DigestToCID(d digest.Digest) (cid.Cid, error) {
+	if d.Algorithm() != digest.SHA256 {
+		return cid.Undef, fmt.Errorf("discovery: unsupported digest algo %q", d.Algorithm())
+	}
+	raw, err := hex.DecodeString(d.Hex())
+	if err != nil {
+		return cid.Undef, fmt.Errorf("discovery: decode digest hex: %w", err)
+	}
+	mh, err := multihash.Encode(raw, multihash.SHA2_256)
+	if err != nil {
+		return cid.Undef, fmt.Errorf("discovery: multihash encode: %w", err)
+	}
+	return cid.NewCidV1(cid.Raw, mh), nil
+}
+
+// transferAddr extracts the dial address for the peer's :5001 transfer
+// endpoint by walking its multiaddrs for an IPv4/IPv6 component. Returns
+// the empty string if no IP-based multiaddr is present.
+func transferAddr(ai peer.AddrInfo) string {
+	for _, ma := range ai.Addrs {
+		ip, ok := extractIP(ma)
+		if !ok {
+			continue
+		}
+		return ip + ":5001"
+	}
+	return ""
+}
+
+func extractIP(ma multiaddr.Multiaddr) (string, bool) {
+	if v, err := ma.ValueForProtocol(multiaddr.P_IP4); err == nil {
+		return v, true
+	}
+	if v, err := ma.ValueForProtocol(multiaddr.P_IP6); err == nil {
+		return "[" + v + "]", true
+	}
+	return "", false
+}
+
+// loadOrCreateIdentity loads a libp2p private key from disk, generating
+// and saving a fresh Ed25519 key if the file doesn't exist.
+func loadOrCreateIdentity(path string, logger *slog.Logger) (crypto.PrivKey, error) {
+	if path == "" {
+		// Ephemeral.
+		priv, _, err := crypto.GenerateEd25519Key(nil)
+		return priv, err
+	}
+	if b, err := os.ReadFile(path); err == nil {
+		k, err := crypto.UnmarshalPrivateKey(b)
+		if err != nil {
+			return nil, fmt.Errorf("read %s: %w", path, err)
+		}
+		logger.Info("loaded libp2p identity", slog.String("path", path))
+		return k, nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("stat %s: %w", path, err)
+	}
+	priv, _, err := crypto.GenerateEd25519Key(nil)
+	if err != nil {
+		return nil, fmt.Errorf("generate key: %w", err)
+	}
+	b, err := crypto.MarshalPrivateKey(priv)
+	if err != nil {
+		return nil, fmt.Errorf("marshal key: %w", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return nil, fmt.Errorf("mkdir: %w", err)
+	}
+	if err := os.WriteFile(path, b, 0o600); err != nil {
+		return nil, fmt.Errorf("write %s: %w", path, err)
+	}
+	logger.Info("generated libp2p identity", slog.String("path", path))
+	return priv, nil
+}

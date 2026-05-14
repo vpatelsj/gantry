@@ -60,6 +60,33 @@ type Config struct {
 	// (§7.2). Lost identity is not catastrophic; old DHT records age out.
 	Libp2pIdentityPath string `yaml:"libp2p_identity_path"`
 
+	// Libp2pBootstrapPeers is an optional list of static multiaddrs to seed
+	// the libp2p host's connection set on startup. In production these are
+	// usually discovered via the K8s informer (§7.2) so this field defaults
+	// to empty; tests and small clusters can use it directly.
+	Libp2pBootstrapPeers []string `yaml:"libp2p_bootstrap_peers"`
+
+	// ---------- Cluster membership (§7.3) ----------
+
+	// NodeName is the Kubernetes node this agent runs on. Sourced via the
+	// Downward API (env spec.nodeName) into GANTRY_NODE_NAME. Used as the
+	// stable HRW NodeID and as the join key against the Node informer for
+	// zone resolution.
+	NodeName string `yaml:"node_name"`
+
+	// MembersNamespace restricts the Pod informer to a single namespace.
+	// Empty means cluster-wide (typical for Gantry as a privileged DaemonSet).
+	MembersNamespace string `yaml:"members_namespace"`
+
+	// MembersLabelSelector is the K8s label selector that identifies Gantry
+	// DaemonSet pods. Used to find peer agents (§7.3). Default matches the
+	// canonical app.kubernetes.io label.
+	MembersLabelSelector string `yaml:"members_label_selector"`
+
+	// MembersKubeconfig is an optional path to a kubeconfig file. Empty
+	// means in-cluster service-account discovery (the production path).
+	MembersKubeconfig string `yaml:"members_kubeconfig"`
+
 	// ---------- Cache ----------
 
 	// CacheDir is the hostPath root for the content store (§4.1, §7.4).
@@ -175,6 +202,11 @@ func NewDefault() *Config {
 		Libp2pListen:       nil,
 		Libp2pIdentityPath: "/var/lib/gantry/libp2p.key",
 
+		NodeName:             "",
+		MembersNamespace:     "",
+		MembersLabelSelector: "app.kubernetes.io/name=gantry",
+		MembersKubeconfig:    "",
+
 		CacheDir:                       "/var/lib/gantry/cache",
 		CacheBudgetBytes:               50 * 1024 * 1024 * 1024, // 50 GiB (§7.4)
 		CacheForcedEvictionHeadroomPct: 5,
@@ -262,6 +294,11 @@ func (c *Config) LoadEnv(env func(string) string) error {
 	setStr("METRICS_LISTEN", &c.MetricsListen)
 	setStr("LIBP2P_IDENTITY_PATH", &c.Libp2pIdentityPath)
 
+	setStr("NODE_NAME", &c.NodeName)
+	setStr("MEMBERS_NAMESPACE", &c.MembersNamespace)
+	setStr("MEMBERS_LABEL_SELECTOR", &c.MembersLabelSelector)
+	setStr("MEMBERS_KUBECONFIG", &c.MembersKubeconfig)
+
 	setStr("CACHE_DIR", &c.CacheDir)
 	setInt64("CACHE_BUDGET_BYTES", &c.CacheBudgetBytes)
 	setInt("CACHE_FORCED_EVICTION_HEADROOM_PCT", &c.CacheForcedEvictionHeadroomPct)
@@ -295,6 +332,11 @@ func (c *Config) BindFlags(fs *flag.FlagSet) {
 	fs.StringVar(&c.TransferListen, "transfer-listen", c.TransferListen, "address for the peer-facing transfer endpoint")
 	fs.StringVar(&c.MetricsListen, "metrics-listen", c.MetricsListen, "address for the Prometheus metrics endpoint")
 	fs.StringVar(&c.Libp2pIdentityPath, "libp2p-identity-path", c.Libp2pIdentityPath, "path to the persisted libp2p identity key")
+
+	fs.StringVar(&c.NodeName, "node-name", c.NodeName, "Kubernetes node name this agent runs on (Downward API spec.nodeName)")
+	fs.StringVar(&c.MembersNamespace, "members-namespace", c.MembersNamespace, "namespace to scope the pod informer (empty = cluster-wide)")
+	fs.StringVar(&c.MembersLabelSelector, "members-label-selector", c.MembersLabelSelector, "label selector identifying Gantry DaemonSet pods")
+	fs.StringVar(&c.MembersKubeconfig, "members-kubeconfig", c.MembersKubeconfig, "optional path to a kubeconfig file (empty = in-cluster)")
 
 	fs.StringVar(&c.CacheDir, "cache-dir", c.CacheDir, "hostPath directory for the content cache")
 	fs.Int64Var(&c.CacheBudgetBytes, "cache-budget-bytes", c.CacheBudgetBytes, "soft cap on cache size in bytes")

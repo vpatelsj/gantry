@@ -214,6 +214,19 @@ func (c *Cache) EntryCount() int {
 	return len(c.entries)
 }
 
+// Digests returns a snapshot of every digest currently in the cache. Used
+// by the startup re-announce path (§Phase 2: re-announce all cached
+// digests via dht.Provide on startup).
+func (c *Cache) Digests() []digest.Digest {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]digest.Digest, 0, len(c.entries))
+	for _, el := range c.entries {
+		out = append(out, el.Value.(*entry).digest)
+	}
+	return out
+}
+
 // admit records a freshly-committed entry. Called by writer.Commit while
 // holding no locks. Triggers eviction if size > budget.
 func (c *Cache) admit(d digest.Digest, size int64) {
