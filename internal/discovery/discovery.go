@@ -29,6 +29,7 @@ package discovery
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -76,6 +77,18 @@ type Options struct {
 
 	// Logger is the structured logger; nil uses slog.Default().
 	Logger *slog.Logger
+
+	// RoutingTableTarget is the expected steady-state routing-table
+	// size (used as the denominator for the §7.7 routing-table
+	// component). Typically `cluster_size - 1`. Zero disables the
+	// component (Health()'s rt term reads 1.0).
+	RoutingTableTarget int
+
+	// SelfTestPeriod is the interval between Provide(self_id) →
+	// FindProviders(self_id) self-test cycles. Zero disables the
+	// background self-test loop (used in tests). Production default
+	// is 60s (§7.7).
+	SelfTestPeriod time.Duration
 }
 
 // FromConfig builds Options from a *config.Config.
@@ -85,6 +98,7 @@ func FromConfig(c *config.Config) Options {
 		ListenAddrs:    c.Libp2pListen,
 		BootstrapPeers: c.Libp2pBootstrapPeers,
 		ProtocolPrefix: "/gantry",
+		SelfTestPeriod: 60 * time.Second,
 	}
 }
 
@@ -93,6 +107,12 @@ type Host struct {
 	logger *slog.Logger
 	h      host.Host
 	d      *dht.IpfsDHT
+
+	// monitor is the Phase 5 §7.7 health tracker. Latency samples
+	// flow from FindProviders; the self-test loop is owned by
+	// New() / Close().
+	monitor      *Monitor
+	selfTestStop context.CancelFunc
 
 	closeOnce sync.Once
 }
@@ -147,6 +167,15 @@ func New(ctx context.Context, opts Options) (*Host, error) {
 	}
 
 	host := &Host{logger: logger, h: h, d: d}
+	host.monitor = NewMonitor(MonitorOptions{
+		RoutingTableSize:   func() int { return d.RoutingTable().Size() },
+		RoutingTableTarget: opts.RoutingTableTarget,
+	})
+	if opts.SelfTestPeriod > 0 {
+		stCtx, stCancel := context.WithCancel(context.Background())
+		host.selfTestStop = stCancel
+		go host.monitor.RunSelfTestLoop(stCtx, opts.SelfTestPeriod, host.runSelfTest)
+	}
 	host.dialBootstrap(ctx, opts.BootstrapPeers)
 
 	logger.Info("libp2p host ready",
@@ -160,6 +189,9 @@ func New(ctx context.Context, opts Options) (*Host, error) {
 func (h *Host) Close() error {
 	var err error
 	h.closeOnce.Do(func() {
+		if h.selfTestStop != nil {
+			h.selfTestStop()
+		}
 		if cerr := h.d.Close(); cerr != nil {
 			err = cerr
 		}
@@ -204,7 +236,11 @@ func (h *Host) FindProviders(ctx context.Context, d digest.Digest) ([]ifaces.Pro
 	// kad-dht's FindProviders is bounded by a default count internally;
 	// the synchronous variant collects until the routing layer signals
 	// done or ctx fires.
+	start := time.Now()
 	ais, err := h.d.FindProviders(ctx, c)
+	if h.monitor != nil && err == nil {
+		h.monitor.ObserveLatency(time.Since(start))
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -225,10 +261,51 @@ func (h *Host) FindProviders(ctx context.Context, d digest.Digest) ([]ifaces.Pro
 	return out, nil
 }
 
-// Health is a Phase 2 stub returning 1.0. Phase 5 replaces it with the
-// §7.7 geometric-mean health score over routing-table coverage, p95
-// lookup latency, and self-test success rate.
-func (h *Host) Health() float64 { return 1.0 }
+// Health returns the §7.7 geometric-mean health score (routing-table
+// coverage, p95 lookup latency, self-test success rate). Returns 1.0
+// when no monitor is wired (test mode).
+func (h *Host) Health() float64 {
+	if h.monitor == nil {
+		return 1.0
+	}
+	return h.monitor.Score()
+}
+
+// Monitor returns the underlying health monitor for callers that need
+// finer-grained signals (e.g. `InBootstrapWindow`). May be nil when
+// the host was constructed without monitoring (test mode).
+func (h *Host) Monitor() *Monitor { return h.monitor }
+
+// runSelfTest performs one Provide → FindProviders cycle on a
+// peer-derived CID. Success means the routing layer accepted the
+// provider record and the immediate-follow-up FindProviders saw at
+// least one provider (which must include this host's own entry).
+func (h *Host) runSelfTest(ctx context.Context) bool {
+	// Derive a stable self-CID from the libp2p peer ID. Hashing the
+	// peer ID bytes yields a 32-byte SHA-256 digest we can wrap into
+	// a CID via DigestToCID.
+	peerBytes, err := h.h.ID().Marshal()
+	if err != nil {
+		return false
+	}
+	hashHex := digestPeerSelfID(peerBytes)
+	d, err := digest.Parse("sha256:" + hashHex)
+	if err != nil {
+		return false
+	}
+	c, err := DigestToCID(d)
+	if err != nil {
+		return false
+	}
+	if err := h.d.Provide(ctx, c, true); err != nil {
+		return false
+	}
+	ais, err := h.d.FindProviders(ctx, c)
+	if err != nil {
+		return false
+	}
+	return len(ais) > 0
+}
 
 // Compile-time check.
 var _ ifaces.DHT = (*Host)(nil)
@@ -409,4 +486,11 @@ func loadOrCreateIdentity(path string, logger *slog.Logger) (crypto.PrivKey, err
 	}
 	logger.Info("generated libp2p identity", slog.String("path", path))
 	return priv, nil
+}
+
+// digestPeerSelfID returns the lower-case hex sha-256 of `peerBytes`,
+// used as the OCI-style digest hex for the §7.7 self-test CID.
+func digestPeerSelfID(peerBytes []byte) string {
+	sum := sha256.Sum256(peerBytes)
+	return hex.EncodeToString(sum[:])
 }

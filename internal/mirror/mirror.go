@@ -56,6 +56,13 @@ type Server struct {
 	// set, before the request falls through to origin.
 	coldStart ColdStartResolver
 
+	// Phase 5 NF5 direct-origin fallback controller (§5.7). When set,
+	// the mirror is permitted to do a controlled direct origin pull
+	// after the cold-start cascade reports ErrColdStartExhausted (and
+	// the NF5 gating sequence passes). When nil, cold-start exhaustion
+	// always returns 5xx.
+	nf5 *NF5Controller
+
 	// Phase 2 tunables (zero values fall back to package defaults).
 	peerLookupBudget time.Duration
 	peerFetchBudget  time.Duration
@@ -159,6 +166,15 @@ type ColdStartResolution struct {
 // path before falling through to origin.
 func WithColdStart(c ColdStartResolver) Option {
 	return func(s *Server) { s.coldStart = c }
+}
+
+// WithNF5 wires the Phase 5 §5.7 direct-origin fallback controller.
+// When non-nil and cold-start exits via ErrColdStartExhausted, the
+// mirror runs the NF5 gating sequence (jitter, token bucket, dedup,
+// re-check) before falling through to a direct origin pull. When nil,
+// cold-start exhaustion always returns 5xx.
+func WithNF5(c *NF5Controller) Option {
+	return func(s *Server) { s.nf5 = c }
 }
 
 // New builds a Server bound to the given cache and origin.
@@ -308,6 +324,25 @@ func (s *Server) serveDigest(w http.ResponseWriter, r *http.Request, upstream, r
 		case peerFallbackExhausted:
 			http.Error(w, "warm path exhausted", http.StatusServiceUnavailable)
 			return
+		case peerFallbackColdExhausted:
+			// §5.7 NF5 last-resort: only attempt a direct origin
+			// pull when the controller passes its gating sequence
+			// (bootstrap done, DHT healthy enough, no dedup
+			// collision, token budget, jitter elapsed without
+			// recheck finding a provider).
+			if s.nf5 == nil {
+				http.Error(w, "warm path exhausted", http.StatusServiceUnavailable)
+				return
+			}
+			proceed, release, err := s.nf5.Allow(ctx, d, kind, 0)
+			if release != nil {
+				defer release()
+			}
+			if err != nil || !proceed {
+				http.Error(w, "warm path exhausted", http.StatusServiceUnavailable)
+				return
+			}
+			// Fall through to the origin pull below.
 		}
 	}
 
@@ -363,11 +398,19 @@ const (
 	// write further bytes.
 	peerFallbackServed
 	// peerFallbackExhausted means the DHT returned providers but all
-	// maxAttempts of them failed (stall or error). Per §5.1's v1
-	// transfer policy the mirror must return 5xx so containerd's
-	// hosts.toml mirror chain advances to origin directly. The caller
-	// must NOT do its own origin pull — that's Phase 5 NF5's job.
+	// maxAttempts of them failed (stall or error), OR the cold-start
+	// cascade short-circuited with an error other than
+	// ErrColdStartExhausted (failure short-circuit, transient
+	// cooldown, etc.). Per §5.1's v1 transfer policy and §5.8's
+	// trusted-cluster-wide failure propagation, the mirror must
+	// return 5xx — NF5 must NOT fire here.
 	peerFallbackExhausted
+	// peerFallbackColdExhausted means the cold-start cascade ran to
+	// its final ErrColdStartExhausted exit (no cache, no in-flight,
+	// no provider returned by HRW + DHT, both top-K and top-2K
+	// already tried). NF5 direct-origin fallback is eligible to fire
+	// — and only here.
+	peerFallbackColdExhausted
 )
 
 // tryPeerFallback attempts to satisfy a cache miss via a DHT-discovered
@@ -418,6 +461,14 @@ func (s *Server) tryPeerFallback(ctx context.Context, w http.ResponseWriter, r *
 				logger.Debug("mirror: cold-start exhausted",
 					slog.Any("err", csErr),
 				)
+				// Only ErrColdStartExhausted (rule-7 cascade truly
+				// exhausted) makes the request eligible for NF5
+				// direct-origin fallback. Failure short-circuit and
+				// transient cooldown intentionally short-circuit to
+				// 5xx without an origin escape valve.
+				if errors.Is(csErr, ErrColdStartExhausted) {
+					return peerFallbackColdExhausted
+				}
 				return peerFallbackExhausted
 			}
 			providers = res.Providers

@@ -215,6 +215,12 @@ func runAgent(args []string) error {
 		OnSize:     func(n int) { p4.setSize(n) },
 	})
 
+	// Phase 5 — DHT health gauge, NF5 origin-fallback counter, and
+	// top-K expansion counter. Health source is the discovery host
+	// (Phase 2 monitor); when running without monitoring (test mode)
+	// it returns 1.0.
+	p5 := newPhase5Metrics(reg, disco.Health)
+
 	coordClient := coord.NewClient(disco.LibP2P(),
 		coord.WithClientLogger(logger),
 	)
@@ -252,6 +258,7 @@ func runAgent(args []string) error {
 			HrwScope:             hrw.ParseScope(c.HRWTopologyScope),
 			SelfZone:             selfZone,
 			TransientCooldownCap: c.OriginFailureHonorWindowCap,
+			TopKExpansionFactor:  c.TopKExpansionFactorDegraded,
 			Metrics: coldstart.MetricsHooks{
 				OnRankMismatch: func(kindLabel string, _ ifaces.NodeID) {
 					p3.hrwRankMismatch.WithLabelValues(kindLabel).Inc()
@@ -264,6 +271,9 @@ func runAgent(args []string) error {
 				OnDesignatedPullerTakeover: func(kindLabel string) {
 					p4.designatedPullerTakeoverTotal.WithLabelValues(kindLabel).Inc()
 				},
+				OnTopKExpansion: func(reason string) {
+					p5.topkExpansionTotal.WithLabelValues(reason).Inc()
+				},
 			},
 		})
 		coldStartResolver = coldStartAdapter{r: realResolver}
@@ -273,6 +283,49 @@ func runAgent(args []string) error {
 		)
 	} else {
 		logger.Info("cold-start orchestrator disabled (single-node membership)")
+	}
+
+	// Phase 5 — NF5 direct-origin fallback controller (§5.7). Wired
+	// only when the cold-start resolver is also wired; without
+	// orchestration there is no `ErrColdStartExhausted` path to gate.
+	var nf5Ctrl *mirror.NF5Controller
+	if coldStartResolver != nil {
+		monitor := disco.Monitor()
+		nf5Ctrl = mirror.NewNF5(mirror.NF5Options{
+			Logger:           logger,
+			JitterBase:       c.NF5JitterBase,
+			PerNodeRateLimit: c.NF5PerNodeRateLimit,
+			ClusterSize:      func() int { return len(memberView.Snapshot()) },
+			InBootstrap: func() bool {
+				if monitor == nil {
+					return false
+				}
+				return monitor.InBootstrapWindow(c.BootstrapWindow, c.BootstrapRoutingTablePct)
+			},
+			HealthyEnough: func() bool {
+				// Decline NF5 when DHT is Unhealthy (<0.3). The empty
+				// DHT answer can't be trusted, and we'd rather 5xx and
+				// let kubelet back off than thunder the origin.
+				return disco.Health() >= 0.3
+			},
+			Inflight: inflightMap,
+			Recheck: func(ctx context.Context, d digest.Digest) bool {
+				// Final post-jitter probe: did anyone publish a
+				// provider record while we slept? If so, NF5 declines
+				// and the client retries through the warm path on its
+				// next attempt.
+				rcCtx, cancel := context.WithTimeout(ctx, 1*time.Second)
+				defer cancel()
+				prov, err := disco.FindProviders(rcCtx, d)
+				return err == nil && len(prov) > 0
+			},
+			OnFallback: func() { p5.originFallbackTotal.Inc() },
+		})
+		logger.Info("NF5 origin-fallback wired",
+			slog.Duration("jitter_base", c.NF5JitterBase),
+			slog.Int("per_node_rate_limit", c.NF5PerNodeRateLimit),
+			slog.Duration("bootstrap_window", c.BootstrapWindow),
+		)
 	}
 
 	// Mirror with Phase 2 peer fallback.
@@ -300,6 +353,7 @@ func runAgent(args []string) error {
 			p2.dhtLookupDur.WithLabelValues(outcome).Observe(dur.Seconds())
 		}),
 		mirror.WithColdStart(coldStartResolver),
+		mirror.WithNF5(nf5Ctrl),
 	)
 
 	mirrorStop, err := mirrorSrv.ListenAndServe(c.MirrorListen)
@@ -691,6 +745,14 @@ type coldStartAdapter struct{ r *coldstart.Resolver }
 func (a coldStartAdapter) Resolve(ctx context.Context, d digest.Digest, kind ifaces.OriginRefKind, registry, repository string, expectedSize int64) (*mirror.ColdStartResolution, error) {
 	res, err := a.r.Resolve(ctx, d, kind, registry, repository, expectedSize)
 	if err != nil {
+		// Translate the cold-start cascade-exhausted sentinel to the
+		// mirror-package sentinel that NF5 fallback gates on. Other
+		// cold-start errors (failure short-circuit, transient
+		// cooldown) are deliberately not translated so the mirror
+		// treats them as opaque 5xx — NF5 cannot fire on them.
+		if errors.Is(err, coldstart.ErrExhausted) {
+			return nil, mirror.ErrColdStartExhausted
+		}
 		return nil, err
 	}
 	return &mirror.ColdStartResolution{Providers: res.Providers, Outcome: res.Outcome}, nil
@@ -905,4 +967,29 @@ func failureClassLabel(c ifaces.FailureClass) string {
 		return "unspecified"
 	}
 	return string(c)
+}
+
+// phase5Metrics groups the §7.6 instruments owned by Phase 5: the
+// DHT health gauge, NF5 direct-origin fallback counter, and top-K
+// expansion counter.
+type phase5Metrics struct {
+	originFallbackTotal prometheus.Counter
+	topkExpansionTotal  *prometheus.CounterVec
+}
+
+func newPhase5Metrics(reg *metrics.Registry, healthScore func() float64) *phase5Metrics {
+	p := &phase5Metrics{}
+	_ = reg.NewGaugeFunc("discovery", prometheus.GaugeOpts{
+		Name: "p2p_dht_health_score",
+		Help: "§7.7 geometric-mean DHT health score in [0, 1] (routing-table coverage × p95 lookup latency score × self-test success rate).",
+	}, healthScore)
+	p.originFallbackTotal = reg.NewCounter("mirror", prometheus.CounterOpts{
+		Name: "p2p_origin_fallback_total",
+		Help: "§5.7 NF5 direct-origin fallback pulls (last-resort path after cold-start exhaustion).",
+	})
+	p.topkExpansionTotal = reg.NewCounterVec("coord", prometheus.CounterOpts{
+		Name: "p2p_topk_expansion_total",
+		Help: "Cold-start cascade expansions from top-K to top-(K × factor) by reason (degraded DHT, all top-K unreachable).",
+	}, []string{"reason"})
+	return p
 }

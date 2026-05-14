@@ -626,3 +626,107 @@ func rep(c byte, n int) string {
 	}
 	return string(b)
 }
+
+// TestTopKExpansionFactor_AllUnreachable asserts that Options.TopKExpansionFactor
+// is honored: with factor=3 and HrwK=3 the expanded pass probes 9
+// candidates, not the default 2*K=6. Uses the rule-5 path (all
+// unreachable) so the result is deterministic and never touches
+// pollDHT.
+func TestTopKExpansionFactor_AllUnreachable(t *testing.T) {
+	d := digest.MustParse("sha256:" + rep('4', 64))
+
+	// 12-node cluster + self; all peer nodes "unreachable" so every
+	// PullIntentQuery returns an error and the cascade emits rule 5
+	// (errNoReachable) on every pass.
+	nodes := make([]ifaces.Node, 12)
+	for i := range nodes {
+		nodes[i] = ifaces.Node{ID: ifaces.NodeID("n" + string(rune('0'+i))), Addr: "x:5001"}
+	}
+	intentErrs := map[ifaces.NodeID]error{}
+	for _, n := range nodes {
+		intentErrs[n.ID] = errors.New("unreachable")
+	}
+
+	tests := []struct {
+		name            string
+		factor          int
+		wantIntentCalls int // 3 (first pass) + HrwK*factor (expanded pass)
+	}{
+		{"default_factor_2", 0, 3 + 6},
+		{"explicit_factor_2", 2, 3 + 6},
+		{"factor_3", 3, 3 + 9},
+		{"factor_4_capped_by_cluster", 4, 3 + 12}, // 12 nodes, K*4=12 → all
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			coord := &stubCoord{intentErrs: intentErrs}
+			disco := &stubDisco{health: 1.0}
+			var expandReasons []string
+			metrics := coldstart.MetricsHooks{
+				OnTopKExpansion: func(reason string) {
+					expandReasons = append(expandReasons, reason)
+				},
+			}
+
+			r := coldstart.New(coldstart.Options{
+				Members:             fakes.NewMembers("self", nodes...),
+				Discovery:           disco,
+				Coord:               coord,
+				Inflight:            inflight.New(inflight.DefaultStalls(), nil),
+				HrwK:                3,
+				HrwScope:            hrw.ScopeCluster,
+				TopKExpansionFactor: tt.factor,
+				Metrics:             metrics,
+				QueryTimeout:        100 * time.Millisecond,
+				PollManifest:        20 * time.Millisecond,
+				PollLayer:           50 * time.Millisecond,
+			})
+
+			_, err := r.Resolve(context.Background(), d, ifaces.KindManifest, "reg.example.com", "test/repo", 0)
+			if !errors.Is(err, coldstart.ErrExhausted) {
+				t.Fatalf("Resolve err = %v; want ErrExhausted", err)
+			}
+			if coord.intentCalls != tt.wantIntentCalls {
+				t.Errorf("intentCalls = %d; want %d (factor=%d, HrwK=3)",
+					coord.intentCalls, tt.wantIntentCalls, tt.factor)
+			}
+			if len(expandReasons) != 1 || expandReasons[0] != "all_unreachable" {
+				t.Errorf("OnTopKExpansion reasons = %v; want [all_unreachable]", expandReasons)
+			}
+		})
+	}
+}
+
+// TestTopKExpansion_DegradedReason asserts OnTopKExpansion fires with
+// reason="degraded" on the rule-6 path (rule 7 + DHT health < 0.5).
+func TestTopKExpansion_DegradedReason(t *testing.T) {
+	d := digest.MustParse("sha256:" + rep('5', 64))
+	nodes := make([]ifaces.Node, 8)
+	for i := range nodes {
+		nodes[i] = ifaces.Node{ID: ifaces.NodeID("n" + string(rune('0'+i))), Addr: "x:5001"}
+	}
+	intents := map[ifaces.NodeID]ifaces.PullIntent{}
+	for _, n := range nodes {
+		intents[n.ID] = ifaces.PullIntent{} // empty — rule 7
+	}
+	coord := &stubCoord{intents: intents}
+	// Degraded DHT triggers rule 6 expansion; provider eventually
+	// shows up so pollDHT terminates and the resolve succeeds.
+	disco := &stubDisco{
+		health:    0.4,
+		providers: [][]ifaces.Provider{nil, {{NodeID: "puller", Addr: "puller:5001"}}},
+	}
+	var reasons []string
+	metrics := coldstart.MetricsHooks{
+		OnTopKExpansion: func(reason string) { reasons = append(reasons, reason) },
+	}
+	r := buildResolver(t, coord, disco, "self", nodes, metrics, time.Now)
+	if _, err := r.Resolve(context.Background(), d, ifaces.KindManifest, "reg.example.com", "test/repo", 0); err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if len(reasons) != 1 || reasons[0] != "degraded" {
+		t.Errorf("OnTopKExpansion reasons = %v; want [degraded]", reasons)
+	}
+}

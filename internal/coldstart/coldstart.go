@@ -90,6 +90,12 @@ type MetricsHooks struct {
 	// (rule 6 / rule 7). kindLabel is "manifest" or "layer". Maps to
 	// §7.6 metric `p2p_designated_puller_takeover_total`.
 	OnDesignatedPullerTakeover func(kindLabel string)
+	// OnTopKExpansion fires once per expansion pass to top-2K (or
+	// top-(K × TopKExpansionFactor) when the factor is configured).
+	// reason is "degraded" (rule-6 DHT-degraded expand) or
+	// "all_unreachable" (rule-5 expansion). Maps to §7.6 metric
+	// `p2p_topk_expansion_total{reason=}`.
+	OnTopKExpansion func(reason string)
 }
 
 // Options configures a Resolver.
@@ -110,6 +116,11 @@ type Options struct {
 	PollManifest         time.Duration // default 200ms — §5.2a
 	PollLayer            time.Duration // default 1s — §5.2a
 	TransientCooldownCap time.Duration // default 30s — §5.2 rule 4
+
+	// TopKExpansionFactor is the multiplier applied to HrwK on the
+	// expansion pass under rule 5 / rule 6 (§5.2 step 5; §7.7
+	// `topk_expansion_factor_degraded`). Defaults to 2 when ≤1.
+	TopKExpansionFactor int
 }
 
 // Resolver runs the §5.2 cascade.
@@ -150,6 +161,9 @@ func New(opts Options) *Resolver {
 	}
 	if opts.TransientCooldownCap <= 0 {
 		opts.TransientCooldownCap = 30 * time.Second
+	}
+	if opts.TopKExpansionFactor < 2 {
+		opts.TopKExpansionFactor = 2
 	}
 	return &Resolver{
 		opts:       opts,
@@ -218,16 +232,26 @@ func (r *Resolver) Resolve(ctx context.Context, d digest.Digest, kind ifaces.Ori
 	//     DHT health is below the §7.7 degraded threshold (we use 0.5).
 	expand := false
 	expandReason := ""
+	expandMetricReason := ""
 	switch {
 	case errors.Is(err, errNoReachable):
 		expand = true
 		expandReason = "rule5_all_unreachable"
+		expandMetricReason = "all_unreachable"
 	case errors.Is(err, errAllNeither) && r.opts.Discovery.Health() < 0.5:
 		expand = true
 		expandReason = "rule6_degraded_expand"
+		expandMetricReason = "degraded"
 	}
 	if expand {
-		res, outcome, err = r.probe(ctx, d, kind, registry, repository, expectedSize, candidates, r.opts.HrwK*2, expandReason)
+		factor := r.opts.TopKExpansionFactor
+		if factor < 2 {
+			factor = 2
+		}
+		if r.opts.Metrics.OnTopKExpansion != nil {
+			r.opts.Metrics.OnTopKExpansion(expandMetricReason)
+		}
+		res, outcome, err = r.probe(ctx, d, kind, registry, repository, expectedSize, candidates, r.opts.HrwK*factor, expandReason)
 		if err == nil {
 			r.bumpDuration(kindLabel, outcome, start)
 			return res, nil
