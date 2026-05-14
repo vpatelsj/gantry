@@ -97,14 +97,15 @@ type Server struct {
 func (s *Server) Drain() { s.draining.Store(true) }
 
 type metricsHooks struct {
-	onCacheHit       func()
-	onCacheMiss      func()
-	onOriginPull     func(kind string)
-	onOriginFailure  func(class string)
-	onPeerFetch      func(outcome string)
-	onPeerDialResult func(success bool)
-	onDhtLookup      func(outcome string, dur time.Duration)
-	onProvideError   func(op string)
+	onCacheHit         func()
+	onCacheMiss        func()
+	onOriginPull       func(kind string)
+	onOriginFailure    func(class string)
+	onPeerFetch        func(outcome string)
+	onPeerFetchLatency func(outcome string, d time.Duration)
+	onPeerDialResult   func(success bool)
+	onDhtLookup        func(outcome string, dur time.Duration)
+	onProvideError     func(op string)
 }
 
 // Option configures Server construction.
@@ -136,6 +137,19 @@ func WithPeerMetrics(peerFetchOutcome func(outcome string), peerDialResult func(
 	return func(s *Server) {
 		s.metrics.onPeerFetch = peerFetchOutcome
 		s.metrics.onPeerDialResult = peerDialResult
+	}
+}
+
+// WithPeerFetchLatencyMetric registers a hook that fires once per
+// fetchOneProvider call with the terminal outcome label and the
+// wall-clock time from the FetchFromPeer dial to either the cache
+// commit (hit) or the failing-branch return. Used for the
+// p2p_peer_fetch_duration_seconds{outcome} histogram so operators can
+// see whether peer fetches are slow because of dial latency, body
+// streaming, or commit-time digest verification.
+func WithPeerFetchLatencyMetric(onPeerFetchLatency func(outcome string, d time.Duration)) Option {
+	return func(s *Server) {
+		s.metrics.onPeerFetchLatency = onPeerFetchLatency
 	}
 }
 
@@ -630,6 +644,7 @@ func (s *Server) fetchOneProvider(ctx context.Context, w http.ResponseWriter, r 
 	pCtx, cancel := context.WithTimeout(ctx, fetchBudget)
 	defer cancel()
 
+	fetchStart := time.Now()
 	pRef := ifaces.OriginRef{Registry: upstream, Repository: repo, Digest: d, Kind: kind}
 	rc, _, err := s.peer.FetchFromPeer(pCtx, p.Addr, pRef)
 	if err != nil {
@@ -637,6 +652,7 @@ func (s *Server) fetchOneProvider(ctx context.Context, w http.ResponseWriter, r 
 		if errors.As(err, &enf) {
 			s.bumpPeerDial(true)
 			s.bumpPeerFetch("notfound")
+			s.bumpPeerFetchLatency("notfound", fetchStart)
 			logger.Debug("mirror: peer 404",
 				slog.String("peer", p.Addr),
 				slog.String("node", string(p.NodeID)),
@@ -645,6 +661,7 @@ func (s *Server) fetchOneProvider(ctx context.Context, w http.ResponseWriter, r 
 		}
 		s.bumpPeerDial(false)
 		s.bumpPeerFetch("error")
+		s.bumpPeerFetchLatency("error", fetchStart)
 		logger.Debug("mirror: peer fetch error",
 			slog.String("peer", p.Addr),
 			slog.Any("err", err),
@@ -657,6 +674,7 @@ func (s *Server) fetchOneProvider(ctx context.Context, w http.ResponseWriter, r 
 	cw, cwerr := s.cache.Writer(pCtx, d)
 	if cwerr != nil {
 		s.bumpPeerFetch("error")
+		s.bumpPeerFetchLatency("error", fetchStart)
 		logger.Warn("mirror: cache writer unavailable for peer fetch", slog.Any("err", cwerr))
 		return false
 	}
@@ -664,6 +682,7 @@ func (s *Server) fetchOneProvider(ctx context.Context, w http.ResponseWriter, r 
 
 	if _, err := io.Copy(cw, rc); err != nil {
 		s.bumpPeerFetch("stall")
+		s.bumpPeerFetchLatency("stall", fetchStart)
 		logger.Debug("mirror: peer copy stalled",
 			slog.String("peer", p.Addr),
 			slog.Any("err", err),
@@ -672,6 +691,7 @@ func (s *Server) fetchOneProvider(ctx context.Context, w http.ResponseWriter, r 
 	}
 	if err := cw.Commit(pCtx); err != nil {
 		s.bumpPeerFetch("error")
+		s.bumpPeerFetchLatency("error", fetchStart)
 		logger.Warn("mirror: peer commit failed (likely digest mismatch)",
 			slog.String("peer", p.Addr),
 			slog.Any("err", err),
@@ -707,11 +727,13 @@ func (s *Server) fetchOneProvider(ctx context.Context, w http.ResponseWriter, r 
 	rcLocal, size, err := s.cache.Open(ctx, d)
 	if err != nil {
 		s.bumpPeerFetch("error")
+		s.bumpPeerFetchLatency("error", fetchStart)
 		logger.Warn("mirror: post-commit cache open failed", slog.Any("err", err))
 		return false
 	}
 	defer func() { _ = rcLocal.Close() }()
 	s.bumpPeerFetch("hit")
+	s.bumpPeerFetchLatency("hit", fetchStart)
 	writeBlobHeaders(w, d, size, kind)
 	if r.Method == http.MethodHead {
 		return true
@@ -766,6 +788,15 @@ func (s *Server) bumpOriginFailure(err error) {
 func (s *Server) bumpPeerFetch(outcome string) {
 	if s.metrics.onPeerFetch != nil {
 		s.metrics.onPeerFetch(outcome)
+	}
+}
+
+// bumpPeerFetchLatency emits the peer-fetch duration observation with
+// the terminal outcome label. Always paired with bumpPeerFetch; the
+// two together describe one fetchOneProvider call.
+func (s *Server) bumpPeerFetchLatency(outcome string, start time.Time) {
+	if s.metrics.onPeerFetchLatency != nil {
+		s.metrics.onPeerFetchLatency(outcome, time.Since(start))
 	}
 }
 

@@ -418,6 +418,9 @@ func runAgent(args []string) error {
 				}
 			},
 		),
+		mirror.WithPeerFetchLatencyMetric(func(outcome string, d time.Duration) {
+			p2.peerFetchDur.WithLabelValues(outcome).Observe(d.Seconds())
+		}),
 		mirror.WithDhtLookupMetric(func(outcome string, dur time.Duration) {
 			p2.dhtLookup.WithLabelValues(outcome).Inc()
 			p2.dhtLookupDur.WithLabelValues(outcome).Observe(dur.Seconds())
@@ -671,6 +674,7 @@ type phase2Metrics struct {
 	peerServe       prometheus.Counter
 	peerMiss        prometheus.Counter
 	peerFetch       *prometheus.CounterVec
+	peerFetchDur    *prometheus.HistogramVec
 	peerDialSuccess prometheus.Counter
 	peerDialFailure prometheus.Counter
 	dhtProvide      prometheus.Counter
@@ -695,6 +699,11 @@ func newPhase2Metrics(reg *metrics.Registry) *phase2Metrics {
 		peerFetch: reg.NewCounterVec("mirror", prometheus.CounterOpts{
 			Name: "p2p_peer_fetch_total",
 			Help: "Peer fetches initiated by the mirror miss path.",
+		}, []string{"outcome"}),
+		peerFetchDur: reg.NewHistogramVec("mirror", prometheus.HistogramOpts{
+			Name:    "p2p_peer_fetch_duration_seconds",
+			Help:    "End-to-end peer-fetch latency from FetchFromPeer dial to terminal outcome (hit = cache commit, error/stall/notfound = first failing branch). Together with p2p_peer_fetch_total{outcome} this isolates dial vs. body vs. commit-time-digest-verification slowness.",
+			Buckets: prometheus.ExponentialBuckets(0.01, 2, 12),
 		}, []string{"outcome"}),
 		peerDialSuccess: reg.NewCounter("mirror", prometheus.CounterOpts{
 			Name: "p2p_peer_dial_success_total",
