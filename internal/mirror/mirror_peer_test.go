@@ -51,7 +51,7 @@ func startPeerTransfer(t *testing.T, c ifaces.Cache) string {
 	return ln.Addr().String()
 }
 
-func newMirrorWithPeer(t *testing.T, originBlobs map[digest.Digest][]byte, providers map[digest.Digest][]ifaces.Provider) (*httptest.Server, *cache.Cache, *int32, *int32) {
+func newMirrorWithPeer(t *testing.T, originBlobs map[digest.Digest][]byte, providers map[digest.Digest][]ifaces.Provider) (*httptest.Server, *cache.Cache, *fakes.DHT, *int32, *int32) {
 	t.Helper()
 	var originHits int32
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -120,7 +120,7 @@ func newMirrorWithPeer(t *testing.T, originBlobs map[digest.Digest][]byte, provi
 	)
 	srv := httptest.NewServer(m.Handler())
 	t.Cleanup(srv.Close)
-	return srv, c, &originHits, &peerFetches
+	return srv, c, dht, &originHits, &peerFetches
 }
 
 func TestMirror_PeerFallback_ServesFromPeerNotOrigin(t *testing.T) {
@@ -131,7 +131,7 @@ func TestMirror_PeerFallback_ServesFromPeerNotOrigin(t *testing.T) {
 	peerCache.Put(d, body)
 	peerAddr := startPeerTransfer(t, peerCache)
 
-	srv, _, originHits, peerFetches := newMirrorWithPeer(
+	srv, _, dht, originHits, peerFetches := newMirrorWithPeer(
 		t,
 		map[digest.Digest][]byte{d: body},
 		map[digest.Digest][]ifaces.Provider{d: {{NodeID: "peer-a", Addr: peerAddr}}},
@@ -155,13 +155,26 @@ func TestMirror_PeerFallback_ServesFromPeerNotOrigin(t *testing.T) {
 	if atomic.LoadInt32(peerFetches) != 1 {
 		t.Errorf("peer fetches = %d, want 1", *peerFetches)
 	}
+	// §5.2 step 7: after a successful peer fetch the digest MUST be
+	// re-advertised to the DHT so the provider set grows. Provide is
+	// fire-and-forget in a goroutine; poll up to 2s.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if dht.ProvideCount(d) >= 1 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if got := dht.ProvideCount(d); got < 1 {
+		t.Errorf("dht.Provide call count = %d, want >= 1 (post-peer-fetch re-advertise)", got)
+	}
 }
 
 func TestMirror_PeerFallback_NoProvidersFallsThroughToOrigin(t *testing.T) {
 	body := []byte("only at origin")
 	d := digestOf(body)
 
-	srv, _, originHits, peerFetches := newMirrorWithPeer(
+	srv, _, _, originHits, peerFetches := newMirrorWithPeer(
 		t,
 		map[digest.Digest][]byte{d: body},
 		nil,
@@ -195,7 +208,7 @@ func TestMirror_PeerFallback_PeerNotFoundExhaustsWarmPath(t *testing.T) {
 	peerCache := fakes.NewCache()
 	peerAddr := startPeerTransfer(t, peerCache)
 
-	srv, _, originHits, peerFetches := newMirrorWithPeer(
+	srv, _, _, originHits, peerFetches := newMirrorWithPeer(
 		t,
 		map[digest.Digest][]byte{d: body},
 		map[digest.Digest][]ifaces.Provider{d: {{NodeID: "peer-stale", Addr: peerAddr}}},

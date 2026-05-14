@@ -608,6 +608,27 @@ func (s *Server) fetchOneProvider(ctx context.Context, w http.ResponseWriter, r 
 		return false
 	}
 
+	// Re-advertise this digest into the DHT now that we've cached a
+	// byte-identical copy. Without this, peer-fetched blobs were
+	// discoverable only via the source peer's announcements, so the
+	// provider set never grew — defeating the deduplication promise
+	// of the design (detailed-design §5.2 step 7). Fire-and-forget
+	// with a 30s budget; bg ctx so client cancellation can't abort
+	// the announcement.
+	if s.dht != nil {
+		dHash := d
+		go func() {
+			provCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			if perr := s.dht.Provide(provCtx, dHash); perr != nil {
+				logger.Debug("mirror: post-peer-fetch dht.Provide failed",
+					slog.String("digest", dHash.String()),
+					slog.Any("err", perr),
+				)
+			}
+		}()
+	}
+
 	// Re-open from cache and stream verified bytes to the client.
 	rcLocal, size, err := s.cache.Open(ctx, d)
 	if err != nil {

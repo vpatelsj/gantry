@@ -219,15 +219,17 @@ func (p *PeerDialer) FetchFromPeer(ctx context.Context, addr string, ref ifaces.
 // DHT is an in-memory ifaces.DHT. Provides() and FindProviders() share a
 // digest→providers map, and Health() returns a configurable score.
 type DHT struct {
-	mu        sync.Mutex
-	providers map[string][]ifaces.Provider
-	health    float64
+	mu          sync.Mutex
+	providers   map[string][]ifaces.Provider
+	health      float64
+	provideCall map[string]int
 }
 
 func NewDHT() *DHT {
 	return &DHT{
-		providers: map[string][]ifaces.Provider{},
-		health:    1.0,
+		providers:   map[string][]ifaces.Provider{},
+		health:      1.0,
+		provideCall: map[string]int{},
 	}
 }
 
@@ -244,9 +246,18 @@ func (d *DHT) Health() float64 {
 }
 
 func (d *DHT) Provide(_ context.Context, dg digest.Digest) error {
-	// Identity of "this node" isn't modeled in the fake; tests use Inject.
-	_ = dg
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.provideCall[dg.String()]++
 	return nil
+}
+
+// ProvideCount returns the number of times Provide was called for dg.
+// Used by tests that assert the §5.2-step-7 re-advertise path fires.
+func (d *DHT) ProvideCount(dg digest.Digest) int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.provideCall[dg.String()]
 }
 
 // Inject seeds the provider list for a digest.

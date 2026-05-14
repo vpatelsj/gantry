@@ -146,7 +146,7 @@ func TestMirror_ColdStart_WarmPathSkipsResolver(t *testing.T) {
 // Phase 1 fallthrough behaviour is preserved.
 func newMirrorWithColdStart(t *testing.T, originBlobs map[digest.Digest][]byte, providers map[digest.Digest][]ifaces.Provider, cs mirror.ColdStartResolver) (*httptest.Server, *int32, *int32) {
 	t.Helper()
-	srv, _, originHits, peerFetches := newMirrorWithPeer(t, originBlobs, providers)
+	srv, _, _, originHits, peerFetches := newMirrorWithPeer(t, originBlobs, providers)
 	// Discard the previous httptest.Server and rebuild with the same
 	// upstream + cache but adding ColdStart. The simplest way is to
 	// repeat the construction.
