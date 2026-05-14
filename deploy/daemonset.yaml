@@ -144,6 +144,26 @@ spec:
               readOnly: true
             - name: tmp
               mountPath: /tmp
+            # containerd socket is consumed by the cdsub subsystem to
+            # discover locally-cached images and announce them on the
+            # DHT (§5.4). gantry only calls ListImages/Subscribe, never
+            # write APIs — but UNIX-socket mounts can't be marked
+            # readOnly without breaking the gRPC bidirectional stream,
+            # so RBAC-style protection lives at the host level instead.
+            # Operators whose node uses a non-default socket path can
+            # override via GANTRY_CONTAINERD_SOCKET or in the ConfigMap.
+            #
+            # Permissions caveat: containerd.sock is typically owned
+            # by root:root mode 0660. Because the pod runs as
+            # nonroot (UID 65532), operators must either:
+            #   (a) set spec.template.spec.securityContext.fsGroup
+            #       to a group that has access (e.g. the host
+            #       containerd group), or
+            #   (b) relax socket perms on the node, or
+            #   (c) clear ContainerdSocket in the ConfigMap to
+            #       disable cdsub entirely.
+            - name: containerd-socket
+              mountPath: /run/containerd/containerd.sock
       volumes:
         - name: cache
           hostPath:
@@ -162,3 +182,7 @@ spec:
             optional: true
         - name: tmp
           emptyDir: {}
+        - name: containerd-socket
+          hostPath:
+            path: /run/containerd/containerd.sock
+            type: Socket

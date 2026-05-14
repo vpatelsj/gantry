@@ -408,11 +408,13 @@ func runAgent(args []string) error {
 	}
 	logger.Info("mirror endpoint listening", slog.String("addr", c.MirrorListen))
 
-	// Phase 2 — cdsub announce loop. NoOpSource is used when no real
-	// containerd is available; the loop still exercises List/Subscribe
-	// and is harmless. A real containerd-event source is a Phase 2
-	// follow-up bound under a Linux build tag.
-	cdSub := cdsub.New(cdsub.NoOpSource{}, disco,
+	// Phase 2 — cdsub announce loop. The platform-specific selector in
+	// cdsub_source_{linux,other}.go returns the real containerd source
+	// on linux (when ContainerdSocket is reachable) and NoOpSource
+	// otherwise; the Subscriber loop handles either uniformly via the
+	// ImageSource interface.
+	cdsubSrc := newCdsubSource(c, logger)
+	cdSub := cdsub.New(cdsubSrc, disco,
 		cdsub.WithLogger(logger),
 		cdsub.WithMetrics(
 			func() { p2.dhtProvide.Inc() },
@@ -540,6 +542,14 @@ func runAgent(args []string) error {
 	case <-cdsubDone:
 	case <-shutdownCtx.Done():
 		logger.Warn("cdsub did not drain within shutdown budget")
+	}
+	// Release the underlying containerd gRPC client if the source
+	// owns one. NoOpSource doesn't implement io.Closer so this is a
+	// best-effort type assertion.
+	if closer, ok := cdsubSrc.(interface{ Close() error }); ok {
+		if err := closer.Close(); err != nil {
+			logger.Warn("cdsub source close error", slog.Any("err", err))
+		}
 	}
 	// §Phase 6: "flushes DHT Provide for any newly committed entries."
 	// runOriginPull goroutines own one inflight handle and one

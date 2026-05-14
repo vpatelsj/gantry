@@ -106,6 +106,20 @@ type Config struct {
 	// providers. Default 3; §8 open question.
 	EvictionProviderCountThreshold int `yaml:"eviction_provider_count_threshold"`
 
+	// ---------- containerd integration (cdsub) ----------
+
+	// ContainerdSocket is the path to the containerd gRPC API socket
+	// that the cdsub subsystem dials to discover locally-cached images
+	// and announce them on the DHT (§5.4 image-event → Provide loop).
+	// Empty disables the containerd source (cdsub becomes a no-op,
+	// which is the only sensible mode on non-linux build hosts).
+	ContainerdSocket string `yaml:"containerd_socket"`
+
+	// ContainerdNamespace is the containerd namespace cdsub watches.
+	// Kubelet uses "k8s.io" for pod containers — the default. Set to
+	// "moby" for Docker-managed images, or any custom namespace.
+	ContainerdNamespace string `yaml:"containerd_namespace"`
+
 	// ---------- Upstream registries ----------
 
 	// UpstreamRegistries enumerates every OCI registry the agent mirrors
@@ -212,6 +226,9 @@ func NewDefault() *Config {
 		CacheForcedEvictionHeadroomPct: 5,
 		EvictionProviderCountThreshold: 3,
 
+		ContainerdSocket:    "/run/containerd/containerd.sock",
+		ContainerdNamespace: "k8s.io",
+
 		UpstreamRegistries: nil,
 
 		HRWK:             3,
@@ -304,6 +321,9 @@ func (c *Config) LoadEnv(env func(string) string) error {
 	setInt("CACHE_FORCED_EVICTION_HEADROOM_PCT", &c.CacheForcedEvictionHeadroomPct)
 	setInt("EVICTION_PROVIDER_COUNT_THRESHOLD", &c.EvictionProviderCountThreshold)
 
+	setStr("CONTAINERD_SOCKET", &c.ContainerdSocket)
+	setStr("CONTAINERD_NAMESPACE", &c.ContainerdNamespace)
+
 	setInt("HRW_K", &c.HRWK)
 	setStr("HRW_TOPOLOGY_SCOPE", &c.HRWTopologyScope)
 	setStr("ZONE_LABEL_KEY", &c.ZoneLabelKey)
@@ -342,6 +362,9 @@ func (c *Config) BindFlags(fs *flag.FlagSet) {
 	fs.Int64Var(&c.CacheBudgetBytes, "cache-budget-bytes", c.CacheBudgetBytes, "soft cap on cache size in bytes")
 	fs.IntVar(&c.CacheForcedEvictionHeadroomPct, "cache-forced-eviction-headroom-pct", c.CacheForcedEvictionHeadroomPct, "force eviction when free disk < this percent of budget")
 	fs.IntVar(&c.EvictionProviderCountThreshold, "eviction-provider-count-threshold", c.EvictionProviderCountThreshold, "defer eviction when this node is one of fewer than N providers")
+
+	fs.StringVar(&c.ContainerdSocket, "containerd-socket", c.ContainerdSocket, "containerd gRPC socket path (empty = disable cdsub source)")
+	fs.StringVar(&c.ContainerdNamespace, "containerd-namespace", c.ContainerdNamespace, "containerd namespace cdsub watches (default k8s.io)")
 
 	fs.IntVar(&c.HRWK, "hrw-k", c.HRWK, "HRW top-K size")
 	fs.StringVar(&c.HRWTopologyScope, "hrw-topology-scope", c.HRWTopologyScope, `HRW scope: "cluster" or "zone"`)

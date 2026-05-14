@@ -39,6 +39,15 @@ data:
     cache_forced_eviction_headroom_pct: 5
     eviction_provider_count_threshold: 3
 
+    # ---------- containerd integration (cdsub, §5.4) ----------
+    # Path to the host's containerd gRPC socket. Set to "" to disable
+    # the cdsub source entirely (the agent will still serve peer
+    # fetches; it just won't announce locally-cached images).
+    containerd_socket: "/run/containerd/containerd.sock"
+    # Containerd namespace cdsub watches. "k8s.io" is what kubelet
+    # uses; switch to "moby" for Docker-managed images.
+    containerd_namespace: "k8s.io"
+
     # ---------- Upstream registries (§7.1) ----------
     # Edit this list for each operator deployment. Credentials are
     # mounted from the gantry-registry-credentials Secret.

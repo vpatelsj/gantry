@@ -69,6 +69,12 @@ A YAML config file matching `internal/config/config.go` is supported:
 
 All flags can be set via uppercase env vars too (e.g. `GANTRY_MIRROR_LISTEN`).
 
+On Linux, the agent automatically connects to the local containerd over
+`/run/containerd/containerd.sock` (namespace `k8s.io`) to discover
+locally-cached images and announce them on the DHT. Override via
+`--containerd-socket` / `--containerd-namespace`, or set socket to ""
+to disable. Non-Linux builds skip this entirely.
+
 ### Endpoints
 
 | Endpoint | Listener | Purpose |
