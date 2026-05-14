@@ -84,6 +84,87 @@ to disable. Non-Linux builds skip this entirely.
 | `:4001` | libp2p | TCP + QUIC swarm + `/gantry/coord/1.0.0` stream protocol. |
 | `:9095` | ops | `/metrics`, `/livez`, `/healthz`, `/readyz`. |
 
+## Security model
+
+Gantry is deliberately **cluster-internal** — there is no cross-cluster
+federation, and confidentiality + integrity of the on-cluster traffic
+rests on three controls layered together. If you peel one layer back you
+must replace it with an equivalent control before deploying.
+
+### Mirror endpoint (`:5000`) — loopback by default, hostPort opt-in
+
+The mirror endpoint speaks plain HTTP and is reachable only from
+containerd on the same node. Two patterns are supported:
+
+- **Single-host / non-Kubernetes:** bind `mirror_listen: 127.0.0.1:5000`.
+  The config validator hard-rejects any non-loopback address. This is
+  the safe default for `make run`, local dev, and any deployment outside
+  Kubernetes.
+- **Kubernetes DaemonSet:** the pod binds `0.0.0.0:5000` inside its
+  network namespace, and the DaemonSet exposes it through
+  `hostPort: 5000` with `hostIP: 127.0.0.1`. The kubelet's CNI plumbing
+  DNATs `127.0.0.1:5000` on the node into the pod, so containerd reaches
+  the mirror over loopback even though the pod itself binds widely.
+  Because the pod-side bind isn't literally loopback, the operator must
+  set `mirror_bind_allow_non_loopback: true` (env
+  `GANTRY_MIRROR_BIND_ALLOW_NON_LOOPBACK=1`, flag
+  `--mirror-bind-allow-non-loopback`) to disarm the validator. This is
+  an **explicit opt-in**: do not enable it without also configuring
+  `hostPort.hostIP: 127.0.0.1` (or an equivalent kernel-level barrier),
+  because the mirror endpoint is intentionally not authenticated and
+  containerd's `skip_verify: true` mirror config trusts whatever serves
+  it. The shipped `deploy/daemonset.yaml` + `deploy/configmap.yaml`
+  already wire this correctly; the flag exists so non-DaemonSet rollouts
+  (e.g. systemd unit on a bare metal node behind a host firewall) can
+  consciously take the same shortcut.
+
+### Peer transfer endpoint (`:5001`) — h2c, NetworkPolicy-gated
+
+The peer-to-peer transfer endpoint runs **plaintext HTTP/2 (h2c)**.
+That is a deliberate tradeoff:
+
+- Cluster-internal traffic only. Off-node reachability is blocked by the
+  shipped `deploy/networkpolicy.yaml` (ingress restricted to peer
+  agents and the kubelet). If your CNI does not enforce NetworkPolicy,
+  you must replace it with an equivalent firewall before running Gantry
+  in production.
+- A `Gantry-Mirrored: 1` request header is required on every peer call;
+  the handler 400s anything else. This is **not** an authentication
+  mechanism — it stops accidental mis-routes (e.g. a misconfigured curl
+  hitting the wrong port), nothing more.
+- The integrity backstop is in-band digest verification. Every blob
+  pulled from a peer is streamed through the digest-pipe in
+  `internal/digestpipe` while it is being committed to the local cache;
+  a peer that returns wrong bytes fails the commit and the consumer
+  retries another provider. A peer **cannot** poison the cache by
+  returning attacker-chosen bytes, because the digest the requester
+  asked for is hashed independently as the bytes arrive.
+- Range requests use standard RFC 7233 semantics (`Range: bytes=N-M` →
+  `206 Partial Content` with `Content-Range`); the digest-pipe is
+  applied to the full object on commit, not per-range.
+
+What h2c is **not** defending against:
+
+- A malicious workload sharing the cluster network with the agent can
+  read peer-to-peer traffic in transit. If that is in your threat model,
+  terminate Gantry traffic on a mesh (Istio / Linkerd / Cilium mTLS)
+  before deploying, or wait for the post-GA mTLS option (tracked in
+  the design doc §4.4 follow-ups). Image bytes are typically already
+  public (pulled from a public registry), so this is rarely the right
+  knob to turn first.
+- A compromised peer that happens to *also* hold a digest can serve that
+  digest. NetworkPolicy ingress + a controlled image-pull list is the
+  defense; assume every node in the DHT can serve every digest it has
+  legitimately pulled.
+
+### Coordination plane (`:4001`)
+
+The libp2p Kademlia DHT and `/gantry/coord/1.0.0` stream protocol are
+authenticated by libp2p peer identity (Ed25519 keypair persisted at
+`libp2p_identity_path`). Stream traffic is encrypted by libp2p's
+built-in TLS / Noise transport — this is independent of the h2c
+transfer endpoint and is **not** affected by the section above.
+
 ## Deployment
 
 See [deploy/README.md](deploy/README.md) for the full Kubernetes rollout

@@ -50,13 +50,26 @@ type Config struct {
 
 	// MirrorBindAllowNonLoopback relaxes the loopback-only validation on
 	// MirrorListen. Set to true ONLY when the deployment guarantees the
-	// mirror is unreachable from off-node by some other mechanism
-	// (hostPort + hostIP=127.0.0.1, NetworkPolicy, etc.). The default
-	// (false) is the safe value for any non-Kubernetes deployment.
+	// mirror is unreachable from off-node by some other mechanism — the
+	// shipped DaemonSet uses hostPort with hostIP=127.0.0.1, which DNATs
+	// the node's loopback into the pod so containerd reaches the mirror
+	// over 127.0.0.1 even though the pod itself binds 0.0.0.0. Equivalent
+	// alternatives: a host-level firewall blocking the mirror port on
+	// non-loopback interfaces, or running the agent in the host network
+	// namespace bound to 127.0.0.1. The default (false) is the safe value
+	// for any non-Kubernetes deployment. See README.md "Security model"
+	// for the full opt-in checklist.
 	MirrorBindAllowNonLoopback bool `yaml:"mirror_bind_allow_non_loopback"`
 
-	// TransferListen is the peer-facing HTTP/2 endpoint (§4.4). NetworkPolicy
-	// restricts inter-node visibility; the agent itself binds 0.0.0.0.
+	// TransferListen is the peer-facing HTTP/2 endpoint (§4.4). The bind is
+	// typically 0.0.0.0; cluster-internal isolation comes from
+	// NetworkPolicy + the `Gantry-Mirrored: 1` request-header gate +
+	// digestpipe integrity verification, not from the bind address. See
+	// README.md "Security model" for the full threat model — in
+	// particular, the endpoint is plaintext h2c by design and assumes
+	// the cluster network is trusted. Operators that need on-the-wire
+	// confidentiality should layer a service mesh (Istio / Linkerd /
+	// Cilium mTLS) above Gantry.
 	TransferListen string `yaml:"transfer_listen"`
 
 	// MetricsListen is the Prometheus scrape endpoint and /readyz /livez
