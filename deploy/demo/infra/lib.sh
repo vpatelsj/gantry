@@ -39,6 +39,9 @@ require_env() {
 
 load_demo_env() {
     local env_file="${1:-${DEMO_INFRA_ENV:-${DEMO_INFRA_DIR}/env.local}}"
+    # Snapshot externally-set sentinels so the env file cannot silently
+    # override an explicit CONFIRM_DESTROY=yes from the caller.
+    local _preset_confirm_destroy="${CONFIRM_DESTROY:-}"
     if [[ -n "${env_file}" ]]; then
         if [[ -f "${env_file}" ]]; then
             # shellcheck disable=SC1090
@@ -46,6 +49,9 @@ load_demo_env() {
         elif [[ "${env_file}" != "${DEMO_INFRA_DIR}/env.local" ]]; then
             die "env file not found: ${env_file}"
         fi
+    fi
+    if [[ -n "${_preset_confirm_destroy}" ]]; then
+        CONFIRM_DESTROY="${_preset_confirm_destroy}"
     fi
 
     : "${AZ_LOCATION:=canadacentral}"
