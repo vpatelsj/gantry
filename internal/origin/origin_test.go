@@ -321,11 +321,14 @@ func TestPull_StartCallbackFiresOnceBeforeOutcome(t *testing.T) {
 		}
 		_, _ = io.Copy(io.Discard, rc)
 		_ = rc.Close()
-		if len(startKinds) != 1 || startKinds[0] != "blob" {
-			t.Fatalf("startKinds = %v, want [blob]", startKinds)
+		// KindBlob maps to the metric label "layer" (the design
+		// vocabulary), NOT "blob" (the OCI URL family). See
+		// origin.originMetricKind for the rationale.
+		if len(startKinds) != 1 || startKinds[0] != "layer" {
+			t.Fatalf("startKinds = %v, want [layer]", startKinds)
 		}
-		if len(successKinds) != 1 || successKinds[0] != "blob" {
-			t.Fatalf("successKinds = %v, want [blob]", successKinds)
+		if len(successKinds) != 1 || successKinds[0] != "layer" {
+			t.Fatalf("successKinds = %v, want [layer]", successKinds)
 		}
 		if len(failureKindClass) != 0 {
 			t.Fatalf("failureKindClass = %v, want empty", failureKindClass)
@@ -361,4 +364,36 @@ func TestPull_StartCallbackFiresOnceBeforeOutcome(t *testing.T) {
 			t.Fatalf("startKinds = %v, want [config] (KindConfig must surface as a distinct 'kind' label all the way through origin.WithMetrics so the started counter agrees with the per-kind success/failure breakdown)", startKinds)
 		}
 	})
+}
+
+// TestOriginMetricKind_MapsToDesignVocabulary locks in the
+// design-doc label set:
+//
+//	p2p_origin_pull_total{kind="manifest|config|layer"}
+//
+// In the in-process enum KindBlob covers everything under /blobs/
+// (both config blobs and layer blobs), and KindBlob.String() returns
+// "blob" — the OCI URL-family term, correct for logs but wrong as a
+// Prometheus label because the design vocabulary commits to "layer".
+// originMetricKind is the seam where the in-process kind becomes the
+// observability label; this test pins both halves (manifest/config
+// pass through unchanged, KindBlob is rewritten to "layer") so a
+// later refactor cannot reintroduce a `kind="blob"` series that
+// dashboards built against the design spec would not pick up.
+func TestOriginMetricKind_MapsToDesignVocabulary(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		in   ifaces.OriginRefKind
+		want string
+	}{
+		{ifaces.KindManifest, "manifest"},
+		{ifaces.KindConfig, "config"},
+		{ifaces.KindBlob, "layer"}, // <- the load-bearing rewrite
+	}
+	for _, tc := range cases {
+		if got := originMetricKind(tc.in); got != tc.want {
+			t.Errorf("originMetricKind(%v) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
 }

@@ -104,7 +104,7 @@ func New(cfg *config.Config, opts ...Option) (*Client, error) {
 
 // Pull implements ifaces.OriginPuller.
 func (c *Client) Pull(ctx context.Context, ref ifaces.OriginRef) (io.ReadCloser, int64, error) {
-	kind := ref.Kind.String()
+	kind := originMetricKind(ref.Kind)
 	if c.metrics.onPullStart != nil {
 		c.metrics.onPullStart(kind)
 	}
@@ -144,6 +144,45 @@ func (c *Client) recordFailure(kind string, err error) {
 		class = string(oe.Class)
 	}
 	c.metrics.onPullFailure(kind, class)
+}
+
+// originMetricKind maps the in-process OriginRefKind enum to the
+// observability label vocabulary the design doc commits to:
+//
+//	p2p_origin_pull_total{kind="manifest|config|layer"}
+//	p2p_origin_pull_success_total{kind="manifest|config|layer",class=...}
+//	p2p_origin_pull_failure_total{kind="manifest|config|layer",class=...}
+//
+// The Go-side enum value KindBlob covers everything that lives under
+// /v2/<repo>/blobs/<digest> — that's both image-config blobs (KindConfig)
+// and layer blobs. For URL routing the two collapse to /blobs/, which is
+// why OriginRefKind.String() returns "blob" (the OCI-spec term). For
+// metrics, however, the design vocabulary is "layer" — the operator-
+// facing semantic — and we MUST NOT leak "blob" to Prometheus or
+// dashboards built against the design spec would have an empty "layer"
+// bucket and an unknown "blob" label cluttering the cardinality.
+//
+// KindConfig is preserved as "config" so the per-kind counter
+// distinguishes the image-config blob (one per image manifest) from
+// the layer blobs (many per image). This is the load-bearing
+// observability invariant the tenth-review work plumbed end-to-end
+// through manifest.TypedChildren → coldstart.PrefetchChildren →
+// please_pull proto KIND_CONFIG, and the helper here is the leaf node
+// of that chain — the place where the in-process kind becomes a
+// Prometheus label.
+func originMetricKind(k ifaces.OriginRefKind) string {
+	switch k {
+	case ifaces.KindManifest:
+		return "manifest"
+	case ifaces.KindConfig:
+		return "config"
+	default:
+		// KindBlob and any future zero-valued / unknown kind both
+		// land here. Treating unknown as "layer" matches the OCI
+		// reality (layer pulls are the dominant /blobs/ traffic)
+		// and keeps the label set bounded.
+		return "layer"
+	}
 }
 
 // Compile-time check.
