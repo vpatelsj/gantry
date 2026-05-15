@@ -55,19 +55,6 @@ flowchart LR
 | `:4001` | libp2p | TCP + QUIC swarm + `/gantry/coord/1.0.0`. |
 | `:9095` | ops | `/metrics`, `/livez`, `/healthz`, `/readyz`. |
 
-## Security model — at a glance
-
-- **`:5000`** plain HTTP, loopback or hostPort-bound to `127.0.0.1`.
-  Non-loopback bind requires explicit `mirror_bind_allow_non_loopback`.
-- **`:5001`** h2c, **cluster-internal only**. Off-node reachability is
-  expected to be blocked by `deploy/examples/networkpolicy.yaml` or an
-  equivalent firewall. Integrity is guaranteed by in-band digest
-  verification: a hostile peer cannot poison the cache.
-- **`:4001`** libp2p with Noise transport encryption + Ed25519 peer
-  identity.
-
-Full threat model and operator opt-ins: [deploy/README.md](deploy/README.md).
-
 ## Build & run
 
 ```sh

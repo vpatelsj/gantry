@@ -135,9 +135,22 @@ func (h *harness) applyManifests(ctx context.Context) {
 		filepath.Join(h.repoRoot, "deploy", "configmap.yaml")); err != nil {
 		h.t.Fatalf("apply configmap: %v", err)
 	}
-	if err := h.run(ctx, "kubectl", "apply", "-f",
-		filepath.Join(h.repoRoot, "deploy", "networkpolicy.yaml")); err != nil {
-		h.t.Fatalf("apply networkpolicy: %v", err)
+	// NetworkPolicy is intentionally NOT part of the default e2e
+	// rollout. The hardening manifest lives at
+	// deploy/examples/networkpolicy.yaml and is templated — every
+	// rule defers CIDR/namespace choices to the operator (see
+	// deploy/README.md § Hardening overlays). Applying it as-is here
+	// would either fail validation (unresolved placeholders) or
+	// silently isolate the agent pods from the kind-cluster control
+	// plane and break the smoke test before rollout. A dedicated
+	// hardening-overlay e2e variant can opt in via the
+	// GANTRY_E2E_NETWORKPOLICY env var once we have a kind-friendly
+	// concrete copy to ship.
+	if os.Getenv("GANTRY_E2E_NETWORKPOLICY") != "" {
+		if err := h.run(ctx, "kubectl", "apply", "-f",
+			filepath.Join(h.repoRoot, "deploy", "examples", "networkpolicy.yaml")); err != nil {
+			h.t.Fatalf("apply networkpolicy (opt-in): %v", err)
+		}
 	}
 	// Rewrite the DaemonSet image to gantry:e2e using kubectl's
 	// -k overlay would require a kustomization file; for now use

@@ -54,7 +54,7 @@ prereq CLIs:
 | --- | --- |
 | `bootCluster()` | `kind create cluster --config kind-config.yaml` |
 | `buildAndLoadImage()` | `deploy/build.sh -t e2e` then `kind load docker-image gantry:e2e` |
-| `applyManifests()` | rewrites the DaemonSet image to `gantry:e2e` then `kubectl apply -f deploy/` |
+| `applyManifests()` | rewrites the DaemonSet image to `gantry:e2e` then `kubectl apply -f deploy/` (NetworkPolicy is opt-in via `GANTRY_E2E_NETWORKPOLICY=1`) |
 | `waitForRollout()` | polls `kubectl rollout status ds/gantry -n gantry-system` |
 | `checkReadyz()` | `kubectl exec` into one pod and curls `127.0.0.1:9095/readyz` |
 | `teardown()` | `kind delete cluster` (skipped when `E2E_KEEP=1`) |
