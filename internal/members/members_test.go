@@ -570,3 +570,144 @@ func TestRunningMatchingPodCount_CountsRunningPodsRegardlessOfAnnotationOrReady(
 		t.Errorf("SnapshotForBootstrap len = %d, want 2 (only ready-ann + notready-ann have annotations)", got)
 	}
 }
+
+// TestTerminatingPodsExcludedFromAllViews guards the
+// rolling-update / node-drain deadlock: a pod with
+// DeletionTimestamp set stays Phase=Running with Ready=True for the
+// grace-period window, but will never re-AnnounceSelf with fresh
+// annotations. If it leaks into any membership view the surviving
+// pods either route traffic to a doomed peer (Snapshot leak),
+// waste libp2p dials on a peer that can't be reached
+// (SnapshotForBootstrap leak), or deadlock at NotReady on
+// "peer self-announcements pending" (RunningMatchingPodCount leak,
+// because the new readiness gate compares this count against
+// SnapshotForBootstrap).
+//
+// The terminating fixture is deliberately given a FULL set of valid
+// annotations (peer-id, p2p-addrs, transfer-addr) and is both
+// Phase=Running and Ready=True. This proves the terminating filter
+// wins over otherwise-perfect bootstrap/serving eligibility — a
+// terminating pod missing annotations would already be filtered by
+// SnapshotForBootstrap's annotation check and would not exercise
+// the new path.
+func TestTerminatingPodsExcludedFromAllViews(t *testing.T) {
+	gantryLabel := map[string]string{"app.kubernetes.io/name": "gantry"}
+
+	// Terminating peer: fully eligible by every other filter.
+	terminating := newPod("terminating", "ns", "node-a", "10.0.0.1", true, gantryLabel)
+	terminating.Annotations = map[string]string{
+		AnnotationPeerID:       "peer-terminating",
+		AnnotationP2PAddrs:     "/ip4/10.0.0.1/tcp/4001/p2p/peer-terminating",
+		AnnotationTransferAddr: "10.0.0.1:5001",
+	}
+	delTime := metav1.NewTime(time.Now())
+	terminating.DeletionTimestamp = &delTime
+
+	// Control peer: same shape, no DeletionTimestamp. Must appear
+	// in all three views so the test fails loudly if someone
+	// breaks the positive path while fixing the negative one.
+	control := newPod("control", "ns", "node-b", "10.0.0.2", true, gantryLabel)
+	control.Annotations = map[string]string{
+		AnnotationPeerID:       "peer-control",
+		AnnotationP2PAddrs:     "/ip4/10.0.0.2/tcp/4001/p2p/peer-control",
+		AnnotationTransferAddr: "10.0.0.2:5001",
+	}
+
+	cs := fake.NewSimpleClientset(
+		terminating, control,
+		newNode("node-a", ""), newNode("node-b", ""),
+	)
+	m, err := New(Options{
+		NodeName:      "node-b",
+		Namespace:     "ns",
+		LabelSelector: "app.kubernetes.io/name=gantry",
+		Clientset:     cs,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(m.Stop)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	m.Start()
+	if err := m.WaitForSync(ctx); err != nil {
+		t.Fatalf("WaitForSync: %v", err)
+	}
+
+	// Snapshot (Ready, serving view) must NOT include the
+	// terminating pod even though it is Phase=Running+Ready=True.
+	serving := m.Snapshot()
+	for _, n := range serving {
+		if string(n.ID) == "node-a" {
+			t.Errorf("Snapshot leaked terminating node-a into serving view: %+v (HRW would route transfer traffic to a doomed peer)", serving)
+		}
+	}
+	if len(serving) != 1 || string(serving[0].ID) != "node-b" {
+		t.Errorf("Snapshot = %+v, want [node-b] (control only)", serving)
+	}
+
+	// SnapshotForBootstrap must NOT include the terminating pod
+	// even though its p2p-addrs annotation is fully populated.
+	boot := m.SnapshotForBootstrap()
+	for _, n := range boot {
+		if string(n.ID) == "node-a" {
+			t.Errorf("SnapshotForBootstrap leaked terminating node-a into bootstrap view: %+v (libp2p would dial a doomed peer)", boot)
+		}
+	}
+	if len(boot) != 1 || string(boot[0].ID) != "node-b" {
+		t.Errorf("SnapshotForBootstrap = %+v, want [node-b] (control only)", boot)
+	}
+
+	// RunningMatchingPodCount must NOT include the terminating
+	// pod. Counting it while SnapshotForBootstrap rightly excludes
+	// it would deadlock the surviving pod at NotReady on
+	// "peer self-announcements pending".
+	if got, want := m.RunningMatchingPodCount(), 1; got != want {
+		t.Errorf("RunningMatchingPodCount = %d, want %d (only the control pod; the terminating pod must not be counted or the readiness gate deadlocks)", got, want)
+	}
+}
+
+// TestPodReady_ExcludesTerminating is a direct unit test on the
+// podReady helper covering all four short-circuit paths plus the
+// positive case. podReady is called from Snapshot and is also
+// exported (via Snapshot) as the de facto Ready predicate; the doc
+// comment on podReady promises to exclude Terminating pods so this
+// test pins that contract at the source.
+func TestPodReady_ExcludesTerminating(t *testing.T) {
+	gantryLabel := map[string]string{"app.kubernetes.io/name": "gantry"}
+
+	if podReady(nil) {
+		t.Error("podReady(nil) = true, want false")
+	}
+
+	// Running + Ready=True + DeletionTimestamp set: must return
+	// false. This is the same case Snapshot filters out at its
+	// own loop head; podReady duplicates the check so future
+	// callers inherit the contract.
+	term := newPod("term", "ns", "node-a", "10.0.0.1", true, gantryLabel)
+	delTime := metav1.NewTime(time.Now())
+	term.DeletionTimestamp = &delTime
+	if podReady(term) {
+		t.Error("podReady(Running+Ready+Terminating) = true, want false")
+	}
+
+	// Pending pod: must return false (Phase guard).
+	pending := newPod("pending", "ns", "node-b", "10.0.0.2", true, gantryLabel)
+	pending.Status.Phase = corev1.PodPending
+	if podReady(pending) {
+		t.Error("podReady(Pending) = true, want false")
+	}
+
+	// Running + Ready=False: must return false (no Ready=True
+	// condition).
+	notReady := newPod("notready", "ns", "node-c", "10.0.0.3", false, gantryLabel)
+	if podReady(notReady) {
+		t.Error("podReady(Running+Ready=False) = true, want false")
+	}
+
+	// Positive case: Running + Ready=True + non-terminating.
+	ok := newPod("ready", "ns", "node-d", "10.0.0.4", true, gantryLabel)
+	if !podReady(ok) {
+		t.Error("podReady(Running+Ready+non-terminating) = false, want true")
+	}
+}

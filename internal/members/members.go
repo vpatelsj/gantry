@@ -219,11 +219,22 @@ const (
 // at startup. Pods that have not yet published these annotations still
 // appear in the snapshot — Addr falls back to podIP[:TransferPort],
 // PeerID/P2PAddrs are empty until the announcement arrives.
+//
+// Terminating pods (DeletionTimestamp set) are excluded even if they
+// are still Phase=Running and Ready=True — kubelet leaves Ready=True
+// for the duration of the grace period, and routing HRW/transfer
+// traffic to a pod that is about to disappear is a
+// connection-refused waiting to happen. The exclusion is enforced
+// both directly (the explicit podTerminating check below) and via
+// podReady, which short-circuits on the same predicate.
 func (m *Manager) Snapshot() []ifaces.Node {
 	out := []ifaces.Node{}
 	for _, obj := range m.podInf.GetStore().List() {
 		p, ok := obj.(*corev1.Pod)
 		if !ok {
+			continue
+		}
+		if podTerminating(p) {
 			continue
 		}
 		if !podReady(p) {
@@ -299,11 +310,20 @@ func splitAnnotation(v string) []string {
 //
 // The serving path (HRW choice, transfer destinations) MUST keep
 // using Snapshot() so unready peers don't receive request traffic.
+//
+// Terminating pods (DeletionTimestamp set) are excluded even if they
+// still have valid p2p-addrs annotations — they will never
+// re-announce, so bootstrap dials to them are wasted at best and at
+// worst keep the connection pool half-open until the termination
+// grace period expires.
 func (m *Manager) SnapshotForBootstrap() []ifaces.Node {
 	out := []ifaces.Node{}
 	for _, obj := range m.podInf.GetStore().List() {
 		p, ok := obj.(*corev1.Pod)
 		if !ok {
+			continue
+		}
+		if podTerminating(p) {
 			continue
 		}
 		if p.Status.Phase != corev1.PodRunning {
@@ -351,6 +371,8 @@ func (m *Manager) SnapshotForBootstrap() []ifaces.Node {
 // Contract (do not tighten):
 //
 //   - Requires Status.Phase == PodRunning AND Status.PodIP != "".
+//   - Requires NOT terminating (DeletionTimestamp == nil) — see
+//     below for the rolling-update deadlock this avoids.
 //   - Does NOT require: PodReady=True, gantry.io/p2p-addrs,
 //     gantry.io/peer-id, or any other readiness/announcement signal.
 //
@@ -365,11 +387,22 @@ func (m *Manager) SnapshotForBootstrap() []ifaces.Node {
 // window where every pod is Running but none has yet published its
 // libp2p multiaddrs — without this gate, /readyz would race to green
 // before any peer was actually reachable.
+//
+// Terminating-pod exclusion is the rolling-update / drain guard: a
+// terminating pod stays Phase=Running for the grace period but will
+// never re-AnnounceSelf with fresh annotations. Counting it here
+// while SnapshotForBootstrap rightly excludes it (stale or absent
+// p2p-addrs) would deadlock the surviving pods at
+// "peer self-announcements pending" — they would wait forever for
+// an announcement from a peer that has no opportunity to make one.
 func (m *Manager) RunningMatchingPodCount() int {
 	n := 0
 	for _, obj := range m.podInf.GetStore().List() {
 		p, ok := obj.(*corev1.Pod)
 		if !ok {
+			continue
+		}
+		if podTerminating(p) {
 			continue
 		}
 		if p.Status.Phase != corev1.PodRunning {
@@ -384,10 +417,21 @@ func (m *Manager) RunningMatchingPodCount() int {
 }
 
 // podReady reports whether a pod is in Running phase with a Ready=True
-// condition. Pending/Terminating pods are excluded from the membership view
-// so HRW does not score nodes that cannot serve traffic.
+// condition AND is not in the process of termination. Pending,
+// Terminating, and not-Ready pods are excluded from the membership
+// view so HRW does not score nodes that cannot serve traffic (or are
+// about to disappear).
+//
+// The DeletionTimestamp check is the tail-of-rollout guard: kubelet
+// can leave a pod at Phase=Running with Ready=True for the duration
+// of the termination grace period, and routing traffic to it during
+// that window is a connection-refused waiting to happen. The other
+// three views (Snapshot, SnapshotForBootstrap, RunningMatchingPodCount)
+// apply podTerminating at their own loop heads; this defensive
+// re-check here means any future caller of podReady inherits the
+// contract that the function's doc comment already claims.
 func podReady(p *corev1.Pod) bool {
-	if p.Status.Phase != corev1.PodRunning {
+	if p == nil || podTerminating(p) || p.Status.Phase != corev1.PodRunning {
 		return false
 	}
 	for _, c := range p.Status.Conditions {
@@ -396,6 +440,35 @@ func podReady(p *corev1.Pod) bool {
 		}
 	}
 	return false
+}
+
+// podTerminating reports whether a pod has been marked for deletion
+// by the API server (DeletionTimestamp set). Such a pod is leaving
+// the cluster, will never re-AnnounceSelf with fresh annotations, and
+// must NOT contribute to any membership view:
+//
+//   - Snapshot:                terminating pods would receive HRW
+//     transfer traffic on the way out.
+//   - SnapshotForBootstrap:    bootstrap dials to a doomed peer are
+//     wasted at best, and at worst keep the
+//     connection pool half-open until the
+//     grace period expires.
+//   - RunningMatchingPodCount: this count gates the new "peer
+//     self-announcements pending" /readyz
+//     branch. If a terminating pod is
+//     counted but never appears in the
+//     bootstrap view, the surviving pods
+//     deadlock at NotReady — they wait for
+//     an announcement from a peer that has
+//     no opportunity to make one.
+//
+// The nil guard means callers in tight loops can skip a separate
+// nil-check before the type assertion. Implemented as a free function
+// (not a method) so test fixtures can construct *corev1.Pod values
+// with explicit DeletionTimestamps without going through the
+// informer.
+func podTerminating(p *corev1.Pod) bool {
+	return p != nil && p.DeletionTimestamp != nil
 }
 
 // Compile-time check.
