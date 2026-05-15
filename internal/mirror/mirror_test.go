@@ -303,3 +303,149 @@ func TestParseV2Path(t *testing.T) {
 		t.Errorf("bogus v2 path: got %d, want 404", resp.StatusCode)
 	}
 }
+
+// TestMirror_OriginSuccessMetric_FiresOnlyOnCacheCommit pins the
+// eleventh-review contract: p2p_origin_pull_success_total must fire
+// EXACTLY when the cluster has gained a usable artifact from the
+// origin pull — body fully streamed AND cache commit succeeded.
+// Earlier the origin Client fired success on Close(), which also
+// fires on HEAD (body never read), on io.Copy interruption (body
+// partially read), and on cache-commit failure (commit returns
+// error after EOF). The mirror now owns the success hook and must
+// fire it only after cw.Commit returns nil (or after the
+// direct-stream digest verifier passes when cache is unavailable).
+func TestMirror_OriginSuccessMetric_FiresOnlyOnCacheCommit(t *testing.T) {
+	t.Run("GET fires success once after cache commit", func(t *testing.T) {
+		body := []byte("origin-success-body")
+		d := digestOf(body)
+		f := newFixture(t, map[digest.Digest][]byte{d: body})
+
+		var successCalls int32
+		var successKinds []string
+		// Rebuild server with the success hook wired.
+		oc, err := origin.New(f.cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		m := mirror.New(f.cfg, f.cache, oc,
+			mirror.WithOriginSuccessMetric(func(kind string, _ int64) {
+				atomic.AddInt32(&successCalls, 1)
+				successKinds = append(successKinds, kind)
+			}),
+		)
+		srv := httptest.NewServer(m.Handler())
+		defer srv.Close()
+
+		resp, err := http.Get(srv.URL + "/v2/lib/n/blobs/" + d.String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != 200 || string(got) != string(body) {
+			t.Fatalf("GET: %d %q", resp.StatusCode, got)
+		}
+		if n := atomic.LoadInt32(&successCalls); n != 1 {
+			t.Fatalf("successCalls = %d, want 1 (one full pull + commit = one success)", n)
+		}
+		if len(successKinds) != 1 || successKinds[0] != "layer" {
+			t.Fatalf("successKinds = %v, want [layer] (blob → layer per design-doc Prometheus vocabulary)", successKinds)
+		}
+	})
+
+	t.Run("HEAD does not fire success", func(t *testing.T) {
+		body := []byte("head-no-success")
+		d := digestOf(body)
+		f := newFixture(t, map[digest.Digest][]byte{d: body})
+
+		var successCalls int32
+		oc, err := origin.New(f.cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		m := mirror.New(f.cfg, f.cache, oc,
+			mirror.WithOriginSuccessMetric(func(_ string, _ int64) {
+				atomic.AddInt32(&successCalls, 1)
+			}),
+		)
+		srv := httptest.NewServer(m.Handler())
+		defer srv.Close()
+
+		req, _ := http.NewRequest(http.MethodHead, srv.URL+"/v2/lib/n/blobs/"+d.String(), nil)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != 200 {
+			t.Fatalf("HEAD: %d", resp.StatusCode)
+		}
+		// HEAD must NOT fire success: the body was never streamed
+		// and the cache was never warmed. Counting this as a
+		// success was the central case the eleventh-review fix
+		// targets.
+		if n := atomic.LoadInt32(&successCalls); n != 0 {
+			t.Fatalf("successCalls after HEAD = %d, want 0 (HEAD never reads the body so it never produces a real success)", n)
+		}
+	})
+
+	t.Run("origin truncation does not fire success", func(t *testing.T) {
+		body := []byte("full-body-but-truncated-on-the-wire")
+		d := digestOf(body)
+		// Custom upstream that advertises the full Content-Length
+		// but writes only the first 5 bytes before closing,
+		// forcing io.Copy in serveDigest to return an error
+		// before cw.Commit is reached.
+		up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Length", fmt.Sprintf("%d", len(body)))
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(body[:5])
+			// httptest will close the connection here.
+		}))
+		defer up.Close()
+
+		cfg := &config.Config{UpstreamRegistries: []config.UpstreamRegistry{
+			{Name: "reg.example.com", Endpoint: up.URL},
+		}}
+		c, err := cache.Open(t.TempDir(), 1<<20)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = c.Close() }()
+
+		var successCalls int32
+		oc, err := origin.New(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		m := mirror.New(cfg, c, oc,
+			mirror.WithOriginSuccessMetric(func(_ string, _ int64) {
+				atomic.AddInt32(&successCalls, 1)
+			}),
+		)
+		srv := httptest.NewServer(m.Handler())
+		defer srv.Close()
+
+		resp, err := http.Get(srv.URL + "/v2/lib/n/blobs/" + d.String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		// The mirror has already written headers (200 OK) by the
+		// time the upstream truncation surfaces, so the HTTP
+		// status is 200 — but the body is short and the cache
+		// commit never ran. We don't assert on body length
+		// because the truncation may surface as a copy error
+		// before the client side sees EOF; what we DO assert is
+		// the success metric never fired.
+		_, _ = io.ReadAll(resp.Body)
+		resp.Body.Close()
+
+		if n := atomic.LoadInt32(&successCalls); n != 0 {
+			t.Fatalf("successCalls after truncated origin = %d, want 0 (io.Copy returned an error before cw.Commit; this is the cache-commit-skipped path the success metric must NOT count)", n)
+		}
+		// The cache must also be empty since commit never ran.
+		if ok, _ := c.Has(context.Background(), d); ok {
+			t.Errorf("cache.Has(d) = true after truncated origin pull; want false (commit must not have run)")
+		}
+	})
+}

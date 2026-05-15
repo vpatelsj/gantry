@@ -301,12 +301,11 @@ func TestPull_StartCallbackFiresOnceBeforeOutcome(t *testing.T) {
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
 
-	var startKinds, successKinds []string
+	var startKinds []string
 	var failureKindClass [][2]string
 	cfg := &config.Config{UpstreamRegistries: []config.UpstreamRegistry{{Name: "reg", Endpoint: srv.URL}}}
 	c, err := New(cfg, WithMetrics(
-		func(kind string, _ int64) { startKinds = append(startKinds, kind) },
-		func(kind string, _ int64) { successKinds = append(successKinds, kind) },
+		func(kind string) { startKinds = append(startKinds, kind) },
 		func(kind, class string) { failureKindClass = append(failureKindClass, [2]string{kind, class}) },
 	))
 	if err != nil {
@@ -314,7 +313,7 @@ func TestPull_StartCallbackFiresOnceBeforeOutcome(t *testing.T) {
 	}
 
 	t.Run("success path increments started exactly once with the kind label", func(t *testing.T) {
-		startKinds, successKinds, failureKindClass = nil, nil, nil
+		startKinds, failureKindClass = nil, nil
 		rc, _, err := c.Pull(context.Background(), ifaces.OriginRef{Registry: "reg", Repository: "r", Digest: d, Kind: ifaces.KindBlob})
 		if err != nil {
 			t.Fatalf("Pull: %v", err)
@@ -323,20 +322,26 @@ func TestPull_StartCallbackFiresOnceBeforeOutcome(t *testing.T) {
 		_ = rc.Close()
 		// KindBlob maps to the metric label "layer" (the design
 		// vocabulary), NOT "blob" (the OCI URL family). See
-		// origin.originMetricKind for the rationale.
+		// ifaces.OriginRefKind.MetricLabel for the rationale.
 		if len(startKinds) != 1 || startKinds[0] != "layer" {
 			t.Fatalf("startKinds = %v, want [layer]", startKinds)
-		}
-		if len(successKinds) != 1 || successKinds[0] != "layer" {
-			t.Fatalf("successKinds = %v, want [layer]", successKinds)
 		}
 		if len(failureKindClass) != 0 {
 			t.Fatalf("failureKindClass = %v, want empty", failureKindClass)
 		}
+		// Origin no longer reports SUCCESS itself — that hook
+		// was lifted out in the eleventh review because Close()
+		// fires on HEAD, on io.Copy interruption, and on
+		// cache-commit failure, all of which would falsely
+		// inflate the success counter. The mirror's serveDigest
+		// and the puller pump's runOriginPull now own success
+		// reporting after their respective verify/commit step
+		// passes. See ifaces.OriginRefKind.MetricLabel and
+		// mirror.WithOriginSuccessMetric for the contract.
 	})
 
 	t.Run("unknown registry increments started before the failure", func(t *testing.T) {
-		startKinds, successKinds, failureKindClass = nil, nil, nil
+		startKinds, failureKindClass = nil, nil
 		_, _, err := c.Pull(context.Background(), ifaces.OriginRef{Registry: "other", Repository: "r", Digest: d, Kind: ifaces.KindManifest})
 		if err == nil {
 			t.Fatalf("Pull: want error, got nil")
@@ -344,16 +349,13 @@ func TestPull_StartCallbackFiresOnceBeforeOutcome(t *testing.T) {
 		if len(startKinds) != 1 || startKinds[0] != "manifest" {
 			t.Fatalf("startKinds = %v, want [manifest] (started must fire even when the registry lookup fails — this is the 'started' chokepoint please_pull relies on)", startKinds)
 		}
-		if len(successKinds) != 0 {
-			t.Fatalf("successKinds = %v, want empty", successKinds)
-		}
 		if len(failureKindClass) != 1 || failureKindClass[0][0] != "manifest" {
 			t.Fatalf("failureKindClass = %v, want one entry with kind=manifest", failureKindClass)
 		}
 	})
 
 	t.Run("config kind label passes through", func(t *testing.T) {
-		startKinds, successKinds, failureKindClass = nil, nil, nil
+		startKinds, failureKindClass = nil, nil
 		rc, _, err := c.Pull(context.Background(), ifaces.OriginRef{Registry: "reg", Repository: "r", Digest: d, Kind: ifaces.KindConfig})
 		if err != nil {
 			t.Fatalf("Pull: %v", err)
@@ -375,11 +377,12 @@ func TestPull_StartCallbackFiresOnceBeforeOutcome(t *testing.T) {
 // (both config blobs and layer blobs), and KindBlob.String() returns
 // "blob" — the OCI URL-family term, correct for logs but wrong as a
 // Prometheus label because the design vocabulary commits to "layer".
-// originMetricKind is the seam where the in-process kind becomes the
-// observability label; this test pins both halves (manifest/config
-// pass through unchanged, KindBlob is rewritten to "layer") so a
-// later refactor cannot reintroduce a `kind="blob"` series that
-// dashboards built against the design spec would not pick up.
+// OriginRefKind.MetricLabel is the seam where the in-process kind
+// becomes the observability label; this test pins both halves
+// (manifest/config pass through unchanged, KindBlob is rewritten to
+// "layer") so a later refactor cannot reintroduce a `kind="blob"`
+// series that dashboards built against the design spec would not
+// pick up.
 func TestOriginMetricKind_MapsToDesignVocabulary(t *testing.T) {
 	t.Parallel()
 
@@ -392,8 +395,8 @@ func TestOriginMetricKind_MapsToDesignVocabulary(t *testing.T) {
 		{ifaces.KindBlob, "layer"}, // <- the load-bearing rewrite
 	}
 	for _, tc := range cases {
-		if got := originMetricKind(tc.in); got != tc.want {
-			t.Errorf("originMetricKind(%v) = %q, want %q", tc.in, got, tc.want)
+		if got := tc.in.MetricLabel(); got != tc.want {
+			t.Errorf("OriginRefKind(%v).MetricLabel() = %q, want %q", tc.in, got, tc.want)
 		}
 	}
 }

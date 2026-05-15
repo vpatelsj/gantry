@@ -159,11 +159,29 @@ func runAgent(args []string) error {
 	// does its job. The mirror's originPull hook was the latent
 	// half-wiring that produced this drift; this commit removes
 	// it in favour of the single source of truth here.
+	//
+	// SUCCESS is the asymmetric case: it is NOT reported here.
+	// Origin has no way to tell, at the boundary of its own
+	// responsibility (HTTP response opened + classified), whether
+	// the caller will actually drain and verify the response body.
+	// HEAD requests never read the body; io.Copy interruptions
+	// abort mid-stream; cache-commit-after-EOF can still fail on
+	// digest mismatch. Earlier the origin Client wrapped the
+	// response in a metricReader that fired success on Close(),
+	// which is exactly when every one of those failure paths also
+	// fires — so the success counter ran ahead of reality by
+	// whatever fraction of pulls hit those paths. The eleventh
+	// review flagged this. The originSuccess closure below is
+	// shared with the mirror (via WithOriginSuccessMetric) and
+	// with the puller pump (via newPullerPump); both call it only
+	// after their respective verify/commit step actually passes.
+	originSuccess := func(kind string, _ int64) {
+		inst.originPullSuccess.WithLabelValues(kind).Inc()
+	}
 	originClient, err := origin.New(c,
 		origin.WithLogger(logger),
 		origin.WithMetrics(
-			func(kind string, _ int64) { inst.originPullTotal.WithLabelValues(kind).Inc() },
-			func(kind string, _ int64) { inst.originPullSuccess.WithLabelValues(kind).Inc() },
+			func(kind string) { inst.originPullTotal.WithLabelValues(kind).Inc() },
 			func(kind, class string) { inst.originPullFailure.WithLabelValues(kind, class).Inc() },
 		),
 	)
@@ -381,7 +399,7 @@ func runAgent(args []string) error {
 	var pullerPumpWG sync.WaitGroup
 	pullerPump := newPullerPump(inflightMap, originClient, cstore, disco, negCache, logger, &pullerPumpWG, func() {
 		p2.dhtProvideErr.WithLabelValues("origin_pull_announce").Inc()
-	})
+	}, originSuccess)
 	coordOpts := []coord.Option{
 		coord.WithLogger(logger),
 		coord.WithMetrics(coord.MetricsHooks{
@@ -529,6 +547,7 @@ func runAgent(args []string) error {
 			func() {}, // cache miss already counted by cache hook
 			func(class string) { inst.originFailureTotal.WithLabelValues(class).Inc() },
 		),
+		mirror.WithOriginSuccessMetric(originSuccess),
 		mirror.WithDiscovery(disco, peerClient),
 		mirror.WithPeerMetrics(
 			func(outcome string) { p2.peerFetch.WithLabelValues(outcome).Inc() },
@@ -1894,7 +1913,7 @@ func (p *layerPrefetchAdapter) OnManifestServed(ctx context.Context, registry, r
 //   - On terminal origin failure, the goroutine classifies via the
 //     *ifaces.OriginError wrapper and records the failure so the next
 //     pull_intent_query response surfaces recently_failed.
-func newPullerPump(infl *inflight.Map, originClient ifaces.OriginPuller, cstore ifaces.Cache, disco *discovery.Host, neg *negcache.Cache, logger *slog.Logger, wg *sync.WaitGroup, onProvideErr func()) coord.PullerPump {
+func newPullerPump(infl *inflight.Map, originClient ifaces.OriginPuller, cstore ifaces.Cache, disco *discovery.Host, neg *negcache.Cache, logger *slog.Logger, wg *sync.WaitGroup, onProvideErr func(), onOriginSuccess func(kind string, bytes int64)) coord.PullerPump {
 	lg := logger.With(slog.String("subsystem", "puller-pump"))
 	return func(_ context.Context, registry, repository string, d digest.Digest, kind ifaces.OriginRefKind) (time.Time, bool, *coord.NegativeEntry) {
 		// §5.8 short-circuit: if we're inside a cooldown window, refuse
@@ -1928,7 +1947,7 @@ func newPullerPump(infl *inflight.Map, originClient ifaces.OriginPuller, cstore 
 			if wg != nil {
 				defer wg.Done()
 			}
-			runOriginPull(originClient, cstore, disco, neg, lg, h, registry, repository, d, kind, onProvideErr)
+			runOriginPull(originClient, cstore, disco, neg, lg, h, registry, repository, d, kind, onProvideErr, onOriginSuccess)
 		}()
 		return startedAt, false, nil
 	}
@@ -1948,7 +1967,7 @@ func newPullerPump(infl *inflight.Map, originClient ifaces.OriginPuller, cstore 
 //     puller on a flapping local disk while still self-healing.
 //   - On commit success, we clear any prior entry so the ladder resets
 //     for the next failure run.
-func runOriginPull(originClient ifaces.OriginPuller, cstore ifaces.Cache, disco *discovery.Host, neg *negcache.Cache, lg *slog.Logger, h *inflight.Handle, registry, repository string, d digest.Digest, kind ifaces.OriginRefKind, onProvideErr func()) {
+func runOriginPull(originClient ifaces.OriginPuller, cstore ifaces.Cache, disco *discovery.Host, neg *negcache.Cache, lg *slog.Logger, h *inflight.Handle, registry, repository string, d digest.Digest, kind ifaces.OriginRefKind, onProvideErr func(), onOriginSuccess func(kind string, bytes int64)) {
 	defer h.Done()
 
 	// Background context: the requesting peer's stream is already
@@ -2002,13 +2021,27 @@ func runOriginPull(originClient ifaces.OriginPuller, cstore ifaces.Cache, disco 
 	}
 	defer func() { _ = w.Abort(ctx) }()
 
-	if _, err := io.Copy(w, rc); err != nil {
+	written, err := io.Copy(w, rc)
+	if err != nil {
 		recordOriginFailure(neg, d, err, lg, "origin pull copy failed", registry, repository)
 		return
 	}
 	if err := w.Commit(ctx); err != nil {
 		recordOriginFailure(neg, d, err, lg, "cache commit failed (digest mismatch or io error)", registry, repository)
 		return
+	}
+
+	// Origin pull SUCCEEDED on the please_pull-coordinated path:
+	// the body streamed to completion and the cache commit (which
+	// is also where digest verification fires; see cache.Writer
+	// docs) passed. This is the half of the success contract that
+	// mirror.serveDigest owns for direct-origin pulls; together
+	// they cover every path origin.Client.Pull ever produces.
+	// We fire BEFORE the dht.Provide attempt below because Provide
+	// failures are transient cluster-level signals — the pull
+	// itself produced a usable cached byte-identical artifact.
+	if onOriginSuccess != nil {
+		onOriginSuccess(kind.MetricLabel(), written)
 	}
 
 	// Success: clear any prior negative-cache entry so the next

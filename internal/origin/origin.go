@@ -49,10 +49,22 @@ type Client struct {
 
 // metricsHooks lets the origin client emit counters without importing the
 // metrics package directly. Hooks may be nil.
+//
+// Origin reports STARTED and FAILURE at the boundary of its own
+// responsibility (open the HTTP connection / parse the response /
+// classify the error). It deliberately does NOT report SUCCESS:
+// "origin pull succeeded" is a higher-level outcome that depends on
+// the caller's downstream success (stream fully read, digest
+// verified, bytes committed to cache, DHT advertised). The mirror's
+// serveDigest and the puller pump's runOriginPull each own that
+// definition and emit p2p_origin_pull_success_total themselves once
+// their respective commit/verify steps pass. Counting success here,
+// on Close(), would inflate the counter on HEAD requests (which
+// never read the body) and on io.Copy / cache-commit failure paths
+// (where the caller deferred Close() before returning a failure).
 type metricsHooks struct {
-	onPullStart   func(kind string)              // before request
-	onPullSuccess func(kind string, bytes int64) // after streaming completes
-	onPullFailure func(kind, class string)       // any non-success terminal status
+	onPullStart   func(kind string)        // before request
+	onPullFailure func(kind, class string) // any non-success terminal status
 }
 
 // Option configures a Client.
@@ -68,10 +80,15 @@ func WithLogger(l *slog.Logger) Option {
 }
 
 // WithMetrics registers metric callbacks.
-func WithMetrics(start, success func(kind string, bytes int64), failure func(kind, class string)) Option {
+//
+// start fires once at the top of every Pull invocation, before the
+// registry lookup. failure fires once on any terminal error path
+// (unknown registry, transport error, non-2xx response, auth
+// failure). Success is NOT emitted here — see the metricsHooks doc
+// for why and where it belongs.
+func WithMetrics(start func(kind string), failure func(kind, class string)) Option {
 	return func(c *Client) {
-		c.metrics.onPullStart = func(kind string) { start(kind, 0) }
-		c.metrics.onPullSuccess = success
+		c.metrics.onPullStart = start
 		c.metrics.onPullFailure = failure
 	}
 }
@@ -103,8 +120,20 @@ func New(cfg *config.Config, opts ...Option) (*Client, error) {
 }
 
 // Pull implements ifaces.OriginPuller.
+//
+// Returns the raw response-body ReadCloser; the caller is responsible
+// for streaming the body and reporting per-operation success via
+// their own metric hook (the mirror's serveDigest commits to cache
+// then emits p2p_origin_pull_success_total; the puller pump's
+// runOriginPull does the equivalent after cw.Commit and dht.Provide).
+// origin reports STARTED unconditionally on entry and FAILURE on its
+// own error paths only; it does NOT wrap the response body in a
+// success-on-Close counter because Close has no way to know whether
+// the higher-level operation actually succeeded (HEAD never reads
+// the body; io.Copy + cache.Commit failures both fire Close on a
+// deferred path).
 func (c *Client) Pull(ctx context.Context, ref ifaces.OriginRef) (io.ReadCloser, int64, error) {
-	kind := originMetricKind(ref.Kind)
+	kind := ref.Kind.MetricLabel()
 	if c.metrics.onPullStart != nil {
 		c.metrics.onPullStart(kind)
 	}
@@ -123,15 +152,7 @@ func (c *Client) Pull(ctx context.Context, ref ifaces.OriginRef) (io.ReadCloser,
 		c.recordFailure(kind, err)
 		return nil, 0, err
 	}
-	// Wrap so successful end-of-stream emits the success metric.
-	return &metricReader{
-		ReadCloser: rc,
-		onClose: func(n int64) {
-			if c.metrics.onPullSuccess != nil {
-				c.metrics.onPullSuccess(kind, n)
-			}
-		},
-	}, size, nil
+	return rc, size, nil
 }
 
 func (c *Client) recordFailure(kind string, err error) {
@@ -144,45 +165,6 @@ func (c *Client) recordFailure(kind string, err error) {
 		class = string(oe.Class)
 	}
 	c.metrics.onPullFailure(kind, class)
-}
-
-// originMetricKind maps the in-process OriginRefKind enum to the
-// observability label vocabulary the design doc commits to:
-//
-//	p2p_origin_pull_total{kind="manifest|config|layer"}
-//	p2p_origin_pull_success_total{kind="manifest|config|layer",class=...}
-//	p2p_origin_pull_failure_total{kind="manifest|config|layer",class=...}
-//
-// The Go-side enum value KindBlob covers everything that lives under
-// /v2/<repo>/blobs/<digest> — that's both image-config blobs (KindConfig)
-// and layer blobs. For URL routing the two collapse to /blobs/, which is
-// why OriginRefKind.String() returns "blob" (the OCI-spec term). For
-// metrics, however, the design vocabulary is "layer" — the operator-
-// facing semantic — and we MUST NOT leak "blob" to Prometheus or
-// dashboards built against the design spec would have an empty "layer"
-// bucket and an unknown "blob" label cluttering the cardinality.
-//
-// KindConfig is preserved as "config" so the per-kind counter
-// distinguishes the image-config blob (one per image manifest) from
-// the layer blobs (many per image). This is the load-bearing
-// observability invariant the tenth-review work plumbed end-to-end
-// through manifest.TypedChildren → coldstart.PrefetchChildren →
-// please_pull proto KIND_CONFIG, and the helper here is the leaf node
-// of that chain — the place where the in-process kind becomes a
-// Prometheus label.
-func originMetricKind(k ifaces.OriginRefKind) string {
-	switch k {
-	case ifaces.KindManifest:
-		return "manifest"
-	case ifaces.KindConfig:
-		return "config"
-	default:
-		// KindBlob and any future zero-valued / unknown kind both
-		// land here. Treating unknown as "layer" matches the OCI
-		// reality (layer pulls are the dominant /blobs/ traffic)
-		// and keeps the label set bounded.
-		return "layer"
-	}
 }
 
 // Compile-time check.
@@ -508,28 +490,4 @@ func parseChallenge(challenge string) map[string]string {
 		rest = strings.TrimLeft(rest, ", \t")
 	}
 	return out
-}
-
-// metricReader wraps a ReadCloser, counts bytes, and fires onClose once.
-type metricReader struct {
-	io.ReadCloser
-	n       int64
-	closed  bool
-	onClose func(n int64)
-}
-
-func (m *metricReader) Read(p []byte) (int, error) {
-	n, err := m.ReadCloser.Read(p)
-	m.n += int64(n)
-	return n, err
-}
-
-func (m *metricReader) Close() error {
-	if !m.closed {
-		m.closed = true
-		if m.onClose != nil {
-			m.onClose(m.n)
-		}
-	}
-	return m.ReadCloser.Close()
 }

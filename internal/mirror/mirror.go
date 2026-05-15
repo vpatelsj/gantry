@@ -138,6 +138,7 @@ type metricsHooks struct {
 	onCacheHit         func()
 	onCacheMiss        func()
 	onOriginFailure    func(class string)
+	onOriginSuccess    func(kind string, bytes int64)
 	onPeerFetch        func(outcome string)
 	onPeerFetchLatency func(outcome string, d time.Duration)
 	onPeerDialResult   func(success bool)
@@ -172,6 +173,30 @@ func WithMetrics(cacheHit, cacheMiss func(), originFailure func(class string)) O
 		s.metrics.onCacheHit = cacheHit
 		s.metrics.onCacheMiss = cacheMiss
 		s.metrics.onOriginFailure = originFailure
+	}
+}
+
+// WithOriginSuccessMetric registers a callback fired by the mirror's
+// direct-origin path AFTER it has streamed the response body to
+// completion AND committed the bytes to cache (or, when cache is
+// unavailable, AFTER the direct-stream digest verifier confirms the
+// served bytes match the requested digest). The kind label uses the
+// design-doc Prometheus vocabulary (see ifaces.OriginRefKind.MetricLabel).
+//
+// This hook is the mirror-side half of the origin-success contract:
+// origin.Client.Pull no longer reports success itself because it has
+// no way to know whether the caller actually drained and verified the
+// stream. HEAD requests (which by design never read the body),
+// io.Copy interruptions, and cache-commit failures all leave the
+// response body Closed without a real success — so reporting success
+// on Close() inside origin.Client inflated p2p_origin_pull_success_total
+// against operations that never produced a usable byte. The puller
+// pump's runOriginPull owns the equivalent hook on the
+// please_pull-coordinated path; together they're the two places that
+// know what "the origin pull actually succeeded" means.
+func WithOriginSuccessMetric(originSuccess func(kind string, bytes int64)) Option {
+	return func(s *Server) {
+		s.metrics.onOriginSuccess = originSuccess
 	}
 }
 
@@ -585,6 +610,13 @@ func (s *Server) serveDigest(w http.ResponseWriter, r *http.Request, upstream, r
 		// because the alternative (cache-warming on HEAD) is far
 		// worse for the bandwidth-amplification case it's meant to
 		// avoid.
+		//
+		// We deliberately do NOT fire onOriginSuccess on this path:
+		// origin returned metadata, but no usable bytes were
+		// produced for the cluster. Counting this as a success
+		// would inflate p2p_origin_pull_success_total against an
+		// operation that never warmed cache nor delivered body
+		// bytes to a client.
 		return
 	}
 	written, err := io.Copy(dest, pr)
@@ -600,7 +632,18 @@ func (s *Server) serveDigest(w http.ResponseWriter, r *http.Request, upstream, r
 				slog.Int64("written", written),
 				slog.Any("err", verr),
 			)
+			// Corrupted bytes: do NOT count as origin success.
+			// The client already got them, but the cluster did
+			// not produce a usable cached/verifiable copy.
+			return
 		}
+		// Direct-stream verifier passed: bytes were delivered to
+		// the client AND digest-matched the requested ref. The
+		// cluster did not gain a cache entry (cache was
+		// unavailable), but the origin pull itself succeeded
+		// end-to-end. Count it.
+		s.fireOriginSuccess(kind, written)
+		return
 	}
 	if cwerr == nil {
 		if err := cw.Commit(ctx); err != nil {
@@ -616,6 +659,12 @@ func (s *Server) serveDigest(w http.ResponseWriter, r *http.Request, upstream, r
 		// the cold-start-exhausted path that just escalated to origin.
 		s.reAdvertiseDigest(d, "mirror_origin_announce", logger)
 		s.firePrefetch(kind, upstream, repo, d)
+		// Bytes streamed AND committed: this is the canonical
+		// mirror-direct origin-pull success. Fire AFTER commit
+		// (not after Copy) so a commit failure correctly leaves
+		// the operation classified as not-yet-successful even
+		// though the client already got the bytes.
+		s.fireOriginSuccess(kind, written)
 	}
 }
 
@@ -924,6 +973,22 @@ func (s *Server) bumpOriginFailure(err error) {
 		class = string(oe.Class)
 	}
 	s.metrics.onOriginFailure(class)
+}
+
+// fireOriginSuccess emits p2p_origin_pull_success_total via the hook
+// registered with WithOriginSuccessMetric. Call sites must invoke
+// this AFTER the response body has been streamed AND the cluster has
+// produced a useful artifact from it (cache commit OK, or
+// direct-stream digest verifier passed when cache is unavailable).
+// Calling it earlier — e.g. inside a deferred Close() on the origin
+// reader — inflates the success counter against HEAD requests, io.Copy
+// interruptions, and cache-commit failures (the exact bug the
+// eleventh review flagged as "false positives on the success metric").
+func (s *Server) fireOriginSuccess(kind ifaces.OriginRefKind, bytes int64) {
+	if s.metrics.onOriginSuccess == nil {
+		return
+	}
+	s.metrics.onOriginSuccess(kind.MetricLabel(), bytes)
 }
 
 func (s *Server) bumpPeerFetch(outcome string) {

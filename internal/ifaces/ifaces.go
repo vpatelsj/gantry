@@ -157,6 +157,41 @@ func (k OriginRefKind) String() string {
 	}
 }
 
+// MetricLabel returns the Prometheus label vocabulary the design doc
+// commits to for the p2p_origin_pull_total / _success_total /
+// _failure_total counters:
+//
+//	p2p_origin_pull_total{kind="manifest|config|layer"}
+//
+// MetricLabel is intentionally distinct from String(): String returns
+// "blob" for KindBlob (the OCI Distribution Spec URL-family term,
+// correct in logs and on the wire) while MetricLabel returns "layer"
+// (the operator-facing observability term, what dashboards built
+// against the design spec expect). The two roles must not be
+// conflated — leaking "blob" into Prometheus labels gives dashboards
+// an empty "layer" bucket plus an undocumented "blob" series.
+//
+// KindConfig is preserved as "config" so the per-kind counter
+// distinguishes the single image-config blob per manifest from the
+// many layer blobs. This is the load-bearing observability invariant
+// the tenth-review work plumbed end-to-end through manifest.TypedChildren
+// → coldstart.PrefetchChildren → please_pull proto KIND_CONFIG; this
+// method is the leaf node of that chain.
+func (k OriginRefKind) MetricLabel() string {
+	switch k {
+	case KindManifest:
+		return "manifest"
+	case KindConfig:
+		return "config"
+	default:
+		// KindBlob and any future zero-valued / unknown kind both
+		// land here. Treating unknown as "layer" matches the OCI
+		// reality (layer pulls are the dominant /blobs/ traffic)
+		// and keeps the label set bounded.
+		return "layer"
+	}
+}
+
 // OriginPuller fetches a single digest from origin.
 type OriginPuller interface {
 	// Pull opens a streaming read of the digest's bytes from origin. The
