@@ -1233,11 +1233,18 @@ func announceSelfAndBootstrap(ctx context.Context, mgr *members.Manager, disco *
 	// while RoutingTableSize is still below a healthy threshold, and
 	// stop entirely once the table is populated. kad-dht handles
 	// ongoing refresh from there.
+	//
+	// The convergence target is cluster-size aware: on a 2-node
+	// cluster the routing table can never reach 5, so a fixed
+	// threshold of 5 would loop forever dialing the same single
+	// peer. We cap target at min(maxHealthyRTSize, peer_count) with
+	// a floor of 1 so single-node deployments (membership has only
+	// self) exit immediately after the first pass.
 	const (
 		aggressiveInterval = 5 * time.Second
 		relaxedInterval    = 30 * time.Second
 		aggressiveBudget   = 60 * time.Second
-		healthyRTSize      = 5
+		maxHealthyRTSize   = 5
 	)
 	bootstrapStart := time.Now()
 	for {
@@ -1250,9 +1257,11 @@ func announceSelfAndBootstrap(ctx context.Context, mgr *members.Manager, disco *
 				slog.Int("routing_table", disco.RoutingTableSize()),
 			)
 		}
-		if disco.RoutingTableSize() >= healthyRTSize {
+		target := bootstrapConvergenceTarget(len(mgr.SnapshotForBootstrap()), maxHealthyRTSize)
+		if disco.RoutingTableSize() >= target {
 			logger.Info("members: bootstrap converged; ceasing periodic dials",
 				slog.Int("routing_table", disco.RoutingTableSize()),
+				slog.Int("target", target),
 				slog.Duration("elapsed", time.Since(bootstrapStart)),
 			)
 			return
@@ -1267,6 +1276,29 @@ func announceSelfAndBootstrap(ctx context.Context, mgr *members.Manager, disco *
 		case <-time.After(interval):
 		}
 	}
+}
+
+// bootstrapConvergenceTarget returns the RoutingTableSize threshold
+// that signals "bootstrap converged; ceasing periodic dials". It is
+// the minimum of the per-cluster cap (maxSize) and the peer count
+// (members snapshot size minus 1 for self), with a floor of 1 so
+// even a single-node cluster eventually exits the loop.
+//
+// snapshotSize is the size of SnapshotForBootstrap() (peers + self).
+// Returns 1 when snapshotSize ≤ 1: a lone agent has nothing to dial
+// but should not loop forever waiting for an impossible
+// RoutingTableSize ≥ 5 condition. The first ConnectPeers pass (with
+// zero candidates) will satisfy this immediately and the loop
+// exits.
+func bootstrapConvergenceTarget(snapshotSize, maxSize int) int {
+	peers := snapshotSize - 1
+	if peers < 1 {
+		return 1
+	}
+	if peers < maxSize {
+		return peers
+	}
+	return maxSize
 }
 
 // bootstrapPeerAddrs collects every published p2p multiaddr across all

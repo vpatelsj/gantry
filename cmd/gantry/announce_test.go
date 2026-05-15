@@ -261,3 +261,35 @@ func TestSelfAnnounceRequiredForReadiness(t *testing.T) {
 		})
 	}
 }
+
+// bootstrapConvergenceTarget gates "bootstrap converged; ceasing
+// periodic dials" on RoutingTableSize ≥ target. A fixed target of 5
+// loops forever on small clusters (2-3 nodes) because the routing
+// table can never grow that big; a floor of 1 prevents the
+// single-node case from spinning indefinitely waiting for peers it
+// can never have.
+func TestBootstrapConvergenceTarget(t *testing.T) {
+	cases := []struct {
+		name         string
+		snapshotSize int // includes self
+		maxSize      int
+		want         int
+	}{
+		{name: "single-node cluster floors at 1", snapshotSize: 1, maxSize: 5, want: 1},
+		{name: "empty snapshot defensively floors at 1", snapshotSize: 0, maxSize: 5, want: 1},
+		{name: "2-node cluster targets 1 peer", snapshotSize: 2, maxSize: 5, want: 1},
+		{name: "3-node cluster targets 2 peers", snapshotSize: 3, maxSize: 5, want: 2},
+		{name: "5-node cluster targets 4 peers", snapshotSize: 5, maxSize: 5, want: 4},
+		{name: "6-node cluster caps at max=5", snapshotSize: 6, maxSize: 5, want: 5},
+		{name: "100-node cluster caps at max=5", snapshotSize: 100, maxSize: 5, want: 5},
+		{name: "custom max=3 caps at 3", snapshotSize: 10, maxSize: 3, want: 3},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := bootstrapConvergenceTarget(tc.snapshotSize, tc.maxSize); got != tc.want {
+				t.Errorf("bootstrapConvergenceTarget(%d, %d) = %d, want %d",
+					tc.snapshotSize, tc.maxSize, got, tc.want)
+			}
+		})
+	}
+}
