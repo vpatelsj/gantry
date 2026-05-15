@@ -601,6 +601,32 @@ func (c *Config) Validate() error {
 		errs = append(errs, fmt.Errorf("log_format %q: must be json|text", c.LogFormat))
 	}
 
+	// Production K8s mode: if NodeName is set but PodName is empty,
+	// fail fast. NodeName tells peers our HRW/membership identity;
+	// PodName is the apiserver target AnnounceSelf patches with the
+	// three pod annotations (gantry.io/peer-id, gantry.io/p2p-addrs,
+	// gantry.io/transfer-addr) that other agents use to translate
+	// our node-name into a dialable libp2p peer-ID/addr pair. With
+	// NodeName-without-PodName the agent is reachable to itself
+	// (members informer can find peers, HRW can hash, /readyz can
+	// even go green because selfAnnounceRequiredForReadiness is
+	// false in this configuration) but is INVISIBLE to peers: every
+	// inbound Coord.PleasePull / PullIntentQuery 503s silently
+	// because no peer can resolve our node name to a peer ID. There
+	// is no fallback peer-ID-mapping mechanism in the codebase that
+	// would rescue this case — static bootstrap peers solve DHT
+	// seeding, not annotation publication.
+	//
+	// The Downward API DaemonSet pattern shipped in deploy/ wires
+	// all three env vars together (spec.nodeName, metadata.name,
+	// metadata.namespace) so this misconfiguration only happens when
+	// an operator hand-rolls envFrom — exactly the case where a
+	// clear startup error beats hours of silent peer-coordination
+	// failure.
+	if c.NodeName != "" && c.PodName == "" {
+		errs = append(errs, errors.New("node_name is set but pod_name is empty: production K8s mode requires pod_name (GANTRY_POD_NAME / metadata.name via the Downward API) so AnnounceSelf can publish gantry.io/peer-id, gantry.io/p2p-addrs, and gantry.io/transfer-addr on this agent's own pod; without it, other agents see this node in HRW/membership but cannot translate the node name to a dialable libp2p peer ID, silently 503-ing every Coord.PleasePull and PullIntentQuery RPC"))
+	}
+
 	return errors.Join(errs...)
 }
 

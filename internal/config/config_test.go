@@ -74,6 +74,69 @@ func TestValidate_HRWScope(t *testing.T) {
 	}
 }
 
+// TestValidate_NodeNameRequiresPodName pins the ninth-review fail-fast
+// rule: production K8s mode set via GANTRY_NODE_NAME but without
+// GANTRY_POD_NAME is the silent-peer-coordination-failure case the
+// reviewer flagged. AnnounceSelf needs PodName as the apiserver patch
+// target to publish the gantry.io/peer-id, gantry.io/p2p-addrs, and
+// gantry.io/transfer-addr annotations other agents use to translate
+// our node-name into a dialable peer ID. Without those, the pod is in
+// HRW membership but unreachable, and every Coord.PleasePull /
+// PullIntentQuery RPC to it 503s silently. There is no fallback
+// peer-ID-mapping mechanism — static bootstrap peers don't help.
+func TestValidate_NodeNameRequiresPodName(t *testing.T) {
+	c := NewDefault()
+	c.UpstreamRegistries = []UpstreamRegistry{{Name: "r", Endpoint: "https://r"}}
+	c.NodeName = "ip-10-0-0-7"
+	// PodName intentionally left empty.
+	err := c.Validate()
+	if err == nil {
+		t.Fatalf("validate: want error, got nil")
+	}
+	if !strings.Contains(err.Error(), "pod_name") || !strings.Contains(err.Error(), "node_name") {
+		t.Fatalf("validate: error must mention both node_name and pod_name; got %v", err)
+	}
+}
+
+// TestValidate_PodNameWithoutNodeNameOK confirms the inverse is
+// allowed: a Config with PodName but no NodeName isn't useful in
+// production but is occasionally used in local kubelet-less tests
+// (the membership informer simply won't construct). The check is
+// strictly directional: NodeName without PodName, not PodName
+// without NodeName.
+func TestValidate_PodNameWithoutNodeNameOK(t *testing.T) {
+	c := NewDefault()
+	c.UpstreamRegistries = []UpstreamRegistry{{Name: "r", Endpoint: "https://r"}}
+	c.PodName = "gantry-abc12"
+	if err := c.Validate(); err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+}
+
+// TestValidate_FullProdTripleOK confirms the canonical DaemonSet
+// wiring (all three Downward API vars set) passes validation.
+func TestValidate_FullProdTripleOK(t *testing.T) {
+	c := NewDefault()
+	c.UpstreamRegistries = []UpstreamRegistry{{Name: "r", Endpoint: "https://r"}}
+	c.NodeName = "ip-10-0-0-7"
+	c.PodName = "gantry-abc12"
+	c.MembersNamespace = "gantry-system"
+	if err := c.Validate(); err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+}
+
+// TestValidate_DevModeAllEmptyOK confirms dev mode (no Downward API
+// envs) still passes validation. The codepath downstream falls back
+// to a single-self members stub and disables cold-start coordination.
+func TestValidate_DevModeAllEmptyOK(t *testing.T) {
+	c := NewDefault()
+	c.UpstreamRegistries = []UpstreamRegistry{{Name: "r", Endpoint: "https://r"}}
+	if err := c.Validate(); err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+}
+
 func TestLoadYAML_KnownFieldsOnly(t *testing.T) {
 	c := NewDefault()
 	in := []byte("totally_unknown_field: 1\n")
