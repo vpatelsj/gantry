@@ -1596,3 +1596,282 @@ func TestPrefetchLayers_NilLocalPullStillSkipsSelf(t *testing.T) {
 		t.Fatalf("PleasePull calls: got %d, want 0 (self-bucket skipped without LocalPull)", got)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Two-node cold-start concurrency test (seventh code review #6).
+//
+// Spec: Node A and Node B both Resolve the same digest concurrently.
+// HRW rank 0 = A. Required invariants:
+//
+//   (F1) Only A originates the origin pull. B's Resolve must either
+//        observe A's in-flight entry (rule 3 piggyback) or route its
+//        rule-7 please_pull through Coord.PleasePull(A, ...), which
+//        in turn must dedupe through A's inflight map and NOT
+//        originate a second pull.
+//   (F2) Neither resolver originates a pull on B's local side.
+//
+// The doubles below build a "cluster of two" where Coord routes
+// per-target: PullIntentQuery reads the target's inflight map;
+// PleasePull invokes the target's LocalPullStarter (which atomically
+// claims its own inflight). This is the minimum fidelity needed to
+// exercise the inter-node ordering that the F1 invariant rests on.
+// ---------------------------------------------------------------------------
+
+// countingLocalPull implements LocalPullStarter. On each call it
+// claims every requested digest in `infl` atomically, increments
+// `starts` for fresh claims and `dupes` for already-claimed digests,
+// and returns matching PleasePullOutcomes. This mirrors the
+// production puller side: inflight.Start is the single source of
+// truth for "did this call kick off a new origin pull?".
+type countingLocalPull struct {
+	mu     sync.Mutex
+	infl   *inflight.Map
+	starts int
+	dupes  int
+}
+
+func (c *countingLocalPull) StartLocalPull(_ context.Context, _, _ string, kind ifaces.OriginRefKind, ds []digest.Digest) ([]ifaces.PleasePullOutcome, error) {
+	out := make([]ifaces.PleasePullOutcome, len(ds))
+	for i, d := range ds {
+		_, e, already := c.infl.Start(d, kind, 0)
+		c.mu.Lock()
+		if already {
+			c.dupes++
+			out[i] = ifaces.PleasePullOutcome{
+				Digest:    d,
+				Outcome:   ifaces.PleasePullAlreadyPulling,
+				StartedAt: e.StartedAt,
+			}
+		} else {
+			c.starts++
+			out[i] = ifaces.PleasePullOutcome{
+				Digest:    d,
+				Outcome:   ifaces.PleasePullStarted,
+				StartedAt: e.StartedAt,
+			}
+		}
+		c.mu.Unlock()
+	}
+	return out, nil
+}
+
+// inflightLocalIntent implements LocalIntentProvider against a
+// per-node inflight map. Mirrors the production computeLocalIntent
+// for the in-flight bit (HasCached / RecentlyFailed are zero — those
+// branches aren't exercised by the F1 test).
+type inflightLocalIntent struct {
+	infl *inflight.Map
+}
+
+func (l *inflightLocalIntent) LocalPullIntent(_ context.Context, d digest.Digest) ifaces.PullIntent {
+	if e, ok := l.infl.LookupForIntent(d); ok {
+		return ifaces.PullIntent{InFlight: true, StartedAt: e.StartedAt}
+	}
+	return ifaces.PullIntent{}
+}
+
+// twoNodeCoord routes Coord RPCs between two resolvers. RPCs to a
+// target node consult / mutate that target's stub state, simulating
+// the inter-node coord plane without the libp2p hop. Concurrent-safe
+// because both inflight.Map and countingLocalPull are themselves
+// locked.
+type twoNodeCoord struct {
+	mu            sync.Mutex
+	infl          map[ifaces.NodeID]*inflight.Map
+	rank          map[ifaces.NodeID]int32
+	lp            map[ifaces.NodeID]*countingLocalPull
+	pleasePullsTo map[ifaces.NodeID]int
+	intentQueries map[ifaces.NodeID]int
+}
+
+func (c *twoNodeCoord) PullIntentQuery(_ context.Context, target ifaces.NodeID, d digest.Digest) (ifaces.PullIntent, error) {
+	c.mu.Lock()
+	c.intentQueries[target]++
+	infl := c.infl[target]
+	rank := c.rank[target]
+	c.mu.Unlock()
+	intent := ifaces.PullIntent{RecipientRank: rank}
+	if e, ok := infl.LookupForIntent(d); ok {
+		intent.InFlight = true
+		intent.StartedAt = e.StartedAt
+	}
+	return intent, nil
+}
+
+func (c *twoNodeCoord) PleasePull(ctx context.Context, target ifaces.NodeID, registry, repository string, kind ifaces.OriginRefKind, ds []digest.Digest) ([]ifaces.PleasePullOutcome, error) {
+	c.mu.Lock()
+	c.pleasePullsTo[target]++
+	lp := c.lp[target]
+	c.mu.Unlock()
+	return lp.StartLocalPull(ctx, registry, repository, kind, ds)
+}
+
+// TestColdStart_TwoNode_OnlyHRW0OriginatesPull is the F1 invariant
+// test from seventh code review #6.
+//
+// Setup: two-node cluster (A=n0, B=n1). Pick a digest whose HRW rank
+// 0 is A. Spin up two real Resolvers, one per node, sharing a Coord
+// router and a Discovery (which canned-publishes A as a provider so
+// pollDHT terminates quickly). Both Resolve concurrently.
+//
+// Assertions:
+//
+//   - aLP.starts == 1: A originates exactly one origin pull.
+//
+//   - bLP.starts == 0: B's local pull starter is never touched —
+//     because every rule-7 self-puller decision routes its
+//     PleasePull through Coord.PleasePull(target_id_of_A), which in
+//     this test's wiring lands on aLP, not on bLP.
+//
+//   - twoNodeCoord.pleasePullsTo[A] >= 0: B's resolve may issue
+//     please_pull to A (rule 7 with A as rank-0 reachable puller)
+//     OR observe rule 3 via PullIntentQuery (A already in-flight),
+//     depending on race. Both outcomes satisfy F1 because aLP
+//     dedupes via inflight.Start.
+//
+//   - twoNodeCoord.pleasePullsTo[B] == 0: nothing ever asks B to
+//     pull from origin — A is rank 0 and reachable.
+func TestColdStart_TwoNode_OnlyHRW0OriginatesPull(t *testing.T) {
+	cluster := []ifaces.Node{
+		{ID: "n0", Addr: "n0:5001"},
+		{ID: "n1", Addr: "n1:5001"},
+	}
+
+	// Find a digest where HRW rank 0 = n0 ("A").
+	var d digest.Digest
+	for i := 0; i < 4096; i++ {
+		cand := digest.MustParse("sha256:" + digestHex(i))
+		if pickHRW0(cluster, cand) == "n0" {
+			d = cand
+			break
+		}
+	}
+	if d.String() == "" {
+		t.Fatalf("could not find a digest with HRW rank 0 = n0 in 4096 tries")
+	}
+	// Sanity: ranks must be {n0: 0, n1: 1}.
+	top := hrw.TopK(cluster, d, 2)
+	if top[0].Node.ID != "n0" || top[1].Node.ID != "n1" {
+		t.Fatalf("unexpected HRW ranking: %v", top)
+	}
+
+	aInfl := inflight.New(inflight.DefaultStalls(), time.Now)
+	bInfl := inflight.New(inflight.DefaultStalls(), time.Now)
+	aLP := &countingLocalPull{infl: aInfl}
+	bLP := &countingLocalPull{infl: bInfl}
+	aLI := &inflightLocalIntent{infl: aInfl}
+	bLI := &inflightLocalIntent{infl: bInfl}
+
+	coord := &twoNodeCoord{
+		infl:          map[ifaces.NodeID]*inflight.Map{"n0": aInfl, "n1": bInfl},
+		rank:          map[ifaces.NodeID]int32{"n0": 0, "n1": 1},
+		lp:            map[ifaces.NodeID]*countingLocalPull{"n0": aLP, "n1": bLP},
+		pleasePullsTo: map[ifaces.NodeID]int{},
+		intentQueries: map[ifaces.NodeID]int{},
+	}
+
+	// Shared DHT: A is already advertised as a provider so pollDHT
+	// terminates on the first poll. The test focuses on the
+	// please_pull / inflight side; the DHT plane is not the thing
+	// under test here.
+	disco := &stubDisco{
+		health: 1.0,
+		providers: [][]ifaces.Provider{
+			{{NodeID: "n0", Addr: "n0:5001"}},
+		},
+	}
+
+	aMems := fakes.NewMembers("n0", cluster...)
+	bMems := fakes.NewMembers("n1", cluster...)
+
+	mkResolver := func(self ifaces.NodeID, mems ifaces.Members, infl *inflight.Map, li ifaces.LocalIntentProvider, lp ifaces.LocalPullStarter) *coldstart.Resolver {
+		t.Helper()
+		_ = self
+		return coldstart.New(coldstart.Options{
+			Members:      mems,
+			Discovery:    disco,
+			Coord:        coord,
+			Inflight:     infl,
+			HrwK:         2,
+			HrwScope:     hrw.ScopeCluster,
+			LocalIntent:  li,
+			LocalPull:    lp,
+			QueryTimeout: 200 * time.Millisecond,
+			PollManifest: 10 * time.Millisecond,
+			PollLayer:    10 * time.Millisecond,
+		})
+	}
+
+	rA := mkResolver("n0", aMems, aInfl, aLI, aLP)
+	rB := mkResolver("n1", bMems, bInfl, bLI, bLP)
+
+	// Resolve concurrently. Both calls use the SAME outer ctx and
+	// race against each other — that is the production scenario.
+	var wg sync.WaitGroup
+	resolveErrs := make([]error, 2)
+	resolutions := make([]*coldstart.Resolution, 2)
+	for i, r := range []*coldstart.Resolver{rA, rB} {
+		i, r := i, r
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			res, err := r.Resolve(context.Background(), d, ifaces.KindManifest, "docker.io", "library/nginx", 0)
+			resolutions[i] = res
+			resolveErrs[i] = err
+		}()
+	}
+	wg.Wait()
+
+	for i, err := range resolveErrs {
+		if err != nil {
+			t.Errorf("Resolve[%d] error: %v", i, err)
+		}
+	}
+
+	// F1: A originated exactly one origin pull.
+	aLP.mu.Lock()
+	gotAStarts, gotADupes := aLP.starts, aLP.dupes
+	aLP.mu.Unlock()
+	if gotAStarts != 1 {
+		t.Errorf("F1: A originated %d pulls; want exactly 1 (dupes=%d)", gotAStarts, gotADupes)
+	}
+
+	// F2: B never originates.
+	bLP.mu.Lock()
+	gotBStarts := bLP.starts
+	bLP.mu.Unlock()
+	if gotBStarts != 0 {
+		t.Errorf("F2: B originated %d pulls; want 0 (HRW rank 0 = A, B must never originate)", gotBStarts)
+	}
+
+	// B's rule-7 path may or may not have fired please_pull to A
+	// (depending on whether A's inflight insert raced ahead of B's
+	// PullIntentQuery). Either outcome satisfies F1 because aLP
+	// dedupes via inflight.Start. But please_pull MUST NEVER be
+	// addressed to B — A is the only legitimate target.
+	coord.mu.Lock()
+	pleasePullsToA := coord.pleasePullsTo["n0"]
+	pleasePullsToB := coord.pleasePullsTo["n1"]
+	intentToA := coord.intentQueries["n0"]
+	coord.mu.Unlock()
+	if pleasePullsToB != 0 {
+		t.Errorf("please_pull was dispatched to B %d times; want 0 (B is not the designated puller)", pleasePullsToB)
+	}
+	if intentToA < 1 {
+		t.Errorf("pull_intent_query to A fired %d times; want >= 1 (B must probe A)", intentToA)
+	}
+	t.Logf("two-node summary: A.starts=%d A.dupes=%d B.starts=%d please_pulls_to_A=%d intent_queries_to_A=%d",
+		gotAStarts, gotADupes, gotBStarts, pleasePullsToA, intentToA)
+
+	// F1 second leg: B's resolution must point at A (either via
+	// rule-3 piggyback or rule-7 + DHT poll), not at B itself or
+	// at empty.
+	if resolutions[1] == nil {
+		t.Fatalf("B's Resolution is nil; F1 requires B to observe A as the source")
+	}
+	if len(resolutions[1].Providers) == 0 {
+		t.Errorf("B's Resolution has no providers; want at least A as provider")
+	} else if resolutions[1].Providers[0].NodeID != "n0" {
+		t.Errorf("B's Resolution first provider = %s; want n0 (= A)", resolutions[1].Providers[0].NodeID)
+	}
+}
