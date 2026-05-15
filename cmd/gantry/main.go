@@ -625,6 +625,18 @@ func runAgent(args []string) error {
 		mirror.WithColdStart(coldStartResolver),
 		mirror.WithLayerPrefetcher(layerPrefetcher),
 		mirror.WithNF5(nf5Ctrl),
+		// §5.8 negative-cache integration for the mirror's direct-
+		// origin path (thirteenth-review hardening). Before this
+		// option existed, mirror-direct origin failures (including
+		// the §5.7 NF5 fallback) bumped p2p_origin_pull_failure_total
+		// but did NOT seed a recently_failed cooldown — so the next
+		// NF5-eligible request could re-fire the direct origin pull
+		// at the bottom of the next jitter window, retry-amplifying
+		// against an origin that just stalled or digest-mismatched.
+		// negCacheRecorderAdapter mirrors what runOriginPull (the
+		// please_pull-coordinated path) already does via
+		// recordOriginFailure + neg.RecordSuccess.
+		mirror.WithNegativeCacheRecorder(mirrorNegCacheRecorder{neg: negCache, lg: logger}),
 		// §Phase 6 startup gate: /v2/ returns 503 until the mirror
 		// is explicitly marked ready below. Without this gate
 		// containerd's hostPort connection lands on the listener the
@@ -2190,6 +2202,40 @@ func (a negCacheAdapter) Lookup(d digest.Digest) (coord.NegativeEntry, bool) {
 		CooldownUntil: e.CooldownUntil,
 		Class:         e.Class,
 	}, true
+}
+
+// mirrorNegCacheRecorder bridges *negcache.Cache to
+// mirror.NegativeCacheRecorder for the mirror's direct-origin path.
+// Symmetric with runOriginPull's recordOriginFailure +
+// neg.RecordSuccess wiring on the please_pull-coordinated path:
+// every terminal direct-origin failure (origin error / io.Copy stall
+// / cw.Commit mismatch / directVerifier mismatch) seeds a cooldown,
+// and every successful commit clears any prior entry so the ladder
+// resets per §5.8 "Self-healing".
+//
+// Logs at WARN on failure so the operator-facing log surface matches
+// what recordOriginFailure already emits for the coordinated path.
+// The mirror's own per-call logger already includes registry/repo/
+// digest fields at WARN/Error/Debug; this adapter intentionally does
+// not re-log the failure (the mirror's site-local log carries more
+// context than we have here).
+type mirrorNegCacheRecorder struct {
+	neg *negcache.Cache
+	lg  *slog.Logger
+}
+
+func (r mirrorNegCacheRecorder) RecordFailure(d digest.Digest, class ifaces.FailureClass) {
+	if r.neg == nil {
+		return
+	}
+	r.neg.RecordFailure(d, class)
+}
+
+func (r mirrorNegCacheRecorder) RecordSuccess(d digest.Digest) {
+	if r.neg == nil {
+		return
+	}
+	r.neg.RecordSuccess(d)
 }
 
 // phase4Metrics groups the §7.6 instruments owned by Phase 4: the §5.8

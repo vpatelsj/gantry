@@ -1,6 +1,7 @@
 package mirror_test
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -9,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 
@@ -605,5 +607,241 @@ func TestMirror_OriginPullArithmeticIdentity(t *testing.T) {
 	}
 	if s != su+fa+dn {
 		t.Errorf("arithmetic identity broken: started=%d != success(%d)+failure(%d)+downstream(%d) = %d", s, su, fa, dn, su+fa+dn)
+	}
+}
+
+// fakeNegCacheRecorder is an in-memory NegativeCacheRecorder used by
+// the mirror-direct §5.8 integration tests below. It records the call
+// sequence so the test can assert WHICH digests entered cooldown and
+// WHICH succeeded — the contract that distinguishes the new direct-
+// origin negative-cache integration from the pre-thirteenth-review
+// behaviour (where the mirror direct path emitted only metrics and
+// never seeded a cooldown).
+type fakeNegCacheRecorder struct {
+	mu        sync.Mutex
+	failures  []fakeNegFailure
+	successes []digest.Digest
+}
+
+type fakeNegFailure struct {
+	D     digest.Digest
+	Class ifaces.FailureClass
+}
+
+func (r *fakeNegCacheRecorder) RecordFailure(d digest.Digest, class ifaces.FailureClass) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.failures = append(r.failures, fakeNegFailure{D: d, Class: class})
+}
+
+func (r *fakeNegCacheRecorder) RecordSuccess(d digest.Digest) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.successes = append(r.successes, d)
+}
+
+func (r *fakeNegCacheRecorder) snapshot() ([]fakeNegFailure, []digest.Digest) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	f := make([]fakeNegFailure, len(r.failures))
+	copy(f, r.failures)
+	s := make([]digest.Digest, len(r.successes))
+	copy(s, r.successes)
+	return f, s
+}
+
+// TestMirror_DirectOrigin_NegativeCache_OnTruncation pins the
+// thirteenth-review fix: when the mirror's direct-origin path returns
+// 2xx from origin but the body truncates mid-stream, the helper MUST
+// seed the §5.8 negative cache — matching what the puller-pump path
+// (runOriginPull → recordOriginFailure) already does. Without this,
+// the next NF5-eligible request for the same digest could re-fire
+// the direct origin pull at the bottom of the next jitter window.
+func TestMirror_DirectOrigin_NegativeCache_OnTruncation(t *testing.T) {
+	body := []byte("full-body-but-truncated-on-the-wire")
+	d := digestOf(body)
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(body)))
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(body[:5])
+	}))
+	defer up.Close()
+
+	cfg := &config.Config{UpstreamRegistries: []config.UpstreamRegistry{
+		{Name: "reg.example.com", Endpoint: up.URL},
+	}}
+	c, err := cache.Open(t.TempDir(), 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = c.Close() }()
+
+	oc, err := origin.New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := &fakeNegCacheRecorder{}
+	m := mirror.New(cfg, c, oc, mirror.WithNegativeCacheRecorder(rec))
+	srv := httptest.NewServer(m.Handler())
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/v2/lib/n/blobs/" + d.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	failures, successes := rec.snapshot()
+	if len(failures) != 1 {
+		t.Fatalf("recorder.failures = %d, want 1 (truncation must seed a §5.8 cooldown so the next direct-origin attempt waits out the ladder)", len(failures))
+	}
+	if failures[0].D != d {
+		t.Errorf("recorder.failures[0].D = %v, want %v", failures[0].D, d)
+	}
+	if failures[0].Class != ifaces.FailureTransient {
+		t.Errorf("recorder.failures[0].Class = %q, want transient (matches the puller-pump path's classification for io.Copy / cw.Commit failures)", failures[0].Class)
+	}
+	if len(successes) != 0 {
+		t.Errorf("recorder.successes = %d, want 0 (no successful commit)", len(successes))
+	}
+}
+
+// TestMirror_DirectOrigin_NegativeCache_OnOriginError pins the
+// thirteenth-review fix for the OTHER half of the negative-cache
+// contract: when origin returns a terminal error (4xx/5xx mapped via
+// *ifaces.OriginError), the mirror direct path must seed the cache
+// with the origin's own class — same as runOriginPull does. This
+// gives §5.8 trusted-cluster-wide propagation for auth/not_found/
+// rate_limited classes even when the failure was observed by the
+// mirror direct path rather than the coordinated please_pull pump.
+func TestMirror_DirectOrigin_NegativeCache_OnOriginError(t *testing.T) {
+	body := []byte("absent")
+	d := digestOf(body)
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		// 404 → ifaces.FailureNotFound after classification.
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer up.Close()
+
+	cfg := &config.Config{UpstreamRegistries: []config.UpstreamRegistry{
+		{Name: "reg.example.com", Endpoint: up.URL},
+	}}
+	c, err := cache.Open(t.TempDir(), 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = c.Close() }()
+
+	oc, err := origin.New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := &fakeNegCacheRecorder{}
+	m := mirror.New(cfg, c, oc, mirror.WithNegativeCacheRecorder(rec))
+	srv := httptest.NewServer(m.Handler())
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/v2/lib/n/blobs/" + d.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	failures, successes := rec.snapshot()
+	if len(failures) != 1 {
+		t.Fatalf("recorder.failures = %d, want 1 (origin 404 must seed a §5.8 cooldown)", len(failures))
+	}
+	if failures[0].D != d {
+		t.Errorf("recorder.failures[0].D = %v, want %v", failures[0].D, d)
+	}
+	if failures[0].Class != ifaces.FailureNotFound {
+		t.Errorf("recorder.failures[0].Class = %q, want not_found (origin's own class must survive the mirror-direct → recorder hop unchanged)", failures[0].Class)
+	}
+	if len(successes) != 0 {
+		t.Errorf("recorder.successes = %d, want 0", len(successes))
+	}
+}
+
+// TestMirror_DirectOrigin_NegativeCache_OnCommitSuccess pins the
+// §5.8 "Self-healing" half of the contract: a successful mirror-
+// direct origin pull MUST clear any prior cooldown entry by calling
+// RecordSuccess. Symmetric with runOriginPull's neg.RecordSuccess(d)
+// after cw.Commit; without it, a transient failure that recovers on
+// the next attempt would leave the recently_failed entry in place
+// until its cooldown elapsed.
+func TestMirror_DirectOrigin_NegativeCache_OnCommitSuccess(t *testing.T) {
+	body := []byte("happy-path")
+	d := digestOf(body)
+	f := newFixture(t, map[digest.Digest][]byte{d: body})
+
+	// newFixture builds a default mirror without a recorder. Rebuild
+	// with the recorder while reusing the underlying upstream + cache.
+	oc, err := origin.New(f.cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := &fakeNegCacheRecorder{}
+	m := mirror.New(f.cfg, f.cache, oc, mirror.WithNegativeCacheRecorder(rec))
+	srv := httptest.NewServer(m.Handler())
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/v2/lib/n/blobs/" + d.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if !bytes.Equal(got, body) {
+		t.Fatalf("served body = %q, want %q", got, body)
+	}
+
+	failures, successes := rec.snapshot()
+	if len(failures) != 0 {
+		t.Errorf("recorder.failures = %d, want 0 on happy-path commit", len(failures))
+	}
+	if len(successes) != 1 {
+		t.Fatalf("recorder.successes = %d, want 1 (cw.Commit success must clear any prior cooldown)", len(successes))
+	}
+	if successes[0] != d {
+		t.Errorf("recorder.successes[0] = %v, want %v", successes[0], d)
+	}
+}
+
+// TestMirror_DirectOrigin_NegativeCache_NilSafe pins the contract
+// that mirrors without WithNegativeCacheRecorder behave exactly as
+// they did before the option existed: the mirror serves and counts
+// metrics as usual, no panic on nil dereference, no integration
+// requirement on legacy test fixtures.
+func TestMirror_DirectOrigin_NegativeCache_NilSafe(t *testing.T) {
+	body := []byte("anything")
+	d := digestOf(body)
+	f := newFixture(t, map[digest.Digest][]byte{d: body})
+
+	// Default mirror (no recorder). Truncation path AND success
+	// path both must not panic when serveDigest tries to record.
+	resp, err := http.Get(f.server.URL + "/v2/lib/n/blobs/" + d.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if !bytes.Equal(got, body) {
+		t.Fatalf("served body = %q, want %q", got, body)
+	}
+
+	// Origin-error path on the same fixture (request a digest the
+	// upstream doesn't know): origin returns 404 → mirror tries
+	// to record into nil recorder. Must not panic.
+	missing := digestOf([]byte("missing"))
+	resp, err = http.Get(f.server.URL + "/v2/lib/n/blobs/" + missing.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode == 200 {
+		t.Errorf("expected non-200 for missing digest, got %d", resp.StatusCode)
 	}
 }

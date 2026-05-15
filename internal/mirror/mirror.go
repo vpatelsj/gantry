@@ -83,6 +83,12 @@ type Server struct {
 	// configured and ?ns= is absent.
 	defaultUpstream string
 
+	// negCache is the §5.8 negative-cache integration for the
+	// direct-origin path. Optional (nil-safe). See
+	// WithNegativeCacheRecorder for the contract and the
+	// thirteenth-review rationale.
+	negCache NegativeCacheRecorder
+
 	// draining is set to true via Drain() when the agent is shutting
 	// down. Once true, every /v2/ request returns 503 immediately so
 	// containerd's hosts.toml falls through to origin (§Phase 6
@@ -255,6 +261,61 @@ func WithDownstreamFailureMetric(downstreamFailure func(kind, class string)) Opt
 	return func(s *Server) {
 		s.metrics.onOriginDownstreamFailure = downstreamFailure
 	}
+}
+
+// NegativeCacheRecorder is the §5.8 negative-cache integration the
+// mirror's direct-origin path uses to mirror what the coordinated
+// puller-pump path (cmd/gantry/main.go's runOriginPull) already does:
+// classify a terminal origin / downstream failure into an
+// ifaces.FailureClass and seed the per-puller cooldown ladder so the
+// next request for the same digest short-circuits via the same
+// `recently_failed` propagation the please_pull path uses.
+//
+// Why this exists (thirteenth review): before this hook, the mirror's
+// direct-origin path — including the §5.7 NF5 fallback that fires
+// after the cold-start cascade reports ErrColdStartExhausted —
+// recorded the failure metric but did NOT enter a negative-cache
+// cooldown. The next NF5-eligible request for the same digest could
+// re-fire the direct-origin pull at the bottom of the next jitter
+// window, even though the previous attempt had stalled mid-stream or
+// digest-mismatched at commit. The puller-pump path correctly drops
+// such retries on the recently_failed cooldown; the mirror direct
+// path did not. That gap is a retry-amplification hardening hole, not
+// a metrics bug — fireOriginDownstreamFailure was already wired by
+// twelfth-review fixes.
+//
+// Contract:
+//
+//   - RecordFailure is invoked once per terminal mirror-direct origin
+//     failure, BEFORE the response is finalized. The class is taken
+//     from *ifaces.OriginError when origin returns one; downstream
+//     failures (io.Copy / cw.Commit / directVerifier.Verify) are
+//     recorded as FailureTransient — the same classification the
+//     puller-pump path uses for those exact paths.
+//   - RecordSuccess is invoked exactly once per successful
+//     mirror-direct origin pull, AFTER cw.Commit (or the direct-
+//     stream digest verifier) passes. It clears any prior cooldown
+//     so the next failure restarts the ladder from Initial (§5.8
+//     "Self-healing"). Symmetric with the puller-pump path's
+//     neg.RecordSuccess(d) call after a successful Commit.
+//
+// HEAD requests deliberately do NOT touch the negative cache: the
+// coordinated path never issues HEAD, and HEAD does not warm the
+// cache, so recording HEAD failures would diverge the two paths'
+// cooldown semantics with no observability win.
+type NegativeCacheRecorder interface {
+	RecordFailure(d digest.Digest, class ifaces.FailureClass)
+	RecordSuccess(d digest.Digest)
+}
+
+// WithNegativeCacheRecorder wires §5.8 negative-cache integration
+// into the mirror's direct-origin path. See NegativeCacheRecorder
+// for the contract. Nil-safe: passing nil leaves the mirror behaving
+// exactly as it did before this option existed (metric-only failure
+// reporting; no cooldown propagation to subsequent direct-origin
+// attempts on the same node).
+func WithNegativeCacheRecorder(rec NegativeCacheRecorder) Option {
+	return func(s *Server) { s.negCache = rec }
 }
 
 // WithPeerMetrics registers Phase 2 peer-fallback metric callbacks.
@@ -645,6 +706,16 @@ func (s *Server) serveDigest(w http.ResponseWriter, r *http.Request, upstream, r
 
 	pr, psize, perr := s.origin.Pull(ctx, pRef)
 	if perr != nil {
+		// §5.8 negative-cache: classify and record the origin-side
+		// failure so the next direct-origin attempt for the same
+		// digest on this node short-circuits on the recently_failed
+		// cooldown. Symmetric with the puller-pump path's
+		// recordOriginFailure(neg, d, err, "origin pull failed", ...)
+		// in cmd/gantry/main.go. Without this, NF5 direct fallback
+		// could fire again on the next request through this node at
+		// the bottom of the next jitter window, retry-amplifying
+		// against an origin that just returned 4xx/5xx.
+		s.recordNegCacheFailure(d, perr)
 		writeOriginError(w, perr, logger)
 		return
 	}
@@ -683,6 +754,12 @@ func (s *Server) serveDigest(w http.ResponseWriter, r *http.Request, upstream, r
 		// 2xx, the failure is downstream.
 		logger.Debug("mirror: copy stalled", slog.Int64("written", written), slog.Any("err", err))
 		s.fireOriginDownstreamFailure(kind, ifaces.FailureTransient)
+		// §5.8 cooldown: io.Copy stalls are the canonical mid-stream
+		// truncation the thirteenth review flagged for NF5 direct
+		// fallback. Classify as transient (matches the puller-pump
+		// path) so the cooldown ladder grows on repeated truncations
+		// of the same digest.
+		s.recordNegCacheFailure(d, err)
 		return
 	}
 	if directVerifier != nil {
@@ -700,6 +777,12 @@ func (s *Server) serveDigest(w http.ResponseWriter, r *http.Request, upstream, r
 			// digestpipe verifier) so it goes to the downstream
 			// counter, not to origin's failure family.
 			s.fireOriginDownstreamFailure(kind, ifaces.FailureTransient)
+			// §5.8 cooldown: a direct-stream digest mismatch is the
+			// strongest "this origin is lying" signal we have on the
+			// no-cache path. Treat the failure as transient (same
+			// class the puller-pump path uses for cw.Commit
+			// mismatches) so repeated mismatches grow the cooldown.
+			s.recordNegCacheFailure(d, verr)
 			return
 		}
 		// Direct-stream verifier passed: bytes were delivered to
@@ -708,6 +791,10 @@ func (s *Server) serveDigest(w http.ResponseWriter, r *http.Request, upstream, r
 		// unavailable), but the origin pull itself succeeded
 		// end-to-end. Count it.
 		s.fireOriginSuccess(kind, written)
+		// §5.8 "Self-healing": a successful end-to-end pull clears
+		// any prior cooldown entry. Symmetric with the puller-pump
+		// path's neg.RecordSuccess(d) after cw.Commit.
+		s.recordNegCacheSuccess(d)
 		return
 	}
 	if cwerr == nil {
@@ -723,6 +810,13 @@ func (s *Server) serveDigest(w http.ResponseWriter, r *http.Request, upstream, r
 			// family.
 			logger.Warn("mirror: cache commit failed", slog.Any("err", err))
 			s.fireOriginDownstreamFailure(kind, ifaces.FailureTransient)
+			// §5.8 cooldown: cw.Commit is where the cache's digestpipe
+			// fires; this branch means EITHER cache I/O failed OR
+			// origin's bytes didn't hash to d. Both are transient by
+			// the puller-pump path's classification — record so the
+			// next direct-origin attempt for the same digest waits
+			// out the cooldown.
+			s.recordNegCacheFailure(d, err)
 			return
 		}
 		// Re-advertise into the DHT now that we hold a byte-identical
@@ -739,6 +833,11 @@ func (s *Server) serveDigest(w http.ResponseWriter, r *http.Request, upstream, r
 		// the operation classified as not-yet-successful even
 		// though the client already got the bytes.
 		s.fireOriginSuccess(kind, written)
+		// §5.8 "Self-healing": clear any prior cooldown entry so
+		// the next failure restarts the ladder from Initial.
+		// Symmetric with the puller-pump path's neg.RecordSuccess(d)
+		// after its cw.Commit.
+		s.recordNegCacheSuccess(d)
 	}
 }
 
@@ -1097,6 +1196,47 @@ func (s *Server) fireOriginDownstreamFailure(kind ifaces.OriginRefKind, class if
 		return
 	}
 	s.metrics.onOriginDownstreamFailure(kind.MetricLabel(), string(class))
+}
+
+// classifyOriginFailureClass extracts the §5.8 FailureClass from an
+// origin-side error. Mirrors the same classification the puller-pump
+// path's recordOriginFailure (cmd/gantry/main.go) uses: an
+// *ifaces.OriginError carries a class, anything else (cache writer
+// open errors, copy stalls, commit digest mismatches) maps to
+// FailureTransient — not the origin's fault, but treating them as
+// transient blocks the cluster from re-hammering the same puller on
+// a flapping local disk or a content-injection proxy while still
+// self-healing on the next cooldown elapse.
+func classifyOriginFailureClass(err error) ifaces.FailureClass {
+	var oe *ifaces.OriginError
+	if errors.As(err, &oe) && oe.Class != ifaces.FailureUnspecified {
+		return oe.Class
+	}
+	return ifaces.FailureTransient
+}
+
+// recordNegCacheFailure routes a terminal direct-origin failure into
+// the optional §5.8 negative-cache recorder. Nil-safe: leaves the
+// pre-thirteenth-review behaviour untouched when no recorder is
+// wired. Symmetric with the puller-pump path's recordOriginFailure
+// (cmd/gantry/main.go) which seeds the same cache for the
+// please_pull-coordinated path.
+func (s *Server) recordNegCacheFailure(d digest.Digest, err error) {
+	if s.negCache == nil {
+		return
+	}
+	s.negCache.RecordFailure(d, classifyOriginFailureClass(err))
+}
+
+// recordNegCacheSuccess clears any prior §5.8 cooldown entry for d
+// when the mirror's direct-origin path produces a committed (or
+// direct-stream-verified) artifact. Nil-safe; symmetric with the
+// puller-pump path's neg.RecordSuccess(d) call after cw.Commit.
+func (s *Server) recordNegCacheSuccess(d digest.Digest) {
+	if s.negCache == nil {
+		return
+	}
+	s.negCache.RecordSuccess(d)
 }
 
 func (s *Server) bumpPeerFetch(outcome string) {
