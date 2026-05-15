@@ -249,6 +249,14 @@ func runAgent(args []string) error {
 	// missing `pods/patch` RBAC surfaces as a stuck deploy rather
 	// than a silently-isolated agent.
 	var selfAnnounced atomic.Bool
+	// noDialableP2PAddrs is set when announceSelfAndBootstrap
+	// reports a successful patch but with zero published P2PAddrs —
+	// every disco.Addrs() entry was either a wildcard the
+	// rewrite-to-PodIP path couldn't rewrite (mismatched IP family,
+	// no Pod IP exposed) or otherwise unsuitable. Surfacing this in
+	// /readyz is the only way to fail the rollout instead of
+	// silently shipping a libp2p-unreachable agent.
+	var noDialableP2PAddrs atomic.Bool
 	// A successful self-announce is required for readiness iff the
 	// agent is running in production K8s mode with no static
 	// bootstrap peers — i.e. dynamic discovery via annotations is the
@@ -258,8 +266,9 @@ func runAgent(args []string) error {
 	requireSelfAnnounce := false
 	if mgr, ok := memberView.(*members.Manager); ok && c.PodName != "" {
 		requireSelfAnnounce = selfAnnounceRequiredForReadiness(c)
-		go announceSelfAndBootstrap(ctx, mgr, disco, c, logger, func() {
+		go announceSelfAndBootstrap(ctx, mgr, disco, c, logger, func(addrCount int) {
 			selfAnnounced.Store(true)
+			noDialableP2PAddrs.Store(addrCount == 0)
 		})
 	}
 
@@ -538,6 +547,16 @@ func runAgent(args []string) error {
 			// 503 until then makes the rolling deploy pause and
 			// surfaces an RBAC misconfiguration immediately.
 			return "members self-announce pending (check pods/patch RBAC)", false
+		}
+		if requireSelfAnnounce && noDialableP2PAddrs.Load() {
+			// Patch went through but the published P2PAddrs list
+			// was empty: every disco.Addrs() entry was a
+			// wildcard the rewrite-to-PodIP couldn't rewrite.
+			// Peers see our annotation but cannot dial us, so
+			// coord RPCs all fail — fail the readiness probe
+			// rather than ship a silently-isolated agent. Fix:
+			// align libp2p_listen with the Pod's IP family.
+			return "members self-announce has no dialable p2p addresses; check libp2p_listen vs Pod IP family", false
 		}
 		// Single-node cluster carve-out: with only self in the
 		// members view there are no peers to dial, so the kad-dht
@@ -1178,7 +1197,7 @@ func membershipPeerIDResolver(mv ifaces.Members, logger *slog.Logger) func(iface
 // (SnapshotForBootstrap) because readiness depends on RoutingTableSize
 // being > 0 — a deadlock if every peer is waiting for every other
 // peer to be Ready first.
-func announceSelfAndBootstrap(ctx context.Context, mgr *members.Manager, disco *discovery.Host, c *config.Config, logger *slog.Logger, onAnnounced func()) {
+func announceSelfAndBootstrap(ctx context.Context, mgr *members.Manager, disco *discovery.Host, c *config.Config, logger *slog.Logger, onAnnounced func(addrCount int)) {
 	// Build the announcement. Wildcard listen addresses (0.0.0.0,
 	// ::) are not dialable from other pods; substitute the agent's
 	// Pod IP so the published p2p-addrs are usable.
@@ -1195,6 +1214,21 @@ func announceSelfAndBootstrap(ctx context.Context, mgr *members.Manager, disco *
 		// Format /ip4/.../tcp/.../p2p/<peerID> so peers can dial
 		// directly without a separate ID resolution step.
 		multiaddrs = append(multiaddrs, ma+"/p2p/"+peerID.String())
+	}
+	if len(multiaddrs) == 0 {
+		// Loud diagnostic so the readiness probe's terse message has
+		// something to point at in the logs. The peer is in a
+		// broken-but-not-crashed state: cdsub still works, the
+		// transfer endpoint still serves, but no other agent can
+		// dial us over libp2p so coord RPCs (please_pull,
+		// pull_intent) will all fail. readyCheck stays 503 on this
+		// condition; fix is to align libp2p_listen with the Pod's
+		// IP family (typical cause: pod is v4-only but libp2p_listen
+		// specifies a v6 wildcard, or vice versa).
+		logger.Error("members: self-announce will produce zero dialable p2p addresses; check libp2p_listen vs Pod IP family",
+			slog.String("pod_ip", c.PodIP),
+			slog.Int("listen_addrs", len(listenAddrs)),
+		)
 	}
 	ann := members.SelfAnnouncement{
 		PeerID:       peerID.String(),
@@ -1219,7 +1253,10 @@ func announceSelfAndBootstrap(ctx context.Context, mgr *members.Manager, disco *
 				slog.Int("p2p_addrs", len(multiaddrs)),
 			)
 			if onAnnounced != nil {
-				onAnnounced()
+				// Pass addr count so readiness can distinguish
+				// "patch ok and we're dialable" (>0) from "patch
+				// ok but we are silently isolated" (==0).
+				onAnnounced(len(multiaddrs))
 			}
 			break
 		}
