@@ -457,7 +457,17 @@ func runAgent(args []string) error {
 			Logger:           logger,
 			JitterBase:       c.NF5JitterBase,
 			PerNodeRateLimit: c.NF5PerNodeRateLimit,
-			ClusterSize:      func() int { return len(memberView.Snapshot()) },
+			// Use bootstrapPeerCount (Running pods with published
+			// p2p-addrs annotations, irrespective of Ready). NF5
+			// jitter spreads thundering-herd risk across all pods
+			// that *could* race to origin, not just the Ready-set.
+			// During a cold rollout the Ready set is often zero —
+			// using Snapshot() (Ready-only) would size the jitter
+			// window as if the cluster were size 1, collapsing the
+			// per-cluster random delay window to zero and routing
+			// the entire cluster into origin at the same instant,
+			// the exact thundering-herd NF5 exists to prevent.
+			ClusterSize: func() int { return bootstrapPeerCount(memberView) },
 			InBootstrap: func() bool {
 				if monitor == nil {
 					return false
