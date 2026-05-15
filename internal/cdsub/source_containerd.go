@@ -1,6 +1,6 @@
 //go:build linux
 
-// Package cdsub: containerd ImageSource implementation.
+// containerd ImageSource implementation.
 //
 // Wire-up:
 //
