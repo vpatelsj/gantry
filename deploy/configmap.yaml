@@ -75,12 +75,28 @@ data:
     containerd_namespace: "k8s.io"
 
     # ---------- Upstream registries (§7.1) ----------
-    # Edit this list for each operator deployment. Credentials are
-    # mounted from the gantry-registry-credentials Secret.
+    # Edit this list for each operator deployment. At least one
+    # entry is required: origin.New fails fast on an empty list.
+    #
+    # Credentials are OPTIONAL per entry. Omit credentials_path for
+    # public / anonymous registries (the default below). When you DO
+    # need credentials:
+    #   1. apply deploy/registry-secret.example.yaml (renamed and
+    #      filled in with your "username:password" pair, keyed by
+    #      the registry's `name:` field below);
+    #   2. add `credentials_path: "/etc/gantry/registry/<name>"`
+    #      to the matching entry here.
+    # The agent reads each credentials_path EAGERLY at startup
+    # (origin.New); if the file is missing it returns a hard error,
+    # which crashloops the pod. The DaemonSet's registry-creds
+    # volume is `optional: true`, so a default ConfigMap that
+    # references a non-existent credentials_path would let
+    # Kubernetes start the pod and then crash the agent — the
+    # default below is therefore credentials-free on purpose.
     upstream_registries:
       - name: "registry.example.com"
         endpoint: "https://registry.example.com"
-        credentials_path: "/etc/gantry/registry/registry.example.com"
+        # credentials_path: "/etc/gantry/registry/registry.example.com"
       # - name: "ghcr.io"
       #   endpoint: "https://ghcr.io"
       #   credentials_path: "/etc/gantry/registry/ghcr.io"

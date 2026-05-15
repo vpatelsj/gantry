@@ -21,8 +21,16 @@ the gantry agent as a Kubernetes DaemonSet.
 ```sh
 kubectl apply -f deploy/serviceaccount.yaml
 kubectl apply -f deploy/configmap.yaml
-# Operator: edit registry-secret.example.yaml first.
-kubectl apply -f deploy/registry-secret.example.yaml
+# Operator: for any PRIVATE upstream registry, edit
+# registry-secret.example.yaml (rename it, fill in real
+# username:password values keyed by registry `name:`) and apply,
+# AND uncomment the matching `credentials_path:` line in
+# configmap.yaml. The default ConfigMap ships credentials-free so
+# the agent starts cleanly against public registries without any
+# Secret being applied — origin.New eagerly reads every
+# credentials_path at startup, so an unmatched path would
+# crashloop the pod.
+kubectl apply -f deploy/registry-secret.example.yaml   # private registries only
 kubectl apply -f deploy/daemonset.yaml
 # deploy/examples/networkpolicy.yaml is a hardening overlay; do NOT
 # apply it as part of the initial install. See "Hardening overlays"

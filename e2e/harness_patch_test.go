@@ -123,3 +123,83 @@ func TestPatchDaemonSetForE2E_FailsLoudWhenAnchorMissing(t *testing.T) {
 		t.Errorf("error message = %q, want it to mention 'anchor not found' so the operator knows to update gantryContainerAnchor", err.Error())
 	}
 }
+
+// TestPatchConfigMapForE2E_RewritesUpstreamRegistries pins the
+// thirteenth-review fix: the e2e harness must not apply the default
+// ConfigMap's upstream_registries block as-is. The default ships
+// "registry.example.com" (unreachable in kind) plus a commented
+// credentials_path that, if ever uncommented, would crashloop the
+// agent because the secret volume is optional. patchConfigMapForE2E
+// swaps the whole block for a single anonymous-public Docker Hub
+// entry so the e2e cluster is self-contained.
+func TestPatchConfigMapForE2E_RewritesUpstreamRegistries(t *testing.T) {
+	// Locate the real deploy/configmap.yaml so this test also
+	// catches "someone reformatted the upstream_registries block"
+	// regressions in the production manifest.
+	repoRoot, err := filepath.Abs("..")
+	if err != nil {
+		t.Fatalf("filepath.Abs: %v", err)
+	}
+	raw, err := os.ReadFile(filepath.Join(repoRoot, "deploy", "configmap.yaml"))
+	if err != nil {
+		t.Fatalf("read configmap.yaml: %v", err)
+	}
+
+	patched, err := patchConfigMapForE2E(string(raw))
+	if err != nil {
+		t.Fatalf("patchConfigMapForE2E: %v", err)
+	}
+
+	// The e2e replacement must reference an anonymous public
+	// registry — no credentials_path, no placeholder host.
+	if !strings.Contains(patched, `name: "registry-1.docker.io"`) {
+		t.Errorf("patched ConfigMap missing the e2e Docker Hub registry entry")
+	}
+	if !strings.Contains(patched, `ns_alias: "docker.io"`) {
+		t.Errorf("patched ConfigMap missing ns_alias=docker.io; containerd hands the mirror ?ns=docker.io for Hub pulls")
+	}
+	if !strings.Contains(patched, `endpoint: "https://registry-1.docker.io"`) {
+		t.Errorf("patched ConfigMap missing the Docker Hub endpoint")
+	}
+	// The original placeholder host must be GONE — leaving it in
+	// would make every cache-miss request fail DNS on kind.
+	if strings.Contains(patched, "registry.example.com") {
+		t.Errorf("patched ConfigMap still contains the production placeholder 'registry.example.com'; the swap did not apply")
+	}
+	// The commented-out ghcr.io alternative entry must also be
+	// gone — the whole upstream_registries block is replaced.
+	if strings.Contains(patched, `name: "ghcr.io"`) {
+		t.Errorf("patched ConfigMap still contains the commented ghcr.io alternative; the swap did not replace the whole block")
+	}
+	// The two operative credentials_path references that lived
+	// inside the original upstream_registries block must be GONE.
+	// The doc-prose mention near the top of the block (which uses
+	// backticks to describe the field as a concept for operators)
+	// is unaffected by the patch and intentionally left in place
+	// so the patched ConfigMap is still self-documenting.
+	if strings.Contains(patched, `# credentials_path: "/etc/gantry/registry/registry.example.com"`) {
+		t.Errorf("patched ConfigMap still contains the commented credentials_path for registry.example.com; the upstream_registries swap did not remove the whole entry")
+	}
+	if strings.Contains(patched, `credentials_path: "/etc/gantry/registry/ghcr.io"`) {
+		t.Errorf("patched ConfigMap still contains the credentials_path for ghcr.io; the upstream_registries swap did not remove the whole alternative entry")
+	}
+}
+
+// TestPatchConfigMapForE2E_FailsLoudWhenAnchorMissing covers the
+// other half of the contract: if deploy/configmap.yaml's
+// upstream_registries block is reformatted in a way that breaks the
+// anchor, the helper must fail loudly rather than silently leaving
+// the production placeholder in place.
+func TestPatchConfigMapForE2E_FailsLoudWhenAnchorMissing(t *testing.T) {
+	// A minimal ConfigMap that does NOT contain the expected
+	// upstream_registries block. Any apply on this should error.
+	raw := "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: gantry-config\ndata:\n  config.yaml: |\n    mirror_listen: \"0.0.0.0:5000\"\n"
+
+	_, err := patchConfigMapForE2E(raw)
+	if err == nil {
+		t.Fatalf("patchConfigMapForE2E returned nil error on a manifest missing the upstream_registries anchor; want a loud error so the harness aborts before kubectl apply")
+	}
+	if !strings.Contains(err.Error(), "anchor not found") {
+		t.Errorf("error message = %q, want it to mention 'anchor not found' so the operator knows to update configMapUpstreamRegistriesAnchor", err.Error())
+	}
+}

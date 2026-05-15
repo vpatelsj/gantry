@@ -131,8 +131,7 @@ func (h *harness) applyManifests(ctx context.Context) {
 		filepath.Join(h.repoRoot, "deploy", "serviceaccount.yaml")); err != nil {
 		h.t.Fatalf("apply serviceaccount: %v", err)
 	}
-	if err := h.run(ctx, "kubectl", "apply", "-f",
-		filepath.Join(h.repoRoot, "deploy", "configmap.yaml")); err != nil {
+	if err := h.applyConfigMap(ctx); err != nil {
 		h.t.Fatalf("apply configmap: %v", err)
 	}
 	// NetworkPolicy is intentionally NOT applied by the e2e harness.
@@ -170,6 +169,32 @@ func (h *harness) applyDaemonSet(ctx context.Context) error {
 		return err
 	}
 	patched, err := patchDaemonSetForE2E(string(raw), imageTag)
+	if err != nil {
+		return err
+	}
+
+	cmd := exec.CommandContext(ctx, "kubectl", "apply", "-f", "-")
+	cmd.Stdin = strings.NewReader(patched)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("kubectl apply: %w (stderr: %s)", err, stderr.String())
+	}
+	return nil
+}
+
+// applyConfigMap loads deploy/configmap.yaml, rewrites the
+// upstream_registries block so the e2e cluster does NOT depend on
+// whatever placeholder ships in the default production ConfigMap,
+// and pipes the result into `kubectl apply -f -`. See
+// patchConfigMapForE2E for the rationale.
+func (h *harness) applyConfigMap(ctx context.Context) error {
+	raw, err := os.ReadFile(filepath.Join(h.repoRoot, "deploy", "configmap.yaml"))
+	if err != nil {
+		return err
+	}
+	patched, err := patchConfigMapForE2E(string(raw))
 	if err != nil {
 		return err
 	}
@@ -227,6 +252,68 @@ func patchDaemonSetForE2E(raw, imageTag string) (string, error) {
 		// out the production tag (or, worse, the wrong
 		// imagePullPolicy on the wrong container).
 		return "", fmt.Errorf("patchDaemonSetForE2E: gantry image/policy anchor not found in deploy/daemonset.yaml; update gantryContainerAnchor in harness_e2e.go")
+	}
+	return patched, nil
+}
+
+// configMapUpstreamRegistriesAnchor is the multi-line block in
+// deploy/configmap.yaml that lists the operator-facing placeholder
+// registries. patchConfigMapForE2E swaps the whole block for a
+// single anonymous-public entry so the e2e cluster is self-contained
+// — see that helper's doc for why.
+const configMapUpstreamRegistriesAnchor = `    upstream_registries:
+      - name: "registry.example.com"
+        endpoint: "https://registry.example.com"
+        # credentials_path: "/etc/gantry/registry/registry.example.com"
+      # - name: "ghcr.io"
+      #   endpoint: "https://ghcr.io"
+      #   credentials_path: "/etc/gantry/registry/ghcr.io"`
+
+// e2eConfigMapUpstreamRegistriesReplacement is what patchConfigMapForE2E
+// substitutes in for configMapUpstreamRegistriesAnchor. A single
+// anonymous-public Docker Hub entry keeps the e2e cluster
+// self-contained: no credentials volume, no DNS dependency on
+// "registry.example.com" being resolvable in the kind network, and
+// no eager-read crash from origin.New if a future change re-enables
+// credentials_path on the default placeholder. ns_alias = "docker.io"
+// matches the value containerd hands the mirror in `?ns=docker.io`
+// for Hub pulls.
+const e2eConfigMapUpstreamRegistriesReplacement = `    upstream_registries:
+      - name: "registry-1.docker.io"
+        ns_alias: "docker.io"
+        endpoint: "https://registry-1.docker.io"`
+
+// patchConfigMapForE2E rewrites deploy/configmap.yaml's
+// upstream_registries block so the e2e cluster does not depend on
+// the production-facing placeholder entries (`registry.example.com`,
+// commented-out `ghcr.io`, optionally-mounted credentials secret).
+//
+// Why this exists: deploy/configmap.yaml is shipped for operators,
+// and its default upstream_registries list is by design a placeholder
+// that operators are expected to edit before rolling Gantry out. The
+// reviewer's case for the e2e harness was the reverse direction:
+//
+//   - If credentials_path is ever uncommented on the default entry,
+//     origin.New eagerly reads the file at startup and crashloops the
+//     pod — the registry-creds Secret volume in daemonset.yaml is
+//     `optional: true`, so kubelet still starts the pod but the agent
+//     dies on the first `os.ReadFile` in newRegistry.
+//   - Even with credentials_path commented out, leaving the host
+//     `registry.example.com` in the e2e config means every future
+//     scenario test that actually pulls an image (cache-hit on second
+//     pull, NF5 chaos, eviction headroom) has to special-case the
+//     placeholder. Rewriting it once at apply time costs nothing and
+//     makes the e2e cluster behave like a real operator deployment
+//     targeting Docker Hub anonymously.
+//
+// Returns an error if the anchor stops matching, exactly like
+// patchDaemonSetForE2E: silently no-op'ing on a reformatted ConfigMap
+// would let the harness ship a default-placeholder e2e cluster that
+// the reviewer flagged as fragile.
+func patchConfigMapForE2E(raw string) (string, error) {
+	patched := strings.Replace(raw, configMapUpstreamRegistriesAnchor, e2eConfigMapUpstreamRegistriesReplacement, 1)
+	if patched == raw {
+		return "", fmt.Errorf("patchConfigMapForE2E: upstream_registries anchor not found in deploy/configmap.yaml; update configMapUpstreamRegistriesAnchor in harness_e2e.go")
 	}
 	return patched, nil
 }
