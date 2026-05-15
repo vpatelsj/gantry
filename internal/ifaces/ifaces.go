@@ -287,6 +287,31 @@ type Coordinator interface {
 	PleasePull(ctx context.Context, peer NodeID, registry, repository string, kind OriginRefKind, digests []digest.Digest) ([]PleasePullOutcome, error)
 }
 
+// LocalIntentProvider computes the PullIntent for self synchronously,
+// without going through a libp2p coord stream. The cold-start
+// orchestrator uses it to include self as a first-class participant
+// in the §5.2 rule cascade so that when self is HRW rank 0, self
+// pulls instead of delegating to rank 1 (which violates the
+// "one origin pull per digest" thundering-herd invariant — every
+// requester must converge on the same designated puller, and that
+// puller MAY be self).
+type LocalIntentProvider interface {
+	LocalPullIntent(ctx context.Context, d digest.Digest) PullIntent
+}
+
+// LocalPullStarter starts an origin pull on the local node without
+// going through a libp2p coord stream. The cold-start orchestrator
+// invokes this when rule 7 selects self as the designated puller;
+// the wire-level alternative (Coord.PleasePull(self, ...)) would
+// either fail to dial self or — worse — round-trip through libp2p
+// and burn a stream slot. Semantics MUST match the server-side
+// please_pull handler: each digest either starts a new origin pull,
+// piggybacks on an already-in-flight one (PleasePullAlreadyPulling),
+// or short-circuits on the negative cache (PleasePullRecentlyFailed).
+type LocalPullStarter interface {
+	StartLocalPull(ctx context.Context, registry, repository string, kind OriginRefKind, digests []digest.Digest) ([]PleasePullOutcome, error)
+}
+
 // ---------------------------------------------------------------------------
 // Errors.
 // ---------------------------------------------------------------------------

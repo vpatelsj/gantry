@@ -312,7 +312,41 @@ func (s *Server) servePullIntent(ctx context.Context, req *coordv1.PullIntentReq
 		return nil, fmt.Errorf("pull_intent: %w", err)
 	}
 
-	resp := &coordv1.PullIntentResponse{}
+	intent := s.computeLocalIntent(ctx, d)
+
+	resp := &coordv1.PullIntentResponse{
+		HasCached:      intent.HasCached,
+		InFlight:       intent.InFlight,
+		HrwRank:        intent.RecipientRank,
+		RecentlyFailed: intent.RecentlyFailed,
+		FailureClass:   failureClassToProto(intent.FailureClass),
+	}
+	if !intent.StartedAt.IsZero() {
+		resp.StartedAt = timestamppb.New(intent.StartedAt)
+	}
+	if !intent.CooldownUntil.IsZero() {
+		resp.CooldownUntil = timestamppb.New(intent.CooldownUntil)
+	}
+	return resp, nil
+}
+
+// LocalPullIntent implements ifaces.LocalIntentProvider. It returns
+// the same PullIntent the wire-level pull_intent_query handler would
+// produce for d, but without the libp2p stream round-trip — the
+// cold-start orchestrator uses it to include self as a first-class
+// participant in the §5.2 rule cascade.
+func (s *Server) LocalPullIntent(ctx context.Context, d digest.Digest) ifaces.PullIntent {
+	return s.computeLocalIntent(ctx, d)
+}
+
+// computeLocalIntent is the shared implementation behind
+// servePullIntent (wire path) and LocalPullIntent (in-process path).
+// Both must produce semantically identical results for the same d so
+// that the cold-start cascade's HRW-rank-0-on-self decision matches
+// what every peer would compute for us. See §5.2 step 4 and the
+// LocalIntentProvider interface doc.
+func (s *Server) computeLocalIntent(ctx context.Context, d digest.Digest) ifaces.PullIntent {
+	intent := ifaces.PullIntent{RecipientRank: -1}
 
 	// has_cached. Effective local availability: blobs in Gantry's own
 	// cache OR in an optional SecondaryBlobSource (canonically the
@@ -321,7 +355,7 @@ func (s *Server) servePullIntent(ctx context.Context, req *coordv1.PullIntentReq
 	// on the wire, triggering redundant please_pull / origin fetches
 	// even though the transfer endpoint would already serve them.
 	if ok, err := s.cache.Has(ctx, d); err == nil && ok {
-		resp.HasCached = true
+		intent.HasCached = true
 	} else if s.secondary != nil {
 		// Cache miss (or cache.Has error): consult the secondary.
 		// nil-error + true is the only path that flips has_cached;
@@ -329,7 +363,7 @@ func (s *Server) servePullIntent(ctx context.Context, req *coordv1.PullIntentReq
 		// because the peer would then issue a transfer fetch that
 		// also fails.
 		if ok, err := s.secondary.Has(ctx, d); err == nil && ok {
-			resp.HasCached = true
+			intent.HasCached = true
 		} else if err != nil {
 			s.logger.Debug("pull_intent: secondary.Has failed",
 				slog.String("digest", d.String()),
@@ -340,28 +374,67 @@ func (s *Server) servePullIntent(ctx context.Context, req *coordv1.PullIntentReq
 
 	// in_flight / started_at
 	if e, ok := s.inflight.LookupForIntent(d); ok {
-		resp.InFlight = true
-		resp.StartedAt = timestamppb.New(e.StartedAt)
+		intent.InFlight = true
+		intent.StartedAt = e.StartedAt
 	}
 
 	// hrw_rank — own rank in own membership view.
 	if s.members != nil {
 		nodes := s.members.Snapshot()
-		resp.HrwRank = hrw.RankOf(nodes, s.members.Self(), d)
-	} else {
-		resp.HrwRank = -1
+		intent.RecipientRank = hrw.RankOf(nodes, s.members.Self(), d)
 	}
 
 	// §5.8 negative-cache fields.
 	if s.negCache != nil {
 		if e, ok := s.negCache.Lookup(d); ok {
-			resp.RecentlyFailed = true
-			resp.CooldownUntil = timestamppb.New(e.CooldownUntil)
-			resp.FailureClass = failureClassToProto(e.Class)
+			intent.RecentlyFailed = true
+			intent.CooldownUntil = e.CooldownUntil
+			intent.FailureClass = e.Class
 		}
 	}
+	return intent
+}
 
-	return resp, nil
+// StartLocalPull implements ifaces.LocalPullStarter. It runs the same
+// pullerPump-driven path as servePleasePull but skips the libp2p
+// stream layer entirely. Used by the cold-start orchestrator when
+// rule 7 picks self as the designated puller — Coord.PleasePull(self)
+// would round-trip through libp2p (or fail to dial) for no benefit.
+//
+// Returns one PleasePullOutcome per input digest. A nil/zero pump (no
+// WithPullerPump option) yields PleasePullUnspecified entries; that
+// matches the server-side behaviour and is what the cold-start
+// resolver expects when origin-pull is disabled.
+func (s *Server) StartLocalPull(ctx context.Context, registry, repository string, kind ifaces.OriginRefKind, digests []digest.Digest) ([]ifaces.PleasePullOutcome, error) {
+	if registry == "" || repository == "" {
+		return nil, errors.New("start_local_pull: missing registry/repository")
+	}
+	out := make([]ifaces.PleasePullOutcome, 0, len(digests))
+	for _, d := range digests {
+		oc := ifaces.PleasePullOutcome{Digest: d}
+		if s.pullerPump == nil {
+			out = append(out, oc)
+			continue
+		}
+		startedAt, already, fail := s.pullerPump(ctx, registry, repository, d, kind)
+		switch {
+		case fail != nil:
+			oc.Outcome = ifaces.PleasePullRecentlyFailed
+			oc.CooldownUntil = fail.CooldownUntil
+			oc.FailureClass = fail.Class
+		case already:
+			oc.Outcome = ifaces.PleasePullAlreadyPulling
+			oc.StartedAt = startedAt
+		default:
+			oc.Outcome = ifaces.PleasePullStarted
+			oc.StartedAt = startedAt
+			if s.hooks.OnPleasePullStarted != nil {
+				s.hooks.OnPleasePullStarted()
+			}
+		}
+		out = append(out, oc)
+	}
+	return out, nil
 }
 
 func (s *Server) servePleasePull(ctx context.Context, _ peer.ID, req *coordv1.PleasePullRequest) (*coordv1.PleasePullResponse, error) {

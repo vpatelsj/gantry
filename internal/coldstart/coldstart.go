@@ -118,6 +118,28 @@ type Options struct {
 	HrwScope  hrw.Scope // default ScopeCluster
 	SelfZone  string    // required when HrwScope == ScopeZone
 
+	// LocalIntent computes self's PullIntent synchronously, without
+	// the libp2p coord round-trip. When non-nil, the cold-start
+	// orchestrator includes self as a first-class participant in the
+	// §5.2 rule cascade — rule 2 (cache hit on self), rule 3 (self
+	// in-flight), rule 4 (self in cooldown), and rule 7 (self picked
+	// as designated puller) all behave the same as for any peer.
+	//
+	// Without LocalIntent, the resolver excludes self from
+	// queryTargets and from `reachable`, which means a self-as-HRW-
+	// rank-0 case routes please_pull to rank 1 — two nodes both
+	// trying to delegate to each other can each origin-pull the same
+	// digest, violating the F1 "one origin pull per digest"
+	// invariant. New deployments MUST wire LocalIntent.
+	LocalIntent ifaces.LocalIntentProvider
+	// LocalPull starts an origin pull on self without the libp2p
+	// please_pull RPC. Used when rule 7's lowest-rank-reachable puller
+	// is self. nil + LocalIntent non-nil + rule 7 picks self →
+	// resolver falls back to Coord.PleasePull(self, ...), which will
+	// either fail to dial or burn a stream slot to no benefit; tests
+	// should set both together.
+	LocalPull ifaces.LocalPullStarter
+
 	// Tunables (defaults applied if zero).
 	QueryTimeout         time.Duration // default 2s — §5.2 step 5 wait window
 	PollManifest         time.Duration // default 200ms — §5.2a
@@ -332,6 +354,18 @@ func (r *Resolver) probe(ctx context.Context, d digest.Digest, kind ifaces.Origi
 	}
 
 	self := r.opts.Members.Self()
+	// Find self's rank in top (if present) so we can synthesize a
+	// self-response below. selfIdx == -1 means self isn't in the
+	// current top-N — typically because the cluster has at least K
+	// other nodes that all rank higher for this digest, in which
+	// case self is irrelevant to the cascade.
+	selfIdx := -1
+	for i, s := range top {
+		if s.Node.ID == self {
+			selfIdx = i
+			break
+		}
+	}
 	// Don't pull_intent_query ourselves — we already know our state.
 	queryTargets := make([]hrw.Scored, 0, len(top))
 	for _, s := range top {
@@ -343,6 +377,30 @@ func (r *Resolver) probe(ctx context.Context, d digest.Digest, kind ifaces.Origi
 	probeCtx, cancel := context.WithTimeout(ctx, r.opts.QueryTimeout)
 	defer cancel()
 	responses := r.fanOut(probeCtx, queryTargets, d)
+
+	// Synthesize self's response from LocalIntent so the rule cascade
+	// can pick self when self is rank 0 (or for cache-hit / in-flight
+	// piggyback). Without this, an excluded-self set means
+	// lowestRankReachable() never returns self even though self IS
+	// the HRW-designated puller — two nodes both ranking each other
+	// as the puller can each issue a please_pull and both
+	// origin-pull, violating the F1 invariant.
+	if r.opts.LocalIntent != nil && selfIdx >= 0 {
+		selfIntent := r.opts.LocalIntent.LocalPullIntent(ctx, d)
+		// Defensive: the synthetic responder MUST report the rank we
+		// expect for self so the cascade's lowest-rank-reachable
+		// picks correctly. The server-side computeLocalIntent uses
+		// the same membership view we did, but if the snapshot
+		// changed mid-flight, fall back to our index.
+		if selfIntent.RecipientRank != int32(selfIdx) {
+			selfIntent.RecipientRank = int32(selfIdx)
+		}
+		responses = append(responses, response{
+			node:   top[selfIdx].Node,
+			ok:     true,
+			intent: selfIntent,
+		})
+	}
 
 	// §5.3: emit hrw_rank_mismatch when responder's reported rank
 	// disagrees with our locally computed rank.
@@ -613,6 +671,18 @@ func (r *Resolver) sendPleasePull(ctx context.Context, puller response, d digest
 	// (the mirror at the layer-fanout level groups by puller).
 	ctx, cancel := context.WithTimeout(ctx, r.opts.QueryTimeout)
 	defer cancel()
+	// When the designated puller is self, skip the libp2p stream and
+	// drive the local pullerPump directly. Identity of "puller is
+	// self" is whatever Members.Self() reports — the synthetic
+	// response added in probe() uses the same ID, so a rule-7 match
+	// on self is detectable by NodeID equality. Without this branch,
+	// Coord.PleasePull(self, ...) would either fail to dial (peer.ID
+	// = our own peer.ID does not resolve to a network address) or
+	// round-trip through libp2p for no benefit.
+	if r.opts.LocalPull != nil && puller.node.ID == r.opts.Members.Self() {
+		_, err := r.opts.LocalPull.StartLocalPull(ctx, registry, repository, kind, []digest.Digest{d})
+		return err
+	}
 	_, err := r.opts.Coord.PleasePull(ctx, puller.node.ID, registry, repository, kind, []digest.Digest{d})
 	return err
 }

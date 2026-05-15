@@ -365,6 +365,8 @@ func runAgent(args []string) error {
 			HrwK:                  c.HRWK,
 			HrwScope:              hrw.ParseScope(c.HRWTopologyScope),
 			SelfZone:              selfZone,
+			LocalIntent:           coordServer,
+			LocalPull:             coordServer,
 			TransientCooldownCap:  c.OriginFailureHonorWindowCap,
 			TopKExpansionFactor:   c.TopKExpansionFactorDegraded,
 			TrustedFailureClasses: parseTrustedFailureClasses(c.OriginFailureClassesTrustedClusterWide, logger),

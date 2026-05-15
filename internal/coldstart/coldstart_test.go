@@ -773,3 +773,395 @@ func TestTopKExpansion_DegradedReason(t *testing.T) {
 		t.Errorf("OnTopKExpansion reasons = %v; want [degraded_health]", reasons)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Self-as-first-class-participant tests (sixth review, #1 priority).
+//
+// These cover the regression where the resolver excluded self from the
+// HRW probe set and from the rule-7 reachable list, causing self-as-
+// rank-0 cases to delegate please_pull to rank 1 and break the
+// "one origin pull per digest" thundering-herd invariant.
+// ---------------------------------------------------------------------------
+
+// stubLocalIntent implements ifaces.LocalIntentProvider.
+type stubLocalIntent struct {
+	mu     sync.Mutex
+	intent ifaces.PullIntent
+	calls  int
+}
+
+func (s *stubLocalIntent) LocalPullIntent(_ context.Context, _ digest.Digest) ifaces.PullIntent {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.calls++
+	return s.intent
+}
+
+// stubLocalPull implements ifaces.LocalPullStarter and records every
+// invocation so a test can prove rule 7 went local instead of
+// dialing libp2p.
+type stubLocalPull struct {
+	mu       sync.Mutex
+	registry []string
+	repo     []string
+	digests  [][]digest.Digest
+	out      []ifaces.PleasePullOutcome
+	err      error
+}
+
+func (s *stubLocalPull) StartLocalPull(_ context.Context, registry, repository string, _ ifaces.OriginRefKind, ds []digest.Digest) ([]ifaces.PleasePullOutcome, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.registry = append(s.registry, registry)
+	s.repo = append(s.repo, repository)
+	dsCopy := make([]digest.Digest, len(ds))
+	copy(dsCopy, ds)
+	s.digests = append(s.digests, dsCopy)
+	if s.err != nil {
+		return nil, s.err
+	}
+	if s.out != nil {
+		return s.out, nil
+	}
+	out := make([]ifaces.PleasePullOutcome, len(ds))
+	for i, d := range ds {
+		out[i] = ifaces.PleasePullOutcome{Digest: d, Outcome: ifaces.PleasePullStarted}
+	}
+	return out, nil
+}
+
+// findDigestWhereSelfIsRank0 generates digests until it finds one for
+// which hrw.TopK(nodes, d, k) puts self at index 0. HRW is
+// deterministic, so this terminates quickly for any non-degenerate
+// cluster — the search just needs to find a (digest, nodeID) pair
+// whose double-hash maximises among the cluster. We try byte values
+// 'a'…'z' and '0'…'9' before giving up so the test never spins
+// forever on a buggy hash.
+func findDigestWhereSelfIsRank0(t *testing.T, nodes []ifaces.Node, self ifaces.NodeID, k int) digest.Digest {
+	t.Helper()
+	for _, c := range []byte("abcdef0123456789") {
+		d := digest.MustParse("sha256:" + rep(c, 64))
+		top := hrw.TopK(nodes, d, k)
+		if len(top) > 0 && top[0].Node.ID == self {
+			return d
+		}
+	}
+	// Fall back: vary the first byte while keeping the rest stable
+	// to widen the search space without leaving the hex alphabet.
+	for i := 0; i < 256; i++ {
+		hi := "0123456789abcdef"[i%16]
+		lo := "0123456789abcdef"[(i/16)%16]
+		body := rep('a', 62)
+		d := digest.MustParse("sha256:" + string(hi) + string(lo) + body)
+		top := hrw.TopK(nodes, d, k)
+		if len(top) > 0 && top[0].Node.ID == self {
+			return d
+		}
+	}
+	t.Fatalf("no digest found where self=%s ranks 0 in top-K=%d", self, k)
+	return digest.Digest{}
+}
+
+// programPeerIntentsByRank programs every node in top other than self
+// with a PullIntent whose RecipientRank reflects its actual position
+// in top. Tests use this so lowestRankReachable picks self (rank 0)
+// unambiguously instead of tying with peers whose default rank=0
+// from a zero-valued PullIntent.
+func programPeerIntentsByRank(coord *stubCoord, top []hrw.Scored, self ifaces.NodeID) {
+	if coord.intents == nil {
+		coord.intents = map[ifaces.NodeID]ifaces.PullIntent{}
+	}
+	for i, s := range top {
+		if s.Node.ID == self {
+			continue
+		}
+		coord.intents[s.Node.ID] = ifaces.PullIntent{RecipientRank: int32(i)}
+	}
+}
+
+// TestSelfIsRank0_UsesLocalPullNotRPC asserts that when self is the
+// HRW-designated puller (rank 0 in top-K) and no peer reports cache /
+// in-flight, rule 7 invokes the LocalPullStarter rather than dialing
+// Coord.PleasePull(self, ...). This is the canonical regression
+// case from sixth code review #1: pre-fix, the resolver excluded
+// self and dispatched please_pull to rank 1.
+func TestSelfIsRank0_UsesLocalPullNotRPC(t *testing.T) {
+	nodes := clusterNodes()
+	self := ifaces.NodeID("n2") // pick any, the helper finds a digest
+	d := findDigestWhereSelfIsRank0(t, nodes, self, 3)
+	top := hrw.TopK(nodes, d, 3)
+
+	// Every other top-K member reports rule-7 (cold start) intent
+	// with its true rank so lowestRankReachable picks self (rank 0)
+	// unambiguously.
+	coord := &stubCoord{}
+	programPeerIntentsByRank(coord, top, self)
+	// Discovery: DHT empty on first call (rule 2 false-empty cross
+	// check), then non-empty after the local pull "lands" so pollDHT
+	// terminates.
+	disco := &stubDisco{
+		providers: [][]ifaces.Provider{
+			nil,
+			{{NodeID: self, Addr: "local:5001"}},
+		},
+	}
+	li := &stubLocalIntent{intent: ifaces.PullIntent{}} // empty — rule 7
+	lp := &stubLocalPull{}
+
+	mems := fakes.NewMembers(self, nodes...)
+	infl := inflight.New(inflight.DefaultStalls(), time.Now)
+	r := coldstart.New(coldstart.Options{
+		Members:              mems,
+		Discovery:            disco,
+		Coord:                coord,
+		Inflight:             infl,
+		LocalIntent:          li,
+		LocalPull:            lp,
+		HrwK:                 3,
+		HrwScope:             hrw.ScopeCluster,
+		Now:                  time.Now,
+		QueryTimeout:         200 * time.Millisecond,
+		PollManifest:         20 * time.Millisecond,
+		PollLayer:            50 * time.Millisecond,
+		TransientCooldownCap: 30 * time.Second,
+	})
+
+	res, err := r.Resolve(context.Background(), d, ifaces.KindManifest, "reg.example.com", "test/repo", 0)
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if len(res.Providers) == 0 {
+		t.Fatal("Providers empty after rule 7 self-pull")
+	}
+	// Invariant A: no remote PleasePull dial — rule 7 routed locally.
+	if len(coord.pleasePullCalls) != 0 {
+		t.Errorf("Coord.PleasePull dialed %d times, want 0; ids=%v", len(coord.pleasePullCalls), coord.pleasePullCalls)
+	}
+	// Invariant B: local pump invoked exactly once with the right
+	// digest and registry/repository.
+	lp.mu.Lock()
+	defer lp.mu.Unlock()
+	if len(lp.digests) != 1 {
+		t.Fatalf("StartLocalPull invocations = %d; want 1", len(lp.digests))
+	}
+	if len(lp.digests[0]) != 1 || lp.digests[0][0] != d {
+		t.Errorf("StartLocalPull digests = %v; want [%s]", lp.digests[0], d)
+	}
+	if lp.registry[0] != "reg.example.com" || lp.repo[0] != "test/repo" {
+		t.Errorf("StartLocalPull addr = %s/%s; want reg.example.com/test/repo", lp.registry[0], lp.repo[0])
+	}
+	// Invariant C: LocalPullIntent was consulted at least once — the
+	// synthetic self-response is what made rule 7 pick self.
+	li.mu.Lock()
+	calls := li.calls
+	li.mu.Unlock()
+	if calls < 1 {
+		t.Errorf("LocalPullIntent calls = %d; want >= 1", calls)
+	}
+}
+
+// TestSelfIsRank0_NoLocalPull_FallsBackToRPC asserts back-compat:
+// when LocalPull is nil but LocalIntent is set, rule 7 falls back to
+// Coord.PleasePull(self) rather than crashing. New deployments wire
+// both; existing tests that set neither still bypass self entirely.
+func TestSelfIsRank0_NoLocalPull_FallsBackToRPC(t *testing.T) {
+	nodes := clusterNodes()
+	self := ifaces.NodeID("n0")
+	d := findDigestWhereSelfIsRank0(t, nodes, self, 3)
+	top := hrw.TopK(nodes, d, 3)
+
+	coord := &stubCoord{}
+	programPeerIntentsByRank(coord, top, self)
+	disco := &stubDisco{
+		providers: [][]ifaces.Provider{
+			nil,
+			{{NodeID: self, Addr: "local:5001"}},
+		},
+	}
+	li := &stubLocalIntent{intent: ifaces.PullIntent{}}
+
+	mems := fakes.NewMembers(self, nodes...)
+	infl := inflight.New(inflight.DefaultStalls(), time.Now)
+	r := coldstart.New(coldstart.Options{
+		Members:     mems,
+		Discovery:   disco,
+		Coord:       coord,
+		Inflight:    infl,
+		LocalIntent: li,
+		// LocalPull intentionally nil.
+		HrwK:                 3,
+		HrwScope:             hrw.ScopeCluster,
+		Now:                  time.Now,
+		QueryTimeout:         200 * time.Millisecond,
+		PollManifest:         20 * time.Millisecond,
+		PollLayer:            50 * time.Millisecond,
+		TransientCooldownCap: 30 * time.Second,
+	})
+
+	if _, err := r.Resolve(context.Background(), d, ifaces.KindManifest, "reg.example.com", "test/repo", 0); err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	// Coord.PleasePull(self, ...) is the fallback — exactly one call,
+	// to self.
+	if len(coord.pleasePullCalls) != 1 || coord.pleasePullCalls[0] != self {
+		t.Errorf("Coord.PleasePull calls = %v; want [%s]", coord.pleasePullCalls, self)
+	}
+}
+
+// TestConcurrentResolvers_OnlyDesignatedPullerInvoked is the §F1
+// invariant test in cold-start unit form. Two parallel calls to
+// Resolve on the SAME resolver with the SAME digest must converge on
+// exactly one StartLocalPull invocation — the second caller's
+// LocalPullIntent must see the in-flight entry from the first call
+// and piggyback (rule 3) instead of triggering a second origin pull.
+//
+// The single-resolver framing is a unit-test stand-in for "two nodes
+// each running their own resolver" — both nodes share the inflight
+// view via the libp2p coord stream in production, and our
+// LocalIntent (backed by the same inflight map across goroutines)
+// faithfully reproduces that hand-off here.
+func TestConcurrentResolvers_OnlyDesignatedPullerInvoked(t *testing.T) {
+	nodes := clusterNodes()
+	self := ifaces.NodeID("n1")
+	d := findDigestWhereSelfIsRank0(t, nodes, self, 3)
+	top := hrw.TopK(nodes, d, 3)
+
+	coord := &stubCoord{}
+	programPeerIntentsByRank(coord, top, self)
+	disco := &stubDisco{
+		providers: [][]ifaces.Provider{
+			{{NodeID: self, Addr: "local:5001"}},
+		},
+	}
+
+	mems := fakes.NewMembers(self, nodes...)
+	infl := inflight.New(inflight.DefaultStalls(), time.Now)
+
+	// LocalIntent reports in-flight if the inflight map has an entry,
+	// otherwise reports empty. This is what coord.Server's
+	// computeLocalIntent does in production (modulo cache.Has /
+	// secondary.Has, irrelevant here).
+	li := &liFromInflight{infl: infl}
+	// LocalPull stub blocks on a gate AFTER inserting the inflight
+	// entry; the test uses a "started" signal to wait until the
+	// first resolver is actually parked in the pump before launching
+	// the second, eliminating timing flakes under -race.
+	gate := make(chan struct{})
+	started := make(chan struct{}, 1)
+	lp := &gatedLocalPull{infl: infl, gate: gate, started: started}
+
+	r := coldstart.New(coldstart.Options{
+		Members:              mems,
+		Discovery:            disco,
+		Coord:                coord,
+		Inflight:             infl,
+		LocalIntent:          li,
+		LocalPull:            lp,
+		HrwK:                 3,
+		HrwScope:             hrw.ScopeCluster,
+		Now:                  time.Now,
+		QueryTimeout:         200 * time.Millisecond,
+		PollManifest:         20 * time.Millisecond,
+		PollLayer:            50 * time.Millisecond,
+		TransientCooldownCap: 30 * time.Second,
+	})
+
+	var wg sync.WaitGroup
+	errs := make([]error, 2)
+	// Launch G1 first, wait until it reaches the pump (so the
+	// inflight entry is live and observable), then launch G2.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_, err := r.Resolve(context.Background(), d, ifaces.KindManifest, "reg.example.com", "test/repo", 0)
+		errs[0] = err
+	}()
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first resolver never reached StartLocalPull")
+	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_, err := r.Resolve(context.Background(), d, ifaces.KindManifest, "reg.example.com", "test/repo", 0)
+		errs[1] = err
+	}()
+	// Give G2 enough time to reach rule 3 + pollDHT, then unblock
+	// G1's pump.
+	time.Sleep(40 * time.Millisecond)
+	close(gate)
+	wg.Wait()
+
+	for i, e := range errs {
+		if e != nil {
+			t.Errorf("Resolve[%d]: %v", i, e)
+		}
+	}
+	lp.mu.Lock()
+	defer lp.mu.Unlock()
+	// Exactly one local pull: the second resolver must have hit rule
+	// 3 (in-flight) once it saw self's intent reflect the in-flight
+	// entry inserted by the first.
+	if lp.starts != 1 {
+		t.Errorf("StartLocalPull invocations = %d; want 1 (F1 invariant: one origin pull per digest)", lp.starts)
+	}
+	if len(coord.pleasePullCalls) != 0 {
+		t.Errorf("Coord.PleasePull dialed %d times, want 0", len(coord.pleasePullCalls))
+	}
+}
+
+// liFromInflight is a LocalIntentProvider that reports in_flight
+// whenever the shared inflight map has an entry — mirroring the
+// production coord.Server.computeLocalIntent semantics.
+type liFromInflight struct {
+	infl *inflight.Map
+}
+
+func (l *liFromInflight) LocalPullIntent(_ context.Context, d digest.Digest) ifaces.PullIntent {
+	if e, ok := l.infl.LookupForIntent(d); ok {
+		return ifaces.PullIntent{InFlight: true, StartedAt: e.StartedAt}
+	}
+	return ifaces.PullIntent{}
+}
+
+// gatedLocalPull inserts an inflight entry, signals on started, then
+// blocks on gate before returning Started. started lets the test
+// know the resolver is parked in the pump so the second resolver
+// can be launched deterministically.
+type gatedLocalPull struct {
+	infl    *inflight.Map
+	gate    <-chan struct{}
+	started chan<- struct{}
+	mu      sync.Mutex
+	starts  int
+}
+
+func (g *gatedLocalPull) StartLocalPull(ctx context.Context, _, _ string, _ ifaces.OriginRefKind, ds []digest.Digest) ([]ifaces.PleasePullOutcome, error) {
+	g.mu.Lock()
+	g.starts++
+	g.mu.Unlock()
+	out := make([]ifaces.PleasePullOutcome, len(ds))
+	for i, d := range ds {
+		// Insert the in-flight entry BEFORE returning so any
+		// concurrent LocalPullIntent observes us. Map.Start returns
+		// alreadyInFlight=true on the second hit; we don't release
+		// the handle because production wouldn't either until the
+		// pull actually completes.
+		_, e, _ := g.infl.Start(d, ifaces.KindManifest, 0)
+		out[i] = ifaces.PleasePullOutcome{Digest: d, Outcome: ifaces.PleasePullStarted, StartedAt: e.StartedAt}
+	}
+	if g.started != nil {
+		// Non-blocking notify; only the first call matters.
+		select {
+		case g.started <- struct{}{}:
+		default:
+		}
+	}
+	select {
+	case <-g.gate:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	return out, nil
+}
