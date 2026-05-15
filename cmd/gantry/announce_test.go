@@ -213,11 +213,14 @@ func TestIsProductionMode(t *testing.T) {
 }
 
 // selfAnnounceRequiredForReadiness must be true exactly when the
-// agent is in production mode, has a PodName (so AnnounceSelf has
-// anything to patch), AND no static bootstrap peers are configured.
-// A misclassification either lets a broken-RBAC pod report Ready
-// silently isolated (the bug this gate fixes), or stalls rollouts
-// when static peers would have seeded the DHT anyway.
+// agent is in production mode AND has a PodName (so AnnounceSelf
+// has something to patch). Static bootstrap peers DO NOT bypass
+// the gate: they solve DHT seeding, not the K8s-node-name → libp2p
+// peer-ID mapping that ships through the gantry.io/peer-id pod
+// annotation. A pod that boots, completes DHT bootstrap via static
+// peers, but fails to publish its own peer-id annotation would be
+// listed in HRW membership under a node name no other agent can
+// translate to a dialable peer ID — every cold-start RPC to it 503s.
 func TestSelfAnnounceRequiredForReadiness(t *testing.T) {
 	cases := []struct {
 		name string
@@ -230,7 +233,7 @@ func TestSelfAnnounceRequiredForReadiness(t *testing.T) {
 			want: false,
 		},
 		{
-			name: "prod mode with PodName and no static peers requires it",
+			name: "prod mode with PodName requires it",
 			c: &config.Config{
 				NodeName: "node-1",
 				PodName:  "gantry-abc",
@@ -238,13 +241,13 @@ func TestSelfAnnounceRequiredForReadiness(t *testing.T) {
 			want: true,
 		},
 		{
-			name: "prod mode with static bootstrap peers bypasses gate",
+			name: "prod mode with static bootstrap peers still requires it (annotations are independent of DHT seeding)",
 			c: &config.Config{
 				NodeName:             "node-1",
 				PodName:              "gantry-abc",
 				Libp2pBootstrapPeers: []string{"/ip4/10.0.0.1/tcp/4001/p2p/Qm..."},
 			},
-			want: false,
+			want: true,
 		},
 		{
 			name: "prod mode without PodName cannot self-announce, so no gate",

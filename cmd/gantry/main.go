@@ -979,14 +979,37 @@ func isProductionMode(c *config.Config) bool {
 // selfAnnounceRequiredForReadiness reports whether a successful
 // pods/patch self-announce must precede the agent reporting Ready.
 // True when production-mode K8s membership is wired AND the agent
-// has its own pod name AND no static bootstrap peers are configured.
-// Static-bootstrap deployments are exempt because operator-supplied
-// peers seed the routing table regardless of our annotation; without
-// static peers, the annotation is the *only* path other agents have
-// to discover us, so a stuck pods/patch RBAC must surface as a
-// stalled rollout instead of a silently-isolated agent.
+// has its own pod name.
+//
+// Static-bootstrap peers do NOT bypass this gate. Bootstrap peers
+// solve *DHT seeding* — they help kademlia discover other peers'
+// addresses. They do not solve the membership-ID → libp2p peer-ID
+// mapping problem.
+//
+// In Kubernetes mode each pod's K8s node name (e.g. "ip-10-0-0-7")
+// is its membership identity. The peer-ID (e.g. "12D3Koo…"), the
+// p2p multiaddrs, and the transfer-port hostport are published on
+// the agent's own pod via three annotations:
+//
+//	gantry.io/peer-id
+//	gantry.io/p2p-addrs
+//	gantry.io/transfer-addr
+//
+// Other agents read those annotations off the pod-informer cache to
+// translate a node-name membership entry into the libp2p
+// peer-ID/addr pair that Coord.PleasePull / PullIntentQuery actually
+// dial. If the agent never publishes them — because pods/patch RBAC
+// is broken, or the apiserver is unreachable on first attempt and
+// we never retry — other agents see the K8s node name in HRW
+// membership, fail to translate it, and cold-start RPCs to this
+// node 503 silently. Static bootstrap peers cannot rescue that
+// case: they are unrelated to per-pod annotation publication.
+//
+// PodName is still part of the gate because without it
+// AnnounceSelf has nothing to patch — that is the dev-mode /
+// docker-run scenario where K8s membership isn't expected anyway.
 func selfAnnounceRequiredForReadiness(c *config.Config) bool {
-	return isProductionMode(c) && c.PodName != "" && len(c.Libp2pBootstrapPeers) == 0
+	return isProductionMode(c) && c.PodName != ""
 }
 
 // buildMembers tries to construct a k8s-informer-backed Members
