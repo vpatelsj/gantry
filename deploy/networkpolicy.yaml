@@ -13,13 +13,16 @@
 # endpoint is loopback-only), the in-pod listener binds 0.0.0.0:5000
 # and the kubelet's portmap/iptables DNAT rewrites incoming traffic
 # from `127.0.0.1:5000` on the node to `<podIP>:5000` in the pod's
-# network namespace. The source address the pod observes is the
-# node's IP (the source NAT happens for return-path SNAT, not
-# ingress), so a default-deny NetworkPolicy with no rule for 5000
-# drops the DNATed mirror traffic entirely — containerd then sees
-# connection-refused on every pull. We therefore explicitly allow
-# TCP/5000 from the node CIDR (operator-edit; the same 0.0.0.0/0
-# kubelet-permissive default used by the metrics rule applies).
+# network namespace. The source address the pod observes depends on
+# the CNI's hostPort SNAT behaviour, so a default-deny NetworkPolicy
+# with no rule for 5000 drops the DNATed mirror traffic entirely —
+# containerd then sees connection-refused on every pull. We allow
+# TCP/5000 from a deliberately-narrow placeholder ipBlock
+# (127.0.0.1/32) and require operators to widen to their node CIDR
+# explicitly. Shipping 0.0.0.0/0 here would allow any pod-network or
+# external source that reaches the pod IP to hit the mirror, which
+# defeats the hostIP: 127.0.0.1 loopback-only intent of the
+# DaemonSet binding.
 #
 # Requires a CNI that enforces NetworkPolicy (Calico, Cilium, etc.).
 apiVersion: networking.k8s.io/v1
@@ -80,22 +83,33 @@ spec:
           port: 9095
     # Mirror endpoint (5000) exposed via DaemonSet hostPort with
     # hostIP: 127.0.0.1. After kubelet/portmap DNAT, the in-pod
-    # listener sees source = node IP and destination = <podIP>:5000.
-    # Without this rule, default-deny drops the DNATed mirror
-    # traffic and containerd gets connection-refused on every pull.
+    # listener observes source = node IP (most CNIs SNAT hostPort
+    # for return-path routing) or source = 127.0.0.1 (CNIs that
+    # rely on conntrack to preserve the original). Without this
+    # rule, default-deny drops the DNATed mirror traffic and
+    # containerd gets connection-refused on every pull.
     #
-    # ipBlock 0.0.0.0/0 matches the kubelet-permissive default used
-    # by the 9095 metrics rule. Operators should tighten it to the
-    # actual node CIDR:
-    #   kubectl get nodes -o jsonpath='{.items[*].status.addresses[?(@.type=="InternalIP")].address}'
-    # In particular this rule MUST NOT widen the policy to allow
-    # pod-network access to 5000 (which would bypass the
-    # hostIP: 127.0.0.1 binding's whole reason for existing);
-    # tightening to the node CIDR preserves the loopback-only
-    # invariant the daemonset.yaml comment claims.
+    # ─────────────────────────────────────────────────────────────
+    # OPERATOR ACTION REQUIRED — DO NOT SHIP WITH THE 127.0.0.1/32
+    # PLACEHOLDER ALONE. Replace `cidr` below with your cluster's
+    # actual node CIDR(s). The default of 127.0.0.1/32 works only
+    # on CNIs whose portmap chain preserves the original loopback
+    # source IP (rare); on Calico, Cilium, and most managed CNIs
+    # the source-IP after hostPort DNAT is the node IP, and 5000
+    # will appear connection-refused to containerd until this is
+    # set to the node CIDR. To discover the right value:
+    #
+    #   kubectl get nodes -o jsonpath='{range .items[*]}{.status.addresses[?(@.type=="InternalIP")].address}{"\n"}{end}'
+    #
+    # Then write a CIDR that covers all of those addresses, e.g.
+    # 10.0.0.0/16 for a private VPC, 192.168.1.0/24 for a homelab.
+    # MUST NOT be widened to the pod-network CIDR: that bypasses
+    # the hostIP: 127.0.0.1 binding's whole reason for existing
+    # (containerd should be the only client, never another pod).
+    # ─────────────────────────────────────────────────────────────
     - from:
         - ipBlock:
-            cidr: 0.0.0.0/0
+            cidr: 127.0.0.1/32
       ports:
         - protocol: TCP
           port: 5000
