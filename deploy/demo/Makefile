@@ -65,6 +65,22 @@ harness-baseline:
 	set +a; \
 	cd harness && DEMO_RUN_LIVE=1 go test -tags=demo -run TestPhaseBaseline -timeout=90m ./...
 
+.PHONY: harness-gantry-cold
+harness-gantry-cold:
+	set -a; \
+	[ ! -f $(INFRA_DIR)/.state.env ] || . $(INFRA_DIR)/.state.env; \
+	[ ! -f $(ENV_FILE) ] || . $(ENV_FILE); \
+	set +a; \
+	cd harness && DEMO_RUN_LIVE=1 go test -tags=demo -run TestPhaseGantryCold -timeout=90m -v ./...
+
+.PHONY: harness-gantry-warm
+harness-gantry-warm:
+	set -a; \
+	[ ! -f $(INFRA_DIR)/.state.env ] || . $(INFRA_DIR)/.state.env; \
+	[ ! -f $(ENV_FILE) ] || . $(ENV_FILE); \
+	set +a; \
+	cd harness && DEMO_RUN_LIVE=1 DEMO_ALLOW_CONTENT_PURGE=1 go test -tags=demo -run TestPhaseGantryWarm -timeout=90m -v ./...
+
 # ---- greenfield Azure infra ------------------------------------------------
 
 .PHONY: infra-provision
@@ -83,6 +99,10 @@ infra-monitoring:
 infra-proxy:
 	$(INFRA_DIR)/40-deploy-proxy-spike.sh $(ENV_FILE)
 
+.PHONY: infra-gantry
+infra-gantry:
+	$(INFRA_DIR)/41-deploy-gantry.sh $(ENV_FILE)
+
 .PHONY: infra-smoke
 infra-smoke:
 	$(INFRA_DIR)/50-smoke-proxy-auth.sh $(ENV_FILE)
@@ -98,6 +118,14 @@ infra-hosts-baseline:
 .PHONY: infra-hosts-gantry
 infra-hosts-gantry:
 	$(INFRA_DIR)/70-install-hosts-toml.sh $(ENV_FILE) gantry
+
+.PHONY: infra-grafana-dashboard
+infra-grafana-dashboard:
+	$(INFRA_DIR)/80-install-grafana-dashboard.sh $(ENV_FILE)
+
+.PHONY: infra-purge-cache
+infra-purge-cache:
+	$(INFRA_DIR)/85-purge-containerd-cache.sh $(ENV_FILE) $(PURGE_IMAGE_REF)
 
 .PHONY: infra-destroy
 infra-destroy:

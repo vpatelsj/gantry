@@ -1,0 +1,113 @@
+# Demo-only privileged DaemonSet that purges containerd's content store
+# on every node. Renders @@DIGESTS@@ as a newline-separated list of
+# sha256:<hex> entries; the container removes them via `ctr -n k8s.io
+# content rm` and emits a per-node JSON report containing every digest
+# that was checked, whether it was found, whether it was removed, and
+# any error.
+#
+# Render @@GANTRY_DEMO_NAMESPACE@@ and @@DIGESTS@@ before applying.
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: cache-purge
+  namespace: @@GANTRY_DEMO_NAMESPACE@@
+  labels:
+    app.kubernetes.io/name: cache-purge
+    app.kubernetes.io/component: node-config
+    app.kubernetes.io/part-of: gantry-demo
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: cache-purge
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 50%
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: cache-purge
+        app.kubernetes.io/component: node-config
+        app.kubernetes.io/part-of: gantry-demo
+    spec:
+      hostPID: true
+      hostNetwork: false
+      tolerations:
+        - operator: Exists
+      terminationGracePeriodSeconds: 5
+      containers:
+        - name: purge
+          image: alpine:3.20
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: HOLD_SECONDS
+              value: "3600"
+          command:
+            - sh
+            - -ceu
+            - |
+              apk add --no-cache jq curl >/dev/null
+              # ctr is provided by the host containerd; rather than
+              # ship a containerd binary, exec it via nsenter into PID 1.
+              # PrivilegedContainer + hostPID are required.
+              run_ctr() {
+                nsenter -t 1 -m -u -i -n -p ctr -n k8s.io "$@"
+              }
+              digests_file=/cfg/digests
+              report=$(mktemp)
+              host=$(hostname)
+              echo "{ \"node\": \"${host}\", \"digests\": [" >"${report}"
+              first=1
+              while IFS= read -r digest; do
+                [ -z "${digest}" ] && continue
+                found="false"; removed="false"; err_msg=""
+                if run_ctr content ls 2>/dev/null | awk '{print $1}' | grep -qx "${digest}"; then
+                  found="true"
+                  if run_ctr content rm "${digest}" 2>/tmp/ctr.err; then
+                    removed="true"
+                  else
+                    err_msg=$(tr -d '\n' </tmp/ctr.err | head -c 240)
+                  fi
+                fi
+                [ "${first}" -eq 1 ] || echo "," >>"${report}"
+                first=0
+                printf '  { "digest": "%s", "found": %s, "removed": %s, "error": "%s" }\n' \
+                  "${digest}" "${found}" "${removed}" "${err_msg}" >>"${report}"
+              done <"${digests_file}"
+              echo "]}" >>"${report}"
+
+              # Compact + emit final report on stdout for collection via kubectl logs.
+              jq -c . "${report}"
+
+              # Verification pass: any surviving digests after the prune?
+              survivors=0
+              while IFS= read -r digest; do
+                [ -z "${digest}" ] && continue
+                if run_ctr content ls 2>/dev/null | awk '{print $1}' | grep -qx "${digest}"; then
+                  survivors=$((survivors+1))
+                  echo "SURVIVOR: ${digest}" >&2
+                fi
+              done <"${digests_file}"
+              echo "{\"node\":\"${host}\",\"survivors\":${survivors}}"
+
+              sleep "${HOLD_SECONDS}"
+          securityContext:
+            privileged: true
+            runAsUser: 0
+            runAsGroup: 0
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          volumeMounts:
+            - name: digests
+              mountPath: /cfg
+              readOnly: true
+      volumes:
+        - name: digests
+          configMap:
+            name: cache-purge-digests

@@ -28,8 +28,10 @@ the entire demo** with no residual state in the rest of the repo.
 | `hosts.toml.gantry.template`                        | 3               | implemented |
 | `hosts-toml-installer.yaml`                         | 3               | implemented |
 | `configmap.gantry-demo.yaml`                        | 3               | implemented |
-| `harness/`                                          | 4–8             | step 4 skeleton implemented |
-| `grafana-dashboard.json`                            | 9               | not implemented yet |
+| `harness/`                                          | 4–8             | step 4 skeleton + baseline / gantry-cold / gantry-warm phases implemented |
+| `cache-purge-daemonset.yaml`                        | 7               | implemented |
+| `RUNBOOK.md`                                        | 11              | implemented |
+| `grafana-dashboard.json`                            | 9               | implemented |
 
 ## Usage
 

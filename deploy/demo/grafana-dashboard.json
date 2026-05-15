@@ -1,0 +1,410 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {"type": "datasource", "uid": "grafana"},
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "liveNow": false,
+  "panels": [
+    {
+      "collapsed": false,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 0},
+      "id": 100,
+      "title": "Row 1 — Origin proxy (headline)",
+      "type": "row"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {"drawStyle": "line", "lineWidth": 2, "fillOpacity": 10, "stacking": {"mode": "none"}},
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 1},
+      "id": 1,
+      "options": {"legend": {"displayMode": "table", "placement": "right", "calcs": ["last", "max"]}, "tooltip": {"mode": "multi"}},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "sum by (path_class) (rate(origin_requests_completed_total[1m]))",
+          "legendFormat": "{{path_class}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Origin completed requests/sec by path_class",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {"drawStyle": "line", "lineWidth": 2, "fillOpacity": 10, "stacking": {"mode": "none"}},
+          "unit": "Bps"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 1},
+      "id": 2,
+      "options": {"legend": {"displayMode": "table", "placement": "right", "calcs": ["last", "max"]}, "tooltip": {"mode": "multi"}},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "sum by (path_class) (rate(origin_bytes_to_client_total[1m]))",
+          "legendFormat": "{{path_class}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Origin bytes-to-client/sec by path_class",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]},
+          "unit": "short"
+        }
+      },
+      "gridPos": {"h": 6, "w": 6, "x": 0, "y": 9},
+      "id": 3,
+      "options": {"colorMode": "value", "graphMode": "area", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "sum(origin_requests_completed_total{path_class=~\"blob|manifest_by_digest\"})",
+          "refId": "A"
+        }
+      ],
+      "title": "Cumulative digest requests (blob + manifest_by_digest)",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]},
+          "unit": "decbytes"
+        }
+      },
+      "gridPos": {"h": 6, "w": 6, "x": 6, "y": 9},
+      "id": 4,
+      "options": {"colorMode": "value", "graphMode": "area", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "sum(origin_bytes_to_client_total{path_class=~\"blob|manifest_by_digest\"})",
+          "refId": "A"
+        }
+      ],
+      "title": "Cumulative digest bytes (blob + manifest_by_digest)",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "thresholds": {"mode": "absolute", "steps": [{"color": "blue", "value": null}]},
+          "unit": "short"
+        }
+      },
+      "gridPos": {"h": 6, "w": 6, "x": 12, "y": 9},
+      "id": 5,
+      "options": {"colorMode": "value", "graphMode": "area", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "sum(origin_requests_completed_total{path_class=\"manifest_by_tag\"})",
+          "refId": "A"
+        }
+      ],
+      "title": "Tag requests (informational; expected nonzero in every phase)",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "thresholds": {"mode": "absolute", "steps": [{"color": "yellow", "value": null}, {"color": "red", "value": 1}]},
+          "unit": "short"
+        }
+      },
+      "gridPos": {"h": 6, "w": 6, "x": 18, "y": 9},
+      "id": 6,
+      "options": {"colorMode": "value", "graphMode": "area", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "sum(origin_synthetic_throttle_total)",
+          "refId": "A"
+        }
+      ],
+      "title": "Synthetic 429 count (only nonzero when §7 enabled)",
+      "type": "stat"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 15},
+      "id": 200,
+      "title": "Row 2 — Gantry",
+      "type": "row"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {
+        "defaults": {"color": {"mode": "palette-classic"}, "custom": {"drawStyle": "line", "lineWidth": 2, "fillOpacity": 10}, "unit": "reqps"}
+      },
+      "gridPos": {"h": 7, "w": 8, "x": 0, "y": 16},
+      "id": 7,
+      "options": {"legend": {"displayMode": "table", "placement": "right", "calcs": ["last"]}, "tooltip": {"mode": "multi"}},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "rate(p2p_origin_pull_total[1m])",
+          "legendFormat": "origin pulls",
+          "refId": "A"
+        }
+      ],
+      "title": "p2p_origin_pull_total /s",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {
+        "defaults": {"color": {"mode": "palette-classic"}, "custom": {"drawStyle": "line", "lineWidth": 2, "fillOpacity": 10}, "unit": "reqps"}
+      },
+      "gridPos": {"h": 7, "w": 8, "x": 8, "y": 16},
+      "id": 8,
+      "options": {"legend": {"displayMode": "table", "placement": "right", "calcs": ["last"]}, "tooltip": {"mode": "multi"}},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "sum by (outcome) (rate(p2p_peer_fetch_total[1m]))",
+          "legendFormat": "{{outcome}}",
+          "refId": "A"
+        }
+      ],
+      "title": "p2p_peer_fetch_total /s by outcome",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {
+        "defaults": {"color": {"mode": "palette-classic"}, "custom": {"drawStyle": "line", "lineWidth": 2, "fillOpacity": 10}, "unit": "reqps"}
+      },
+      "gridPos": {"h": 7, "w": 4, "x": 16, "y": 16},
+      "id": 9,
+      "options": {"legend": {"displayMode": "list", "placement": "bottom"}, "tooltip": {"mode": "multi"}},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "rate(p2p_cache_hit_total[1m])",
+          "legendFormat": "cache hits",
+          "refId": "A"
+        }
+      ],
+      "title": "p2p_cache_hit_total /s",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "thresholds": {"mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "yellow", "value": 0.5}, {"color": "green", "value": 0.7}]},
+          "max": 1,
+          "min": 0,
+          "unit": "percentunit"
+        }
+      },
+      "gridPos": {"h": 7, "w": 4, "x": 20, "y": 16},
+      "id": 10,
+      "options": {"orientation": "horizontal", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "showThresholdLabels": false, "showThresholdMarkers": true},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "p2p_dht_health_score",
+          "refId": "A"
+        }
+      ],
+      "title": "p2p_dht_health_score",
+      "type": "gauge"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 23},
+      "id": 300,
+      "title": "Row 3 — Rollout (secondary)",
+      "type": "row"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {
+        "defaults": {"color": {"mode": "palette-classic"}, "custom": {"drawStyle": "line", "lineWidth": 2, "fillOpacity": 10}, "unit": "short"}
+      },
+      "gridPos": {"h": 7, "w": 12, "x": 0, "y": 24},
+      "id": 11,
+      "options": {"legend": {"displayMode": "table", "placement": "right", "calcs": ["last"]}, "tooltip": {"mode": "multi"}},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "sum by (label_gantry_demo_run_label) (kube_pod_status_phase{namespace=\"default\",phase=\"Succeeded\"} * on(namespace,pod) group_left(label_gantry_demo_run_label) kube_pod_labels{label_app_kubernetes_io_name=\"gantry-demo-pull\"})",
+          "legendFormat": "{{label_gantry_demo_run_label}} succeeded",
+          "refId": "A"
+        }
+      ],
+      "title": "Pods completed by phase (label gantry.demo/run-label)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {
+        "defaults": {"color": {"mode": "palette-classic"}, "custom": {"drawStyle": "line", "lineWidth": 2, "fillOpacity": 10}, "unit": "s"}
+      },
+      "gridPos": {"h": 7, "w": 12, "x": 12, "y": 24},
+      "id": 12,
+      "options": {"legend": {"displayMode": "table", "placement": "right", "calcs": ["last"]}, "tooltip": {"mode": "multi"}},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(origin_latency_seconds_bucket[5m])))",
+          "legendFormat": "P50",
+          "refId": "A"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(origin_latency_seconds_bucket[5m])))",
+          "legendFormat": "P95",
+          "refId": "B"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "histogram_quantile(1.00, sum by (le) (rate(origin_latency_seconds_bucket[5m])))",
+          "legendFormat": "P100",
+          "refId": "C"
+        }
+      ],
+      "title": "Origin latency P50/P95/P100 (proxy-side; pod-start CSV pending §5.1)",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 31},
+      "id": 400,
+      "title": "Row 4 — Cost / overhead",
+      "type": "row"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {
+        "defaults": {"color": {"mode": "palette-classic"}, "custom": {"drawStyle": "line", "lineWidth": 2, "fillOpacity": 10}, "unit": "percentunit"}
+      },
+      "gridPos": {"h": 7, "w": 6, "x": 0, "y": 32},
+      "id": 13,
+      "options": {"legend": {"displayMode": "list", "placement": "bottom"}, "tooltip": {"mode": "multi"}},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "sum by (pod) (rate(container_cpu_usage_seconds_total{namespace=\"gantry-demo\",pod=~\"acr-origin-proxy-.*\",container!=\"\"}[1m]))",
+          "legendFormat": "{{pod}} cpu cores",
+          "refId": "A"
+        }
+      ],
+      "title": "Proxy CPU (cores)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {
+        "defaults": {"color": {"mode": "palette-classic"}, "custom": {"drawStyle": "line", "lineWidth": 2, "fillOpacity": 10}, "unit": "Bps"}
+      },
+      "gridPos": {"h": 7, "w": 6, "x": 6, "y": 32},
+      "id": 14,
+      "options": {"legend": {"displayMode": "list", "placement": "bottom"}, "tooltip": {"mode": "multi"}},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "sum by (pod) (rate(container_network_receive_bytes_total{namespace=\"gantry-demo\",pod=~\"acr-origin-proxy-.*\"}[1m]))",
+          "legendFormat": "{{pod}} rx",
+          "refId": "A"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "sum by (pod) (rate(container_network_transmit_bytes_total{namespace=\"gantry-demo\",pod=~\"acr-origin-proxy-.*\"}[1m]))",
+          "legendFormat": "{{pod}} tx",
+          "refId": "B"
+        }
+      ],
+      "title": "Proxy network rx/tx",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {
+        "defaults": {"color": {"mode": "palette-classic"}, "custom": {"drawStyle": "line", "lineWidth": 2, "fillOpacity": 10}, "unit": "short"}
+      },
+      "gridPos": {"h": 7, "w": 6, "x": 12, "y": 32},
+      "id": 15,
+      "options": {"legend": {"displayMode": "table", "placement": "right", "calcs": ["last", "max"]}, "tooltip": {"mode": "multi"}},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "sum by (path_class) (origin_inflight_requests)",
+          "legendFormat": "{{path_class}}",
+          "refId": "A"
+        }
+      ],
+      "title": "origin_inflight_requests by path_class",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {
+        "defaults": {"color": {"mode": "palette-classic"}, "custom": {"drawStyle": "line", "lineWidth": 2, "fillOpacity": 10}, "unit": "decbytes"}
+      },
+      "gridPos": {"h": 7, "w": 6, "x": 18, "y": 32},
+      "id": 16,
+      "options": {"legend": {"displayMode": "list", "placement": "bottom"}, "tooltip": {"mode": "multi"}},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "sum by (pod) (container_memory_working_set_bytes{namespace=\"gantry-system\",pod=~\"gantry-.*\",container!=\"\"})",
+          "legendFormat": "{{pod}} mem",
+          "refId": "A"
+        }
+      ],
+      "title": "Gantry memory (cAdvisor; only when Gantry is deployed)",
+      "type": "timeseries"
+    }
+  ],
+  "refresh": "10s",
+  "schemaVersion": 38,
+  "style": "dark",
+  "tags": ["gantry", "demo", "acr"],
+  "templating": {"list": []},
+  "time": {"from": "now-30m", "to": "now"},
+  "timepicker": {},
+  "timezone": "",
+  "title": "Gantry ACR demo",
+  "uid": "gantry-acr-demo",
+  "version": 1,
+  "weekStart": ""
+}
