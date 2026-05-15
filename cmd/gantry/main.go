@@ -1285,16 +1285,24 @@ func bootstrapPeerAddrs(mgr *members.Manager) []string {
 
 // rewriteWildcardMultiaddr returns ma with any wildcard IP component
 // (/ip4/0.0.0.0 or /ip6/::) replaced by /ip4/<podIP> or /ip6/<podIP>
-// depending on the family of podIP. Non-wildcard multiaddrs are
-// returned unchanged. Returns "" when the address is a wildcard and
-// no usable pod IP is available (signal to the caller to skip
-// publishing this entry).
+// of the *same family* as the wildcard. Non-wildcard multiaddrs are
+// returned unchanged. Returns "" when:
 //
-// IPv6 dual-stack handling: an IPv6 Pod IP must be advertised under
-// the /ip6/ multiaddr family, not /ip4/, otherwise libp2p rejects the
-// multiaddr at dial time and the bootstrap pool contains no usable
-// entry for v6-only clusters. We parse the Pod IP and pick the
-// matching family explicitly.
+//   - the multiaddr is a wildcard and no usable pod IP is available;
+//   - the multiaddr is a wildcard and the pod IP belongs to the
+//     opposite family (e.g. /ip4/0.0.0.0 with a v6 pod IP).
+//
+// The cross-family skip is critical: the wildcard family reflects
+// the family the libp2p host is actually listening on. Silently
+// rewriting /ip4/0.0.0.0 → /ip6/<podIP> would publish an
+// announcement pointing at an address the kernel has no socket bound
+// to; peers dial it and get connection-refused. The caller drops
+// empty strings from the published p2p_addrs set, so dual-stack
+// pods that only have a v6 Pod IP but only listen on v4 publish no
+// entry for the v4 wildcard at all (preferable to publishing a
+// guaranteed-broken one). Operators on v6-only clusters must
+// configure the listener for /ip6/::/ explicitly via the
+// `libp2p_listen` config knob.
 func rewriteWildcardMultiaddr(ma, podIP string) string {
 	isWildcardV4 := strings.HasPrefix(ma, "/ip4/0.0.0.0/")
 	isWildcardV6 := strings.HasPrefix(ma, "/ip6/::/")
@@ -1308,19 +1316,25 @@ func rewriteWildcardMultiaddr(ma, podIP string) string {
 	if ip == nil {
 		return ""
 	}
+	podIsV4 := ip.To4() != nil
+	// Skip cross-family rewrites — they produce undialable
+	// multiaddrs because the listener is bound to the *wildcard's*
+	// family, not the pod IP's.
+	if isWildcardV4 && !podIsV4 {
+		return ""
+	}
+	if isWildcardV6 && podIsV4 {
+		return ""
+	}
 	var (
 		family string
 		rest   string
 	)
-	switch {
-	case ip.To4() != nil:
+	if podIsV4 {
 		family = "/ip4/" + ip.To4().String()
-	default:
-		family = "/ip6/" + ip.String()
-	}
-	if isWildcardV4 {
 		rest = ma[len("/ip4/0.0.0.0"):]
 	} else {
+		family = "/ip6/" + ip.String()
 		rest = ma[len("/ip6/::"):]
 	}
 	return family + rest

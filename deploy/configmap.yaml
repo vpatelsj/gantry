@@ -31,6 +31,18 @@ data:
     metrics_listen: "0.0.0.0:9095"
 
     # ---------- libp2p ----------
+    # IPv4 wildcard listeners. The pods/patch self-announce only
+    # publishes multiaddrs whose wildcard family matches the Pod IP
+    # family — a /ip4/0.0.0.0 listener with a v6 Pod IP is silently
+    # skipped because the kernel has no v6 socket to dial. For
+    # dual-stack or v6-only clusters, append /ip6/::/ listeners
+    # below; the agent will then publish /ip6/<podIP>/ multiaddrs
+    # too. Example:
+    #   libp2p_listen:
+    #     - "/ip4/0.0.0.0/tcp/4001"
+    #     - "/ip4/0.0.0.0/udp/4001/quic-v1"
+    #     - "/ip6/::/tcp/4001"
+    #     - "/ip6/::/udp/4001/quic-v1"
     libp2p_listen:
       - "/ip4/0.0.0.0/tcp/4001"
       - "/ip4/0.0.0.0/udp/4001/quic-v1"

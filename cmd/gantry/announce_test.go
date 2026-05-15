@@ -34,22 +34,22 @@ func TestRewriteWildcardMultiaddr(t *testing.T) {
 			want:  "",
 		},
 		{
-			name:  "ipv6 wildcard with v4 pod IP rewrites to /ip4/",
-			in:    "/ip6/::/tcp/4001",
-			podIP: "10.42.0.7",
-			want:  "/ip4/10.42.0.7/tcp/4001",
-		},
-		{
 			name:  "ipv6 wildcard with v6 pod IP rewrites to /ip6/",
 			in:    "/ip6/::/tcp/4001",
 			podIP: "fd00:10:244::7",
 			want:  "/ip6/fd00:10:244::7/tcp/4001",
 		},
 		{
-			name:  "ipv4 wildcard with v6 pod IP rewrites to /ip6/",
+			name:  "ipv4 wildcard with v6 pod IP skips (no v6 listener)",
 			in:    "/ip4/0.0.0.0/tcp/4001",
 			podIP: "fd00:10:244::7",
-			want:  "/ip6/fd00:10:244::7/tcp/4001",
+			want:  "",
+		},
+		{
+			name:  "ipv6 wildcard with v4 pod IP skips (no v4 listener under /ip6/)",
+			in:    "/ip6/::/tcp/4001",
+			podIP: "10.42.0.7",
+			want:  "",
 		},
 		{
 			name:  "wildcard with unparseable pod IP returns empty",
