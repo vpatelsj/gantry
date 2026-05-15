@@ -526,6 +526,17 @@ func runAgent(args []string) error {
 		mirror.WithColdStart(coldStartResolver),
 		mirror.WithLayerPrefetcher(layerPrefetcher),
 		mirror.WithNF5(nf5Ctrl),
+		// §Phase 6 startup gate: /v2/ returns 503 until the mirror
+		// is explicitly marked ready below. Without this gate
+		// containerd's hostPort connection lands on the listener the
+		// moment ListenAndServe returns — well before members
+		// informer sync, DHT routing-table convergence, self-
+		// announce, and cache scan complete. Every startup-window
+		// /v2/ pull would race those subsystems and route to origin
+		// instead of through the coordinated cold-start path,
+		// silently breaking the F1 'one origin pull per digest'
+		// invariant for the duration of the rollout window.
+		mirror.WithStartupReadinessGate(),
 	)
 
 	mirrorStop, err := mirrorSrv.ListenAndServe(c.MirrorListen)
@@ -657,6 +668,30 @@ func runAgent(args []string) error {
 		}
 		return "", true
 	}
+
+	// §Phase 6 startup mirror gate: poll readyCheck until it returns
+	// green once, then flip the mirror's startup gate to "serving".
+	// Sticky on the mirror side — a subsequent /readyz flap does not
+	// take the mirror back out of service (Drain handles graceful
+	// shutdown separately). 250ms polling is a tradeoff between
+	// startup latency and CPU; readyCheck is a handful of atomic
+	// loads + one cheap routing-table-size call.
+	go func() {
+		t := time.NewTicker(250 * time.Millisecond)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				if _, ok := readyCheck(); ok {
+					mirrorSrv.MarkReady()
+					logger.Info("mirror: startup gate released; /v2/ now serving")
+					return
+				}
+			}
+		}
+	}()
 
 	// Phase 6 — operations HTTP listener. Per §Phase 6 plan,
 	// /healthz includes liveness + readiness; /livez is the pure

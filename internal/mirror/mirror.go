@@ -91,11 +91,48 @@ type Server struct {
 	// the kernel has already accepted get a 503 instead of normal
 	// handling once Drain() has fired.
 	draining atomic.Bool
+
+	// startupGated, together with `ready`, implements the §Phase 6
+	// startup mirror gate. The mirror's TCP listener accepts traffic
+	// from containerd's hostPort plumbing the moment ListenAndServe
+	// returns — well before /readyz can pass (members informer sync,
+	// DHT routing-table convergence, self-announce patch, cache
+	// scan). Without a handler-level gate, image pulls during the
+	// startup window would race the agent's own bootstrap: the
+	// DHT-empty branch would route to origin instead of to the
+	// coordinated cold-start path, and every restarting pod would
+	// add its own direct origin pulls to the cluster's total. That
+	// silently shreds the F1 invariant for the duration of the
+	// startup window.
+	//
+	// startupGated is set by WithStartupReadinessGate; when set, the
+	// /v2/ handler returns 503 (containerd hosts.toml falls through
+	// to origin for THAT request, exactly the same as the shutdown
+	// drain) until MarkReady() is called. Default-false so existing
+	// test fixtures (which build Server without the option) continue
+	// to serve immediately.
+	startupGated bool
+
+	// ready is a sticky atomic flag: false until MarkReady() is
+	// called once, then true forever. Sticky so a /readyz blip
+	// (e.g. DHT routing table briefly empty during informer churn)
+	// does NOT take the mirror out of service mid-rollout — the
+	// startup gate is a one-shot 'wait for first ready' and Drain
+	// handles graceful shutdown separately.
+	ready atomic.Bool
 }
 
 // Drain flips the mirror into shutdown mode: new /v2/ requests return
 // 503 immediately. Idempotent. Safe to call from a signal handler.
 func (s *Server) Drain() { s.draining.Store(true) }
+
+// MarkReady flips the startup gate from "not yet ready" to "serving"
+// for production deployments that opted into WithStartupReadinessGate.
+// Sticky: subsequent /readyz flaps do NOT take the mirror back out of
+// service — once we have decided to serve we stay serving until Drain.
+// Safe to call multiple times; safe to call from any goroutine. No-op
+// for Servers that did not opt into the startup gate.
+func (s *Server) MarkReady() { s.ready.Store(true) }
 
 type metricsHooks struct {
 	onCacheHit         func()
@@ -244,6 +281,21 @@ func WithLayerPrefetcher(p LayerPrefetcher) Option {
 	return func(s *Server) { s.prefetcher = p }
 }
 
+// WithStartupReadinessGate opts the mirror into the §Phase 6 startup
+// gate: until MarkReady() is called, every /v2/ request returns 503
+// with reason "agent starting up". Production callers should pair
+// this with a goroutine that polls the same conditions /readyz uses
+// and calls MarkReady once they converge — see cmd/gantry/main.go's
+// readyCheck-poller for the canonical wiring.
+//
+// Without this option the Server is "ready immediately" so unit-test
+// fixtures (which never call MarkReady) continue to behave as before.
+// The shutdown drain (Drain / drainGuard) is independent of this
+// gate and always installed.
+func WithStartupReadinessGate() Option {
+	return func(s *Server) { s.startupGated = true }
+}
+
 // New builds a Server bound to the given cache and origin.
 func New(cfg *config.Config, cache ifaces.Cache, origin ifaces.OriginPuller, opts ...Option) *Server {
 	s := &Server{
@@ -258,6 +310,14 @@ func New(cfg *config.Config, cache ifaces.Cache, origin ifaces.OriginPuller, opt
 	if len(cfg.UpstreamRegistries) == 1 {
 		s.defaultUpstream = cfg.UpstreamRegistries[0].Name
 	}
+	// Default ready=true so unit-test fixtures, which never call
+	// MarkReady, continue to serve immediately. Production callers
+	// flip startupGated via WithStartupReadinessGate which forces
+	// ready=false at construction and gates the /v2/ handler until
+	// MarkReady() fires.
+	if !s.startupGated {
+		s.ready.Store(true)
+	}
 	return s
 }
 
@@ -265,8 +325,13 @@ func New(cfg *config.Config, cache ifaces.Cache, origin ifaces.OriginPuller, opt
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", s.handleHealthz)
-	mux.HandleFunc("/v2/", s.drainGuard(s.handleV2))
-	mux.HandleFunc("/v2", s.drainGuard(s.handleV2)) // some clients omit trailing slash
+	// Order matters: drainGuard runs FIRST so shutdown wins over a
+	// concurrent startup transition (we never want to flip from
+	// "starting up" back to serving via a stale MarkReady). The
+	// startupGate runs INSIDE drainGuard so a still-not-ready agent
+	// also returns 503.
+	mux.HandleFunc("/v2/", s.drainGuard(s.startupGate(s.handleV2)))
+	mux.HandleFunc("/v2", s.drainGuard(s.startupGate(s.handleV2))) // some clients omit trailing slash
 	return mux
 }
 
@@ -279,6 +344,26 @@ func (s *Server) drainGuard(h http.HandlerFunc) http.HandlerFunc {
 		if s.draining.Load() {
 			w.Header().Set("Docker-Distribution-API-Version", "registry/2.0")
 			http.Error(w, "agent shutting down", http.StatusServiceUnavailable)
+			return
+		}
+		h(w, r)
+	}
+}
+
+// startupGate returns 503 until MarkReady is called, but only for
+// Servers that opted in via WithStartupReadinessGate. The 503 is
+// load-bearing in exactly the same way Drain's 503 is: containerd's
+// hosts.toml falls through to origin for the un-served request.
+// Without this gate the mirror serves /v2/ traffic the moment
+// ListenAndServe returns, racing the agent's own DHT/members/coord
+// bootstrap and routing every startup-window pull straight to origin
+// outside the coordinated cold-start path.
+func (s *Server) startupGate(h http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !s.ready.Load() {
+			w.Header().Set("Docker-Distribution-API-Version", "registry/2.0")
+			w.Header().Set("Retry-After", "5")
+			http.Error(w, "agent starting up", http.StatusServiceUnavailable)
 			return
 		}
 		h(w, r)
