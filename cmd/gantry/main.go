@@ -524,8 +524,31 @@ func runAgent(args []string) error {
 			func() { p2.cdsubReconnect.Inc() },
 		),
 	)
+	// cdsubDone is buffered so the goroutine can deposit Run's error
+	// without blocking even if no select reads it. We ALSO close the
+	// channel after the send so the second select below (line ~684,
+	// the shutdown drain) returns immediately on every path:
+	//
+	//   - Common case: signal-driven shutdown. ctx is cancelled
+	//     here, cdSub.Run returns, the goroutine sends-then-closes,
+	//     the second select reads the buffered value and proceeds.
+	//   - Rare case: cdsub crashes early. The FIRST select below
+	//     (line ~648) drains the buffered error, then the second
+	//     select arrives at an empty-but-closed channel and reads
+	//     the zero-value immediately, instead of blocking until the
+	//     10s shutdown budget expires and emitting a spurious
+	//     "cdsub did not drain within shutdown budget" warning.
+	//
+	// Closing a buffered channel after a single send is safe: only
+	// this goroutine sends, and it sends exactly once before close.
+	// Receiving from a closed channel is always non-blocking and
+	// always allowed, so multiple consumers (the two selects) are
+	// fine.
 	cdsubDone := make(chan error, 1)
-	go func() { cdsubDone <- cdSub.Run(ctx) }()
+	go func() {
+		cdsubDone <- cdSub.Run(ctx)
+		close(cdsubDone)
+	}()
 
 	// Phase 2 — re-announce every digest currently in the local cache so
 	// peers can discover content held over from a previous boot. Runs in
