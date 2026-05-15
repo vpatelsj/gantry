@@ -273,3 +273,92 @@ func TestParseChallenge(t *testing.T) {
 		t.Errorf("scope = %q", got["scope"])
 	}
 }
+
+// TestPull_StartCallbackFiresOnceBeforeOutcome pins the contract
+// that originated in the tenth review: p2p_origin_pull_total must
+// be incremented exactly once per Pull invocation, regardless of
+// the terminal outcome (success, registry-not-found, 4xx, 5xx,
+// transport error). This is the started == success + failure +
+// in-flight arithmetic identity that the wiring in cmd/gantry
+// relies on so 'origin failure rate' alerts can be computed
+// against a coherent denominator.
+//
+// The mirror direct-origin path and the coordinated please_pull /
+// runOriginPull path both call origin.Client.Pull; counting at
+// Pull's entry means both paths share one source of truth and the
+// counter cannot silently undercount please_pull-coordinated
+// pulls (which used to be the case when the started hook lived on
+// the mirror's WithMetrics).
+func TestPull_StartCallbackFiresOnceBeforeOutcome(t *testing.T) {
+	body := []byte("payload")
+	d := digestOf(body)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v2/r/blobs/", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(body)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	var startKinds, successKinds []string
+	var failureKindClass [][2]string
+	cfg := &config.Config{UpstreamRegistries: []config.UpstreamRegistry{{Name: "reg", Endpoint: srv.URL}}}
+	c, err := New(cfg, WithMetrics(
+		func(kind string, _ int64) { startKinds = append(startKinds, kind) },
+		func(kind string, _ int64) { successKinds = append(successKinds, kind) },
+		func(kind, class string) { failureKindClass = append(failureKindClass, [2]string{kind, class}) },
+	))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	t.Run("success path increments started exactly once with the kind label", func(t *testing.T) {
+		startKinds, successKinds, failureKindClass = nil, nil, nil
+		rc, _, err := c.Pull(context.Background(), ifaces.OriginRef{Registry: "reg", Repository: "r", Digest: d, Kind: ifaces.KindBlob})
+		if err != nil {
+			t.Fatalf("Pull: %v", err)
+		}
+		_, _ = io.Copy(io.Discard, rc)
+		_ = rc.Close()
+		if len(startKinds) != 1 || startKinds[0] != "blob" {
+			t.Fatalf("startKinds = %v, want [blob]", startKinds)
+		}
+		if len(successKinds) != 1 || successKinds[0] != "blob" {
+			t.Fatalf("successKinds = %v, want [blob]", successKinds)
+		}
+		if len(failureKindClass) != 0 {
+			t.Fatalf("failureKindClass = %v, want empty", failureKindClass)
+		}
+	})
+
+	t.Run("unknown registry increments started before the failure", func(t *testing.T) {
+		startKinds, successKinds, failureKindClass = nil, nil, nil
+		_, _, err := c.Pull(context.Background(), ifaces.OriginRef{Registry: "other", Repository: "r", Digest: d, Kind: ifaces.KindManifest})
+		if err == nil {
+			t.Fatalf("Pull: want error, got nil")
+		}
+		if len(startKinds) != 1 || startKinds[0] != "manifest" {
+			t.Fatalf("startKinds = %v, want [manifest] (started must fire even when the registry lookup fails — this is the 'started' chokepoint please_pull relies on)", startKinds)
+		}
+		if len(successKinds) != 0 {
+			t.Fatalf("successKinds = %v, want empty", successKinds)
+		}
+		if len(failureKindClass) != 1 || failureKindClass[0][0] != "manifest" {
+			t.Fatalf("failureKindClass = %v, want one entry with kind=manifest", failureKindClass)
+		}
+	})
+
+	t.Run("config kind label passes through", func(t *testing.T) {
+		startKinds, successKinds, failureKindClass = nil, nil, nil
+		rc, _, err := c.Pull(context.Background(), ifaces.OriginRef{Registry: "reg", Repository: "r", Digest: d, Kind: ifaces.KindConfig})
+		if err != nil {
+			t.Fatalf("Pull: %v", err)
+		}
+		_, _ = io.Copy(io.Discard, rc)
+		_ = rc.Close()
+		if len(startKinds) != 1 || startKinds[0] != "config" {
+			t.Fatalf("startKinds = %v, want [config] (KindConfig must surface as a distinct 'kind' label all the way through origin.WithMetrics so the started counter agrees with the per-kind success/failure breakdown)", startKinds)
+		}
+	})
+}

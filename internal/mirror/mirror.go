@@ -137,7 +137,6 @@ func (s *Server) MarkReady() { s.ready.Store(true) }
 type metricsHooks struct {
 	onCacheHit         func()
 	onCacheMiss        func()
-	onOriginPull       func(kind string)
 	onOriginFailure    func(class string)
 	onPeerFetch        func(outcome string)
 	onPeerFetchLatency func(outcome string, d time.Duration)
@@ -158,12 +157,20 @@ func WithLogger(l *slog.Logger) Option {
 	}
 }
 
-// WithMetrics registers metric callbacks.
-func WithMetrics(cacheHit, cacheMiss func(), originPull func(kind string), originFailure func(class string)) Option {
+// WithMetrics registers metric callbacks for cache hit, cache miss,
+// and origin failure observed by the mirror. The origin-pull-started
+// counter is intentionally NOT plumbed here — it is owned by
+// origin.WithMetrics in the origin Client, which is the single
+// chokepoint every origin pull goes through (both the mirror's
+// direct-origin fallback below AND the coordinated please_pull /
+// runOriginPull goroutine in cmd/gantry). Counting starts at the
+// mirror would silently undercount every please_pull-coordinated
+// pull and break the started == success + failure + in-flight
+// arithmetic identity that all three counters rely on.
+func WithMetrics(cacheHit, cacheMiss func(), originFailure func(class string)) Option {
 	return func(s *Server) {
 		s.metrics.onCacheHit = cacheHit
 		s.metrics.onCacheMiss = cacheMiss
-		s.metrics.onOriginPull = originPull
 		s.metrics.onOriginFailure = originFailure
 	}
 }
@@ -515,9 +522,10 @@ func (s *Server) serveDigest(w http.ResponseWriter, r *http.Request, upstream, r
 		}
 	}
 
-	s.bumpOriginPull(kind)
-
-	// 3. Origin pull, stream-and-cache.
+	// 3. Origin pull, stream-and-cache. The started-counter is bumped
+	// inside origin.Pull (via origin.WithMetrics) so both the mirror
+	// direct-origin and the coordinated please_pull paths count one
+	// 'started' apiece against the same counter.
 	pRef := ifaces.OriginRef{Registry: upstream, Repository: repo, Digest: d, Kind: kind}
 	pr, psize, perr := s.origin.Pull(ctx, pRef)
 	if perr != nil {
@@ -892,8 +900,10 @@ func (s *Server) reAdvertiseDigest(d digest.Digest, op string, logger *slog.Logg
 	}()
 }
 
-// bumpCacheHit / bumpCacheMiss / bumpOriginPull / bumpOriginFailure are
-// no-ops if no metric hooks were registered.
+// bumpCacheHit / bumpCacheMiss / bumpOriginFailure are no-ops if no
+// metric hooks were registered. There is intentionally no
+// bumpOriginPull here — see the WithMetrics doc comment for why the
+// origin-pull-started counter lives in origin.WithMetrics instead.
 func (s *Server) bumpCacheHit() {
 	if s.metrics.onCacheHit != nil {
 		s.metrics.onCacheHit()
@@ -902,11 +912,6 @@ func (s *Server) bumpCacheHit() {
 func (s *Server) bumpCacheMiss() {
 	if s.metrics.onCacheMiss != nil {
 		s.metrics.onCacheMiss()
-	}
-}
-func (s *Server) bumpOriginPull(k ifaces.OriginRefKind) {
-	if s.metrics.onOriginPull != nil {
-		s.metrics.onOriginPull(k.String())
 	}
 }
 func (s *Server) bumpOriginFailure(err error) {

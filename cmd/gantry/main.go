@@ -143,11 +143,26 @@ func runAgent(args []string) error {
 	p2 := newPhase2Metrics(reg)
 	p6 := newPhase6Metrics(reg)
 
-	// Origin.
+	// Origin. WithMetrics is the SINGLE chokepoint that every
+	// origin pull goes through — both the mirror direct-origin
+	// path (handleV2 cache-miss after peer fan-out gives up) AND
+	// the coordinated please_pull-driven runOriginPull goroutine.
+	// We deliberately count p2p_origin_pull_total HERE rather than
+	// at the mirror handler so the started / success / failure
+	// counters all share the same arithmetic identity:
+	//   started == success + failure + (in-flight at scrape time)
+	// Counting at the mirror only would silently undercount every
+	// please_pull-coordinated pull (the bulk of pulls on a hot
+	// cluster) so an alert like 'origin failure rate > 1%' would
+	// see only the rate computed against direct-origin starts and
+	// drift further from reality the more cold-start coordination
+	// does its job. The mirror's originPull hook was the latent
+	// half-wiring that produced this drift; this commit removes
+	// it in favour of the single source of truth here.
 	originClient, err := origin.New(c,
 		origin.WithLogger(logger),
 		origin.WithMetrics(
-			func(_ string, _ int64) {}, // start: no instrument yet
+			func(kind string, _ int64) { inst.originPullTotal.WithLabelValues(kind).Inc() },
 			func(kind string, _ int64) { inst.originPullSuccess.WithLabelValues(kind).Inc() },
 			func(kind, class string) { inst.originPullFailure.WithLabelValues(kind, class).Inc() },
 		),
@@ -503,13 +518,15 @@ func runAgent(args []string) error {
 		)
 	}
 
-	// Mirror with Phase 2 peer fallback.
+	// Mirror with Phase 2 peer fallback. The origin-pull-started
+	// counter is owned by origin.WithMetrics (see above) so every
+	// pull — mirror direct-origin AND coordinated please_pull —
+	// shares one source of truth.
 	mirrorSrv := mirror.New(c, cstore, originClient,
 		mirror.WithLogger(logger),
 		mirror.WithMetrics(
 			func() {}, // cache hit already counted by cache hook
 			func() {}, // cache miss already counted by cache hook
-			func(kind string) { inst.originPullTotal.WithLabelValues(kind).Inc() },
 			func(class string) { inst.originFailureTotal.WithLabelValues(class).Inc() },
 		),
 		mirror.WithDiscovery(disco, peerClient),
