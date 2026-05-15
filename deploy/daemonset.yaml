@@ -3,8 +3,10 @@
 # §Phase 6 design notes:
 #   - hostNetwork: false (§7.5) — pods use the cluster Pod network and
 #     dial each other directly via Pod IPs. peering ports (5001 +
-#     libp2p) are restricted by the NetworkPolicy in
-#     deploy/networkpolicy.yaml.
+#     libp2p) are restricted by the optional hardening overlay in
+#     deploy/examples/networkpolicy.yaml (see deploy/README.md §
+#     Hardening overlays for the workflow — the overlay is NOT part
+#     of the default install).
 #   - hostPath mounts:
 #       /var/lib/gantry/cache   — content-addressed cache (§4.1).
 #                                  HostPath chosen over PVC because
@@ -20,10 +22,11 @@
 #     pod the agent binds 0.0.0.0:5000 (configmap.yaml has
 #     mirror_bind_allow_non_loopback: true) because kube-proxy /
 #     portmap DNAT delivers the traffic to <podIP>:5000, not the
-#     pod's loopback. The NetworkPolicy allows ingress on TCP/5000
-#     from the node CIDR (operator-edit placeholder) because after
-#     DNAT the pod observes source = node IP; a default-deny rule
-#     without that allowance silently breaks every mirror pull.
+#     pod's loopback. If you apply the optional NetworkPolicy
+#     hardening overlay, the operator MUST allow ingress on TCP/5000
+#     from the node CIDR (the overlay's default 127.0.0.1/32
+#     placeholder will drop mirror traffic on most CNIs because
+#     after DNAT the pod observes source = node IP, not 127.0.0.1).
 #   - Resource requests are placeholders (NF6 validation pending).
 #     Operators should size them after observing
 #     p2p_in_flight_pulls / cache_budget under their workload.
@@ -34,8 +37,12 @@
 # Apply with:
 #   kubectl apply -f deploy/serviceaccount.yaml
 #   kubectl apply -f deploy/registry-secret.yaml   # operator-supplied
-#   kubectl apply -f deploy/networkpolicy.yaml
 #   kubectl apply -f deploy/daemonset.yaml
+#
+# After verifying rollout, optionally harden with:
+#   # 1. Copy deploy/examples/networkpolicy.yaml into your own overlay
+#   # 2. Edit every "OPERATOR ACTION REQUIRED" ipBlock
+#   # 3. kubectl apply -f <your-overlay>/networkpolicy.yaml
 ---
 apiVersion: apps/v1
 kind: DaemonSet

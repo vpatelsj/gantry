@@ -13,7 +13,7 @@ the gantry agent as a Kubernetes DaemonSet.
 | `serviceaccount.yaml` | ServiceAccount + ClusterRole + Role + PriorityClass. |
 | `configmap.yaml` | Default `config.yaml` (mirrors `config.NewDefault()`). |
 | `registry-secret.example.yaml` | Template Secret for upstream-registry credentials. |
-| `networkpolicy.yaml` | Locks transfer (5001), libp2p (4001), metrics (9095) to inter-agent / monitoring traffic. |
+| `examples/networkpolicy.yaml` | **Hardening overlay (NOT applied by default).** See [Hardening overlays](#hardening-overlays) below. |
 | `hosts.toml.template` | containerd registry mirror config; one file per upstream registry under `/etc/containerd/certs.d/<host>/hosts.toml`. |
 
 ## Apply order
@@ -23,8 +23,10 @@ kubectl apply -f deploy/serviceaccount.yaml
 kubectl apply -f deploy/configmap.yaml
 # Operator: edit registry-secret.example.yaml first.
 kubectl apply -f deploy/registry-secret.example.yaml
-kubectl apply -f deploy/networkpolicy.yaml
 kubectl apply -f deploy/daemonset.yaml
+# deploy/examples/networkpolicy.yaml is a hardening overlay; do NOT
+# apply it as part of the initial install. See "Hardening overlays"
+# below for the workflow.
 ```
 
 ## Building the image locally
@@ -66,6 +68,49 @@ on its own; no restart needed.
 
 See `docs/detailed-design.md` §7.6 for the full metric catalogue.
 
+## Hardening overlays
+
+`deploy/examples/` carries optional hardening manifests that are
+intentionally **not** part of the default `kubectl apply` workflow.
+Every overlay there contains at least one site-specific value (CIDR,
+endpoint, label) that no shipped manifest can guess correctly across
+arbitrary clusters, so applying them unedited will fail the cluster
+into a state that is hard to debug.
+
+### `examples/networkpolicy.yaml`
+
+Locks transfer (5001), libp2p (4001), mirror (5000), and metrics
+(9095) to the minimum traffic each port needs. Holds the manifest
+shape required by §7.5 but **defers four CIDR choices to the
+operator** — apiserver endpoint, kubelet probe source, mirror DNAT
+source, registry egress. See the long "OPERATOR ACTION REQUIRED"
+block at the top of the file and the [Production caveats](#production-caveats)
+table below.
+
+Workflow:
+
+1. Roll out the DaemonSet without the overlay and verify
+   `kubectl -n gantry-system rollout status ds/gantry`,
+   `p2p_cache_hit_total`, and a successful workload pull.
+2. Copy the overlay into your own repository (or a Kustomize /
+   Helm chart), edit every ipBlock marked "OPERATOR ACTION
+   REQUIRED", and review against your CNI's hostPort SNAT
+   behaviour (`kubectl get nodes -o yaml | grep -A2 podCIDR`,
+   etc.).
+3. Apply with `kubectl apply -f your-overlay/networkpolicy.yaml`.
+   Watch `/readyz` and any in-flight mirror pulls for at least one
+   full image pull cycle — a wrong CIDR will surface as
+   `dht routing table empty` (no peer libp2p traffic) or as
+   containerd `connection refused` on 5000 (wrong mirror source
+   CIDR), not as a NetworkPolicy validation error.
+4. Roll back with `kubectl delete networkpolicy -n gantry-system
+   gantry-agent` if anything regresses.
+
+Future hardening overlays (Pod Security Standards, dedicated
+PriorityClass, alternative `hostNetwork: true` topology) will live
+in the same directory and follow the same "deferred to operator,
+not in default install" rule.
+
 ## Production caveats
 
 A few configuration knobs that need operator attention before going
@@ -73,10 +118,10 @@ to production:
 
 | Item | Where | What to change |
 | --- | --- | --- |
-| API server egress CIDR | `networkpolicy.yaml` | The egress to TCP/443 and TCP/6443 defaults to `0.0.0.0/0` because managed control planes (EKS / GKE / AKS) and self-hosted clusters reach the apiserver at IPs that don't match a `namespaceSelector`. Replace with the apiserver's actual CIDR — `kubectl get endpoints kubernetes -n default -o jsonpath='{.subsets[*].addresses[*].ip}'` for self-hosted clusters; the managed-service docs for hosted control planes. |
-| Origin registry egress | `networkpolicy.yaml` | The egress to TCP/443 for origin pulls also defaults to `0.0.0.0/0`. If the cluster only pulls from a known set of registry endpoints (your private registry, ghcr.io, etc.), restrict this rule to those IPs or labels. |
-| Kubelet probe source | `networkpolicy.yaml` | Metrics ingress on TCP/9095 currently allows `0.0.0.0/0` so kubelet liveness/readiness probes (sourced from the node IP) reach the pod on strict CNIs. Replace with the node CIDR — `kubectl get nodes -o jsonpath='{.items[*].status.addresses[?(@.type=="InternalIP")].address}'`. |
-| Mirror port 5000 source | `networkpolicy.yaml` | Ingress on TCP/5000 defaults to a deliberately-narrow `127.0.0.1/32` placeholder. Most CNIs (Calico, Cilium, and managed offerings) SNAT hostPort traffic so the in-pod source-IP after DNAT is the node IP, NOT 127.0.0.1 — the placeholder will then drop containerd's mirror pulls. Replace with the node CIDR (same command as the kubelet probe row). MUST NOT widen to the pod-network CIDR: that bypasses the `hostIP: 127.0.0.1` binding's loopback-only intent. |
+| API server egress CIDR | `examples/networkpolicy.yaml` | The egress to TCP/443 and TCP/6443 defaults to `0.0.0.0/0` because managed control planes (EKS / GKE / AKS) and self-hosted clusters reach the apiserver at IPs that don't match a `namespaceSelector`. Replace with the apiserver's actual CIDR — `kubectl get endpoints kubernetes -n default -o jsonpath='{.subsets[*].addresses[*].ip}'` for self-hosted clusters; the managed-service docs for hosted control planes. |
+| Origin registry egress | `examples/networkpolicy.yaml` | The egress to TCP/443 for origin pulls also defaults to `0.0.0.0/0`. If the cluster only pulls from a known set of registry endpoints (your private registry, ghcr.io, etc.), restrict this rule to those IPs or labels. |
+| Kubelet probe source | `examples/networkpolicy.yaml` | Metrics ingress on TCP/9095 currently allows `0.0.0.0/0` so kubelet liveness/readiness probes (sourced from the node IP) reach the pod on strict CNIs. Replace with the node CIDR — `kubectl get nodes -o jsonpath='{.items[*].status.addresses[?(@.type=="InternalIP")].address}'`. |
+| Mirror port 5000 source | `examples/networkpolicy.yaml` | Ingress on TCP/5000 defaults to a deliberately-narrow `127.0.0.1/32` placeholder. Most CNIs (Calico, Cilium, and managed offerings) SNAT hostPort traffic so the in-pod source-IP after DNAT is the node IP, NOT 127.0.0.1 — the placeholder will then drop containerd's mirror pulls. Replace with the node CIDR (same command as the kubelet probe row). MUST NOT widen to the pod-network CIDR: that bypasses the `hostIP: 127.0.0.1` binding's loopback-only intent. |
 | containerd socket access | `daemonset.yaml` | The pod runs as non-root (UID 65532); `containerd.sock` is typically root:root mode 0660. Set `spec.template.spec.securityContext.fsGroup` to a group with socket access, relax socket perms on the node, or clear `containerd_socket` in the ConfigMap to disable cdsub. |
 | Kubernetes RBAC scope | `serviceaccount.yaml` | The agent only consumes `pods.list/watch` (informer) plus `pods.patch` (self-announce of libp2p + transfer addresses) in its own namespace, and `nodes.list/watch` cluster-wide for the zone label. There is no `get` on pods — informer events deliver the objects without point reads. Review `ClusterRole/Role` to confirm scope hasn't drifted. Membership setup failure is fatal in production mode (Downward-API env vars set), so an RBAC misconfig surfaces as a CrashLoop on rollout instead of a silent single-node fallback. |
 

@@ -124,10 +124,13 @@ The peer-to-peer transfer endpoint runs **plaintext HTTP/2 (h2c)**.
 That is a deliberate tradeoff:
 
 - Cluster-internal traffic only. Off-node reachability is blocked by the
-  shipped `deploy/networkpolicy.yaml` (ingress restricted to peer
-  agents and the kubelet). If your CNI does not enforce NetworkPolicy,
-  you must replace it with an equivalent firewall before running Gantry
-  in production.
+  shipped `deploy/examples/networkpolicy.yaml` hardening overlay
+  (ingress restricted to peer agents and the kubelet). The overlay is
+  intentionally not part of the default `kubectl apply` workflow
+  because every rule defers a CIDR choice to the operator — see
+  `deploy/README.md` for the workflow. If your CNI does not enforce
+  NetworkPolicy, you must replace it with an equivalent firewall
+  before running Gantry in production.
 - A `Gantry-Mirrored: 1` request header is required on every peer call;
   the handler 400s anything else. This is **not** an authentication
   mechanism — it stops accidental mis-routes (e.g. a misconfigured curl
@@ -168,16 +171,18 @@ transfer endpoint and is **not** affected by the section above.
 ## Deployment
 
 See [deploy/README.md](deploy/README.md) for the full Kubernetes rollout
-recipe: ServiceAccount + RBAC, ConfigMap, NetworkPolicy, DaemonSet,
-distroless image, and the per-node `hosts.toml` containerd
-configuration.
+recipe: ServiceAccount + RBAC, ConfigMap, DaemonSet, distroless image,
+the per-node `hosts.toml` containerd configuration, and the optional
+`examples/networkpolicy.yaml` hardening overlay.
 
 ```sh
 kubectl apply -f deploy/serviceaccount.yaml
 kubectl apply -f deploy/configmap.yaml
 kubectl apply -f deploy/registry-secret.example.yaml   # edit first
-kubectl apply -f deploy/networkpolicy.yaml
 kubectl apply -f deploy/daemonset.yaml
+# Optional, AFTER verifying rollout: copy and edit
+# deploy/examples/networkpolicy.yaml into your own overlay first;
+# see deploy/README.md § Hardening overlays.
 ```
 
 ## Contributing

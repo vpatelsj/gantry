@@ -1,5 +1,42 @@
-# NetworkPolicy restricting transfer (5001), libp2p (4001), mirror
-# (5000), and metrics (9095) ports per §7.5.
+# Hardening overlay (NOT applied by default).
+#
+# This NetworkPolicy is shipped as an EXAMPLE only — it is intentionally
+# excluded from the default `kubectl apply -f deploy/` workflow because
+# every rule below has at least one site-specific CIDR (apiserver
+# endpoint, kubelet probe source, mirror DNAT source, registry egress)
+# that no single shipped manifest can pick for an arbitrary cluster.
+# Applying it unmodified WILL break either readiness probes or mirror
+# pulls on most CNIs:
+#
+#   - Mirror port 5000 ingress defaults to a 127.0.0.1/32 placeholder.
+#     On Calico, Cilium, and most managed CNIs the in-pod source-IP
+#     after hostPort DNAT is the NODE IP (not 127.0.0.1), so the
+#     placeholder will drop containerd's mirror pulls cluster-wide.
+#
+#   - Apiserver egress defaults to 0.0.0.0/0 because managed control
+#     planes (EKS / GKE / AKS) and self-hosted clusters reach the
+#     apiserver at IPs that don't match any namespaceSelector.
+#
+#   - Kubelet probe ingress on 9095 defaults to 0.0.0.0/0 for the same
+#     reason (probes come from the node IP, not a labeled namespace).
+#
+# Workflow:
+#
+#   1. Copy this file out of deploy/examples/ into your own overlay
+#      (Kustomize / Helm / plain git) and edit every ipBlock marked
+#      with "OPERATOR ACTION REQUIRED" below.
+#   2. Apply it AFTER deploy/daemonset.yaml has been rolled out and
+#      verified, never as part of the initial install — a bad rule
+#      will leave you with a NotReady DaemonSet and no clear signal
+#      that the policy is the cause.
+#   3. Discover your node CIDR(s):
+#        kubectl get nodes -o jsonpath='{range .items[*]}{.status.addresses[?(@.type=="InternalIP")].address}{"\n"}{end}'
+#      Discover your apiserver endpoints:
+#        kubectl get endpoints kubernetes -n default -o jsonpath='{.subsets[*].addresses[*].ip}'
+#
+# Restricts transfer (5001), libp2p (4001), mirror (5000), and metrics
+# (9095) ports per §7.5. Requires a CNI that enforces NetworkPolicy
+# (Calico, Cilium, etc.).
 #
 # Phase 6: the policy was upgraded from the Phase 2 stub (ingress
 # only) to include explicit egress restrictions. Egress is allowed to
@@ -7,24 +44,6 @@
 # pods (transfer + libp2p), and TCP/443 for origin registry pulls.
 # Operators with explicit registry endpoints should tighten the last
 # rule to their registry IPs or labels.
-#
-# Mirror port 5000 ingress: although the DaemonSet exposes the mirror
-# via `hostPort: 5000` with `hostIP: 127.0.0.1` (so the host-side
-# endpoint is loopback-only), the in-pod listener binds 0.0.0.0:5000
-# and the kubelet's portmap/iptables DNAT rewrites incoming traffic
-# from `127.0.0.1:5000` on the node to `<podIP>:5000` in the pod's
-# network namespace. The source address the pod observes depends on
-# the CNI's hostPort SNAT behaviour, so a default-deny NetworkPolicy
-# with no rule for 5000 drops the DNATed mirror traffic entirely —
-# containerd then sees connection-refused on every pull. We allow
-# TCP/5000 from a deliberately-narrow placeholder ipBlock
-# (127.0.0.1/32) and require operators to widen to their node CIDR
-# explicitly. Shipping 0.0.0.0/0 here would allow any pod-network or
-# external source that reaches the pod IP to hit the mirror, which
-# defeats the hostIP: 127.0.0.1 loopback-only intent of the
-# DaemonSet binding.
-#
-# Requires a CNI that enforces NetworkPolicy (Calico, Cilium, etc.).
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
