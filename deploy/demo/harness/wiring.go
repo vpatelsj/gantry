@@ -26,12 +26,13 @@ func PreflightWiring(ctx context.Context, cfg LiveConfig, repo, tag string) erro
 	}
 
 	pod := fmt.Sprintf("preflight-%d", time.Now().UnixNano())
+	accept := "application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json"
 	if _, err := runCommand(ctx, cfg.RepoRoot, nil,
 		"kubectl", "-n", cfg.GantryNamespace, "run", pod,
 		"--restart=Never", "--image=curlimages/curl:8.10.1",
 		"--command", "--",
 		"sh", "-c",
-		fmt.Sprintf("curl -fsS -o /dev/null http://acr-origin-proxy:5002/v2/%s/manifests/%s", repo, tag),
+		fmt.Sprintf("curl -sS -o /dev/null -H 'Accept: %s' http://acr-origin-proxy:5002/v2/%s/manifests/%s", accept, repo, tag),
 	); err != nil {
 		return fmt.Errorf("preflight curl pod: %w", err)
 	}

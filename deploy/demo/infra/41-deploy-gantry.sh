@@ -62,6 +62,9 @@ sed \
     >"${tmpdir}/daemonset.yaml"
 kubectl apply -f "${tmpdir}/daemonset.yaml"
 
+log "Adding Prometheus scrape annotations to gantry pods"
+kubectl -n "${namespace}" patch ds/gantry --type strategic -p '{"spec":{"template":{"metadata":{"annotations":{"prometheus.io/scrape":"true","prometheus.io/port":"9095","prometheus.io/path":"/metrics"}}}}}'
+
 log "Waiting for Gantry DaemonSet rollout"
 kubectl -n "${namespace}" rollout status ds/gantry --timeout=10m
 
