@@ -126,6 +126,54 @@ func TestValidate_FullProdTripleOK(t *testing.T) {
 	}
 }
 
+// TestValidate_NodeNameAndPodNameRequireMembersNamespace pins the
+// tenth-review fail-fast rule: production K8s mode set via
+// GANTRY_NODE_NAME + GANTRY_POD_NAME but WITHOUT
+// GANTRY_MEMBERS_NAMESPACE is the stuck-unready case the reviewer
+// flagged. selfAnnounceRequiredForReadiness gates /readyz on a
+// successful AnnounceSelf, but members.AnnounceSelf refuses to run
+// when Options.Namespace == "" because Pods(ns).Patch needs a
+// concrete namespace — cluster-wide list/watch cannot self-patch.
+// Without this validation the agent boots cleanly, runs forever,
+// and never goes ready, with the only signal being a recurring
+// "AnnounceSelf requires Options.Namespace" log line.
+func TestValidate_NodeNameAndPodNameRequireMembersNamespace(t *testing.T) {
+	c := NewDefault()
+	c.UpstreamRegistries = []UpstreamRegistry{{Name: "r", Endpoint: "https://r"}}
+	c.NodeName = "ip-10-0-0-7"
+	c.PodName = "gantry-abc12"
+	// MembersNamespace intentionally left empty.
+	err := c.Validate()
+	if err == nil {
+		t.Fatalf("validate: want error, got nil")
+	}
+	if !strings.Contains(err.Error(), "members_namespace") {
+		t.Fatalf("validate: error must mention members_namespace; got %v", err)
+	}
+	// Must NOT alias the node-name-without-pod-name message; the two
+	// production-mode checks have distinct remediation paths and we
+	// want operators to read the right one.
+	if strings.Contains(err.Error(), "pod_name is empty") {
+		t.Fatalf("validate: error wrongly matched the pod_name check: %v", err)
+	}
+}
+
+// TestValidate_PodNameOnlyDoesNotRequireMembersNamespace mirrors the
+// PodName-without-NodeName carve-out from
+// TestValidate_PodNameWithoutNodeNameOK: a Config with only PodName
+// set is dev-mode and the AnnounceSelf path isn't engaged because
+// production-mode gating in cmd/gantry needs NodeName too. The
+// new members_namespace check MUST share that directionality.
+func TestValidate_PodNameOnlyDoesNotRequireMembersNamespace(t *testing.T) {
+	c := NewDefault()
+	c.UpstreamRegistries = []UpstreamRegistry{{Name: "r", Endpoint: "https://r"}}
+	c.PodName = "gantry-abc12"
+	// NodeName + MembersNamespace intentionally left empty.
+	if err := c.Validate(); err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+}
+
 // TestValidate_DevModeAllEmptyOK confirms dev mode (no Downward API
 // envs) still passes validation. The codepath downstream falls back
 // to a single-self members stub and disables cold-start coordination.

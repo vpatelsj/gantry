@@ -119,7 +119,24 @@ type Config struct {
 	PodIP string `yaml:"pod_ip"`
 
 	// MembersNamespace restricts the Pod informer to a single namespace.
-	// Empty means cluster-wide (typical for Gantry as a privileged DaemonSet).
+	// Empty means cluster-wide list/watch — useful for read-only
+	// scenarios, but production deployments MUST set this. The
+	// self-announce write path (members.AnnounceSelf) patches the
+	// agent's own pod via Pods(namespace).Patch and refuses to run
+	// when namespace == "" because the apiserver does not infer a
+	// pod's home namespace from the pod name alone. Without a
+	// namespace the agent's three peer-coordination annotations
+	// (gantry.io/peer-id, gantry.io/p2p-addrs, gantry.io/transfer-addr)
+	// are never published, so peers cannot translate this agent's
+	// node name into a dialable libp2p peer ID — every inbound
+	// Coord.PleasePull / PullIntentQuery 503s silently.
+	//
+	// The shipped DaemonSet wires GANTRY_MEMBERS_NAMESPACE via the
+	// Downward API (`fieldRef: metadata.namespace`) so operators
+	// following deploy/daemonset.yaml satisfy this for free. Hand-
+	// rolled envFrom that misses it is the failure mode this
+	// validation catches at startup rather than at first
+	// Coord.PleasePull miss.
 	MembersNamespace string `yaml:"members_namespace"`
 
 	// MembersLabelSelector is the K8s label selector that identifies Gantry
@@ -424,7 +441,7 @@ func (c *Config) BindFlags(fs *flag.FlagSet) {
 	fs.StringVar(&c.NodeName, "node-name", c.NodeName, "Kubernetes node name this agent runs on (Downward API spec.nodeName)")
 	fs.StringVar(&c.PodName, "pod-name", c.PodName, "Kubernetes pod name of this agent (Downward API metadata.name)")
 	fs.StringVar(&c.PodIP, "pod-ip", c.PodIP, "Kubernetes pod IP of this agent (Downward API status.podIP); used to rewrite 0.0.0.0 listeners into dialable advertised addresses")
-	fs.StringVar(&c.MembersNamespace, "members-namespace", c.MembersNamespace, "namespace to scope the pod informer (empty = cluster-wide)")
+	fs.StringVar(&c.MembersNamespace, "members-namespace", c.MembersNamespace, "namespace to scope the pod informer (REQUIRED when node_name+pod_name are set — AnnounceSelf needs it to self-patch; empty is dev-only)")
 	fs.StringVar(&c.MembersLabelSelector, "members-label-selector", c.MembersLabelSelector, "label selector identifying Gantry DaemonSet pods")
 	fs.StringVar(&c.MembersKubeconfig, "members-kubeconfig", c.MembersKubeconfig, "optional path to a kubeconfig file (empty = in-cluster)")
 
@@ -625,6 +642,33 @@ func (c *Config) Validate() error {
 	// failure.
 	if c.NodeName != "" && c.PodName == "" {
 		errs = append(errs, errors.New("node_name is set but pod_name is empty: production K8s mode requires pod_name (GANTRY_POD_NAME / metadata.name via the Downward API) so AnnounceSelf can publish gantry.io/peer-id, gantry.io/p2p-addrs, and gantry.io/transfer-addr on this agent's own pod; without it, other agents see this node in HRW/membership but cannot translate the node name to a dialable libp2p peer ID, silently 503-ing every Coord.PleasePull and PullIntentQuery RPC"))
+	}
+
+	// Production K8s mode also requires members_namespace. When
+	// NodeName + PodName are both set, the agent will (a) participate
+	// in HRW and (b) try to publish its three coordination annotations
+	// via AnnounceSelf at startup. The self-announce path is a
+	// Pods(namespace).Patch call that REQUIRES a concrete namespace —
+	// members.AnnounceSelf refuses to run with an empty namespace
+	// because the apiserver cannot infer a pod's home namespace from
+	// the pod name alone (different namespaces can hold pods with the
+	// same name). Without members_namespace set, AnnounceSelf fails on
+	// every retry, /readyz never goes green (production readiness
+	// requires a successful self-announce — see
+	// selfAnnounceRequiredForReadiness in cmd/gantry/main.go), and the
+	// agent is stuck unready forever — but the misconfiguration is
+	// silent at config-load time because cluster-wide list/watch is a
+	// supported informer mode in other contexts. Catch it at Validate()
+	// so the operator gets a clear startup error rather than a stuck
+	// /readyz endpoint.
+	//
+	// The shipped DaemonSet at deploy/daemonset.yaml wires this via
+	// the Downward API (fieldRef: metadata.namespace), so operators
+	// following the canonical deploy path satisfy this for free; the
+	// failure mode is a hand-rolled envFrom that omits the namespace
+	// env var.
+	if c.NodeName != "" && c.PodName != "" && c.MembersNamespace == "" {
+		errs = append(errs, errors.New("members_namespace is empty but node_name and pod_name are set (production K8s mode): self-announce (members.AnnounceSelf) needs Options.Namespace to patch this agent's own pod with gantry.io/peer-id, gantry.io/p2p-addrs, and gantry.io/transfer-addr, and refuses to run cluster-wide because the apiserver cannot infer a pod's home namespace from name alone; set GANTRY_MEMBERS_NAMESPACE / members_namespace (typically via Downward API fieldRef: metadata.namespace, see deploy/daemonset.yaml) — without it the agent will never go ready because production-mode readiness requires a successful self-announce"))
 	}
 
 	return errors.Join(errs...)
