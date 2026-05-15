@@ -157,8 +157,19 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: status.podIP
+            # MEMBERS_NAMESPACE → scope the pod informer that
+            # enumerates peer agents. Sourced from the downward API
+            # (metadata.namespace) rather than hard-coded to
+            # gantry-system so an overlay that renames the namespace
+            # (Kustomize, Helm, separate dev/prod installs) only has
+            # to patch metadata.namespace on the DaemonSet — the env
+            # var follows automatically. Default install behaviour
+            # is identical because the DaemonSet ships in
+            # gantry-system.
             - name: GANTRY_MEMBERS_NAMESPACE
-              value: gantry-system
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
           ports:
             # mirror (loopback only) — listed here for documentation.
             - name: mirror

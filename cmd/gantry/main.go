@@ -750,6 +750,26 @@ func runAgent(args []string) error {
 			// let Go open a dual-stack socket on Linux).
 			return "transfer listener family mismatches Pod IP; check transfer_listen vs Pod IP family", false
 		}
+		// Multi-node rollout, no peer has self-announced yet:
+		// every Gantry pod the informer sees is Running (so the
+		// "running" count > 1) but only this pod has published
+		// p2p-addrs (so the bootstrap view ≤ 1, typically == 1
+		// because we annotated ourselves earlier in startup).
+		// Without this gate the existing DHT-empty check below
+		// short-circuits to true (because bootstrap count ≤ 1
+		// trips the single-node carve-out) and /readyz races to
+		// green before any peer is actually dialable — pods flip
+		// Ready, mirror traffic starts, every coord/transfer dial
+		// gets connection-refused, and the cluster thunders the
+		// origin. Staying 503 with this specific reason tells
+		// operators the real cause (peers aren't announced yet);
+		// "dht routing table empty" would misattribute it.
+		//
+		// Must run BEFORE the DHT check below so the reason
+		// string is correct on the first-rollout path.
+		if runningMatchingPodCount(memberView) > 1 && bootstrapPeerCount(memberView) <= 1 {
+			return "peer self-announcements pending", false
+		}
 		// Single-node cluster carve-out: with only self in the
 		// members view there are no peers to dial, so the kad-dht
 		// routing table will stay empty by definition. Without this
@@ -1632,6 +1652,38 @@ func bootstrapPeerCount(m ifaces.Members) int {
 	}
 	if b, ok := m.(bootstrapper); ok {
 		return len(b.SnapshotForBootstrap())
+	}
+	return len(m.Snapshot())
+}
+
+// runningMatchingPodCount returns the count of Running pods the
+// informer sees (with PodIP populated), regardless of Ready or any
+// announcement annotation. Falls back to len(Snapshot()) when the
+// Members implementation doesn't expose RunningMatchingPodCount
+// (the dev-mode single-self fake; test stubs that don't model the
+// informer at all). The fallback is a strict undercount on the
+// dev-mode path, which is fine — the readiness gate this helper
+// feeds only triggers when count > 1, and the dev-mode fake is
+// always single-self.
+//
+// Used by /readyz to distinguish "real single-node cluster" (count
+// == 1, no peers expected) from "multi-node, peers just haven't
+// self-announced yet" (count > 1 but bootstrap view ≤ 1). The
+// latter must keep /readyz at 503 with reason
+// "peer self-announcements pending"; without this distinction the
+// existing DHT check short-circuits during the first-rollout window
+// where every pod is Running but none has yet published its libp2p
+// multiaddrs, racing /readyz to green before any peer is dialable.
+//
+// Structural-typing pattern matches bootstrapPeerCount so test
+// stubs (announce_test.go bootstrapStub, fakes.Members) don't drag
+// internal/members into the import graph.
+func runningMatchingPodCount(m ifaces.Members) int {
+	type runningCounter interface {
+		RunningMatchingPodCount() int
+	}
+	if r, ok := m.(runningCounter); ok {
+		return r.RunningMatchingPodCount()
 	}
 	return len(m.Snapshot())
 }

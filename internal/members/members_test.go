@@ -491,3 +491,82 @@ func TestSnapshotForBootstrap_IncludesNotReadyPodsWithAnnotations(t *testing.T) 
 		}
 	}
 }
+
+// RunningMatchingPodCount must count every Running pod with a PodIP
+// the informer sees, regardless of Ready condition or annotation
+// state. This is the strict superset that Snapshot() (Ready) and
+// SnapshotForBootstrap() (Running + annotated) are filtered subsets
+// of. It exists so /readyz can distinguish "real single-node
+// cluster" from "multi-node, peers haven't self-announced yet" —
+// using either narrower count there would race readiness to green
+// during the first-rollout window where every pod is Running but
+// none has published p2p-addrs.
+//
+// Test matrix:
+//
+//   - Ready+annotated:    counted
+//   - NotReady+annotated: counted
+//   - NotReady+no-ann:    counted (this is the case the method exists for)
+//   - Pending (any ann):  NOT counted (Phase != Running)
+//   - Running, no PodIP:  NOT counted (informer is racing scheduler)
+//   - Wrong label:        NOT counted (excluded by informer selector)
+func TestRunningMatchingPodCount_CountsRunningPodsRegardlessOfAnnotationOrReady(t *testing.T) {
+	gantryLabel := map[string]string{"app.kubernetes.io/name": "gantry"}
+
+	readyAnn := newPod("ready-ann", "ns", "node-a", "10.0.0.1", true, gantryLabel)
+	readyAnn.Annotations = map[string]string{
+		AnnotationPeerID:   "peer-a",
+		AnnotationP2PAddrs: "/ip4/10.0.0.1/tcp/4001/p2p/peer-a",
+	}
+	notReadyAnn := newPod("notready-ann", "ns", "node-b", "10.0.0.2", false, gantryLabel)
+	notReadyAnn.Annotations = map[string]string{
+		AnnotationP2PAddrs: "/ip4/10.0.0.2/tcp/4001/p2p/peer-b",
+	}
+	notReadyNoAnn := newPod("notready-bare", "ns", "node-c", "10.0.0.3", false, gantryLabel)
+	pending := newPod("pending", "ns", "node-d", "10.0.0.4", true, gantryLabel)
+	pending.Status.Phase = corev1.PodPending
+	noIP := newPod("no-ip", "ns", "node-e", "", true, gantryLabel)
+	wrongLabel := newPod("other", "ns", "node-f", "10.0.0.6", true,
+		map[string]string{"app.kubernetes.io/name": "not-gantry"})
+
+	cs := fake.NewSimpleClientset(
+		readyAnn, notReadyAnn, notReadyNoAnn, pending, noIP, wrongLabel,
+		newNode("node-a", ""), newNode("node-b", ""), newNode("node-c", ""),
+		newNode("node-d", ""), newNode("node-e", ""), newNode("node-f", ""),
+	)
+	m, err := New(Options{
+		NodeName:      "node-a",
+		Namespace:     "ns",
+		LabelSelector: "app.kubernetes.io/name=gantry",
+		Clientset:     cs,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(m.Stop)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	m.Start()
+	if err := m.WaitForSync(ctx); err != nil {
+		t.Fatalf("WaitForSync: %v", err)
+	}
+
+	// Expect: ready-ann + notready-ann + notready-bare = 3.
+	// Pending, no-IP and wrong-label are excluded; the latter never
+	// enters the informer at all (selector filter), the former two
+	// are excluded by the method's documented predicate.
+	if got, want := m.RunningMatchingPodCount(), 3; got != want {
+		t.Errorf("RunningMatchingPodCount = %d, want %d (must count NotReady and un-annotated Running pods so /readyz can detect 'peers haven't announced yet')", got, want)
+	}
+
+	// Sanity: Snapshot() (Ready only) reports 1 and
+	// SnapshotForBootstrap() (Running + annotated) reports 2, so
+	// the new counter is a strict superset of both — exactly the
+	// invariant the readiness gate depends on.
+	if got := len(m.Snapshot()); got != 1 {
+		t.Errorf("Snapshot len = %d, want 1 (only ready-ann is Ready)", got)
+	}
+	if got := len(m.SnapshotForBootstrap()); got != 2 {
+		t.Errorf("SnapshotForBootstrap len = %d, want 2 (only ready-ann + notready-ann have annotations)", got)
+	}
+}

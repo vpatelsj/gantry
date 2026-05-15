@@ -4,10 +4,16 @@
 # coord paths (HRW top-K=3 means the requester picks a peer that's
 # not itself, which requires ≥2 peers in the membership view).
 #
-# Each worker maps the host's containerd socket through so the gantry
-# cdsub source has something to talk to. The host directory chosen is
-# kind's own /var/lib/containerd, which is per-cluster and gets
-# cleaned up by `kind delete cluster`.
+# No extraMounts are declared. Each kind node runs its own
+# containerd inside the node container, listening on
+# /run/containerd/containerd.sock; the DaemonSet bind-mounts that
+# in-container socket (not the host's containerd) so the gantry
+# cdsub source can subscribe to image events on the same containerd
+# that pulled the image. If the socket's effective ownership / SELinux
+# label inside the node container does not match the gantry pod's
+# runAsUser the cdsub source falls back to NoOpSource (no event
+# stream) and the rest of the agent keeps working; the smoke test
+# only depends on the HTTP mirror + transfer paths, not on cdsub.
 kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
 name: gantry-e2e

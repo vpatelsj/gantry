@@ -342,6 +342,47 @@ func (m *Manager) SnapshotForBootstrap() []ifaces.Node {
 	return out
 }
 
+// RunningMatchingPodCount returns the number of pods the informer
+// sees in Running phase with a populated PodIP, REGARDLESS of Ready
+// condition or any annotation. The informer's label selector and
+// namespace scope already constrain the set to Gantry peers; this
+// method intentionally does not apply any further filter.
+//
+// Contract (do not tighten):
+//
+//   - Requires Status.Phase == PodRunning AND Status.PodIP != "".
+//   - Does NOT require: PodReady=True, gantry.io/p2p-addrs,
+//     gantry.io/peer-id, or any other readiness/announcement signal.
+//
+// This is the strict superset that Snapshot() (Ready) and
+// SnapshotForBootstrap() (Running + p2p-addrs annotated) are filtered
+// subsets of. It exists so /readyz can distinguish "this is a real
+// single-node cluster" (count == 1) from "multi-node cluster, peers
+// just haven't self-announced yet" (count > 1, bootstrap view ≤ 1).
+// Surfacing the latter as "peer self-announcements pending" rather
+// than "dht routing table empty" tells operators the real cause; it
+// also keeps the readiness probe at 503 during the first-rollout
+// window where every pod is Running but none has yet published its
+// libp2p multiaddrs — without this gate, /readyz would race to green
+// before any peer was actually reachable.
+func (m *Manager) RunningMatchingPodCount() int {
+	n := 0
+	for _, obj := range m.podInf.GetStore().List() {
+		p, ok := obj.(*corev1.Pod)
+		if !ok {
+			continue
+		}
+		if p.Status.Phase != corev1.PodRunning {
+			continue
+		}
+		if p.Status.PodIP == "" {
+			continue
+		}
+		n++
+	}
+	return n
+}
+
 // podReady reports whether a pod is in Running phase with a Ready=True
 // condition. Pending/Terminating pods are excluded from the membership view
 // so HRW does not score nodes that cannot serve traffic.

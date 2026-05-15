@@ -412,18 +412,78 @@ func TestBootstrapPeerCount(t *testing.T) {
 }
 
 // bootstrapStub is a minimal Members implementation that ALSO
-// exposes SnapshotForBootstrap, so we can exercise the structural
-// type assertion inside bootstrapPeerCount without dragging the
-// full k8s informer plumbing into a unit test.
+// exposes SnapshotForBootstrap and RunningMatchingPodCount, so we
+// can exercise the structural type assertions inside
+// bootstrapPeerCount and runningMatchingPodCount without dragging
+// the full k8s informer plumbing into a unit test.
 type bootstrapStub struct {
 	snapshot []ifaces.Node
 	boot     []ifaces.Node
+	running  int
 }
 
 func (s *bootstrapStub) Self() ifaces.NodeID                 { return "self" }
 func (s *bootstrapStub) Snapshot() []ifaces.Node             { return s.snapshot }
 func (s *bootstrapStub) SnapshotForBootstrap() []ifaces.Node { return s.boot }
+func (s *bootstrapStub) RunningMatchingPodCount() int        { return s.running }
 func (s *bootstrapStub) WaitForSync(_ context.Context) error { return nil }
+
+// runningMatchingPodCount must consult RunningMatchingPodCount
+// (Running + PodIP, regardless of Ready or annotation) when the
+// Members implementation exposes it, and fall back to Snapshot
+// only for implementations that don't (the dev-mode single-self
+// fake, test stubs that predate this method). The new counter is
+// the strict superset that the /readyz "peer self-announcements
+// pending" branch relies on to distinguish "real single-node
+// cluster" (count == 1) from "multi-node, peers haven't yet
+// published p2p-addrs" (count > 1, bootstrap view ≤ 1). Without
+// this superset the existing DHT-empty check would short-circuit
+// during the first-rollout window and /readyz would race to green
+// before any peer is dialable.
+func TestRunningMatchingPodCount(t *testing.T) {
+	t.Run("fallback to Snapshot when no RunningMatchingPodCount", func(t *testing.T) {
+		// fakes.Members implements ifaces.Members but NOT the
+		// runningCounter extension; verify the fallback branch.
+		// On the dev-mode path this undercount is acceptable —
+		// the readiness gate this helper feeds only triggers when
+		// count > 1, and the dev-mode fake is always single-self.
+		f := fakes.NewMembers(
+			ifaces.NodeID("self"),
+			ifaces.Node{ID: "self"},
+			ifaces.Node{ID: "peer-a"},
+			ifaces.Node{ID: "peer-b"},
+		)
+		if got := runningMatchingPodCount(f); got != 3 {
+			t.Errorf("runningMatchingPodCount(fakes) = %d, want 3 (fallback to Snapshot)", got)
+		}
+	})
+	t.Run("uses RunningMatchingPodCount when available, ignores Snapshot", func(t *testing.T) {
+		// Multi-node fresh rollout: every Gantry pod is Running
+		// but none has self-announced yet (Snapshot() and
+		// SnapshotForBootstrap() both empty for peers).
+		// RunningMatchingPodCount must still see all 4 pods so
+		// /readyz can stay 503 with "peer self-announcements
+		// pending" rather than racing to green.
+		m := &bootstrapStub{
+			snapshot: nil,
+			boot:     nil,
+			running:  4,
+		}
+		if got := runningMatchingPodCount(m); got != 4 {
+			t.Errorf("runningMatchingPodCount(stub) = %d, want 4 (must read RunningMatchingPodCount, not Snapshot)", got)
+		}
+	})
+	t.Run("single-node returns 1 (real single-node cluster, not a stuck rollout)", func(t *testing.T) {
+		// On a legitimate single-node deploy the new readiness
+		// branch must NOT fire — count == 1 falls below the
+		// `count > 1` guard. Confirm the helper preserves that
+		// invariant.
+		m := &bootstrapStub{running: 1}
+		if got := runningMatchingPodCount(m); got != 1 {
+			t.Errorf("runningMatchingPodCount(single-node stub) = %d, want 1", got)
+		}
+	})
+}
 
 // TestRoutingTableTarget guards eighth-review #3: the kad-dht
 // routing-table target is the count of *other* peers we expect to

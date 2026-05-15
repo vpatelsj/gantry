@@ -85,6 +85,18 @@ endpoint, label) that no shipped manifest can guess correctly across
 arbitrary clusters, so applying them unedited will fail the cluster
 into a state that is hard to debug.
 
+> **Production guidance:** the default install leaves the mirror
+> listener (5000) and transfer listener (5001) reachable from other
+> pods on the cluster network at `<podIP>:port`. The `hostIP:
+> 127.0.0.1` binding on the DaemonSet's hostPort only restricts
+> *host-side* reach; the listener inside the pod is still
+> `0.0.0.0`. Production installs **should** adopt
+> [`examples/networkpolicy.yaml`](examples/networkpolicy.yaml) (or
+> an equivalent NetworkPolicy in their own overlay) to close that
+> pod-network gap. The overlay is shipped as an example rather than
+> a default because its allow-list depends on the cluster's
+> node-CIDR range, which is site-specific (see the workflow below).
+
 ### `examples/networkpolicy.yaml`
 
 Locks transfer (5001), libp2p (4001), mirror (5000), and metrics
