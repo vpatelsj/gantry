@@ -87,6 +87,12 @@ func TestRewriteWildcardMultiaddr(t *testing.T) {
 // to composing podIP:port from the pod's status.podIP. A non-empty
 // 0.0.0.0:port published in the annotation would override that
 // fallback and produce an unreachable advertised address.
+//
+// It also leaves empty for the cross-family case (e.g. v4 wildcard
+// with a v6 Pod IP) so that an undialable annotation isn't published.
+// In that case the readiness probe (see TestTransferAddrFamilyMismatch)
+// is responsible for failing the rollout so the broken pod never goes
+// Ready and never appears in peers' Snapshot views.
 func TestAdvertisedTransferAddr(t *testing.T) {
 	cases := []struct {
 		name           string
@@ -95,7 +101,7 @@ func TestAdvertisedTransferAddr(t *testing.T) {
 		want           string
 	}{
 		{
-			name:           "ipv4 wildcard + pod IP composes",
+			name:           "ipv4 wildcard + ipv4 pod IP composes",
 			transferListen: "0.0.0.0:5001",
 			podIP:          "10.42.0.7",
 			want:           "10.42.0.7:5001",
@@ -107,10 +113,28 @@ func TestAdvertisedTransferAddr(t *testing.T) {
 			want:           "",
 		},
 		{
-			name:           "ipv6 wildcard + pod IP composes",
+			name:           "ipv4 wildcard + ipv6 pod IP returns empty (cross-family)",
+			transferListen: "0.0.0.0:5001",
+			podIP:          "fd00::1234",
+			want:           "",
+		},
+		{
+			name:           "ipv6 wildcard + ipv6 pod IP composes with brackets",
+			transferListen: "[::]:5001",
+			podIP:          "fd00::1234",
+			want:           "[fd00::1234]:5001",
+		},
+		{
+			name:           "ipv6 wildcard + ipv4 pod IP returns empty (cross-family)",
 			transferListen: "[::]:5001",
 			podIP:          "10.42.0.7",
-			want:           "10.42.0.7:5001",
+			want:           "",
+		},
+		{
+			name:           "ipv6 wildcard + empty pod IP returns empty",
+			transferListen: "[::]:5001",
+			podIP:          "",
+			want:           "",
 		},
 		{
 			name:           "explicit bind passes through",
@@ -119,10 +143,16 @@ func TestAdvertisedTransferAddr(t *testing.T) {
 			want:           "10.42.0.7:5001",
 		},
 		{
-			name:           "empty host passes through wildcard handling",
+			name:           "empty host (dual-stack) + ipv4 pod IP composes",
 			transferListen: ":5001",
 			podIP:          "10.42.0.7",
 			want:           "10.42.0.7:5001",
+		},
+		{
+			name:           "empty host (dual-stack) + ipv6 pod IP composes",
+			transferListen: ":5001",
+			podIP:          "fd00::1234",
+			want:           "[fd00::1234]:5001",
 		},
 		{
 			name:           "unparseable listen passes through verbatim",
@@ -136,6 +166,41 @@ func TestAdvertisedTransferAddr(t *testing.T) {
 			got := advertisedTransferAddr(tc.transferListen, tc.podIP)
 			if got != tc.want {
 				t.Errorf("advertisedTransferAddr(%q, %q) = %q, want %q",
+					tc.transferListen, tc.podIP, got, tc.want)
+			}
+		})
+	}
+}
+
+// transferAddrFamilyMismatch must return true exactly for the
+// configurations where advertisedTransferAddr drops to "" because of
+// a cross-family wildcard listener (not because of a missing Pod IP
+// or a non-K8s deploy). The readiness probe uses this to fail
+// /readyz with a targeted message when the transfer endpoint is
+// misconfigured for the pod's IP family.
+func TestTransferAddrFamilyMismatch(t *testing.T) {
+	cases := []struct {
+		name           string
+		transferListen string
+		podIP          string
+		want           bool
+	}{
+		{"v4 wildcard + v4 pod -> OK", "0.0.0.0:5001", "10.42.0.7", false},
+		{"v4 wildcard + v6 pod -> MISMATCH", "0.0.0.0:5001", "fd00::1234", true},
+		{"v6 wildcard + v6 pod -> OK", "[::]:5001", "fd00::1234", false},
+		{"v6 wildcard + v4 pod -> MISMATCH", "[::]:5001", "10.42.0.7", true},
+		{"empty host (dual-stack) + v4 pod -> OK", ":5001", "10.42.0.7", false},
+		{"empty host (dual-stack) + v6 pod -> OK", ":5001", "fd00::1234", false},
+		{"explicit v4 bind -> not a wildcard -> OK", "10.42.0.7:5001", "10.42.0.7", false},
+		{"explicit v6 bind -> not a wildcard -> OK", "[fd00::1234]:5001", "fd00::1234", false},
+		{"empty pod IP (non-K8s) -> never a mismatch", "0.0.0.0:5001", "", false},
+		{"unparseable listen -> never a mismatch (annotation passes verbatim)", "notahostport", "10.42.0.7", false},
+		{"unparseable pod IP -> never a mismatch (treat as opaque)", "0.0.0.0:5001", "not-an-ip", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := transferAddrFamilyMismatch(tc.transferListen, tc.podIP); got != tc.want {
+				t.Errorf("transferAddrFamilyMismatch(%q, %q) = %v; want %v",
 					tc.transferListen, tc.podIP, got, tc.want)
 			}
 		})

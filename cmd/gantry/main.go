@@ -257,6 +257,28 @@ func runAgent(args []string) error {
 	// /readyz is the only way to fail the rollout instead of
 	// silently shipping a libp2p-unreachable agent.
 	var noDialableP2PAddrs atomic.Bool
+	// noDialableTransferAddr is set when c.TransferListen is
+	// wildcard-bound to a single IP family that does not match the
+	// pod's IP family — e.g. transfer_listen=0.0.0.0:5001 on an
+	// IPv6-only cluster, or transfer_listen=[::]:5001 on a v4-only
+	// cluster. In that state, peers reading our self-announce
+	// annotation (or composing podIP:transferPort via the Snapshot
+	// fallback) would see an address the kernel has no socket bound
+	// to, and every peer transfer attempt would connection-refused
+	// — duplicating the libp2p cross-family mode for the transfer
+	// endpoint. Computed once at startup since c.TransferListen and
+	// c.PodIP do not change after boot.
+	var noDialableTransferAddr atomic.Bool
+	noDialableTransferAddr.Store(transferAddrFamilyMismatch(c.TransferListen, c.PodIP))
+	if noDialableTransferAddr.Load() {
+		// Loud diagnostic so the readiness probe's terse message
+		// has something concrete in the logs. Mirrors the libp2p
+		// cross-family warning emitted from announceSelfAndBootstrap.
+		logger.Error("transfer: listener family mismatches Pod IP; advertised transfer address will be empty and peers cannot dial this node for blob fetches",
+			slog.String("transfer_listen", c.TransferListen),
+			slog.String("pod_ip", c.PodIP),
+		)
+	}
 	// A successful self-announce is required for readiness iff the
 	// agent is running in production K8s mode with no static
 	// bootstrap peers — i.e. dynamic discovery via annotations is the
@@ -594,6 +616,17 @@ func runAgent(args []string) error {
 			// rather than ship a silently-isolated agent. Fix:
 			// align libp2p_listen with the Pod's IP family.
 			return "members self-announce has no dialable p2p addresses; check libp2p_listen vs Pod IP family", false
+		}
+		if requireSelfAnnounce && noDialableTransferAddr.Load() {
+			// Same hazard, transfer-endpoint flavour. Wildcard
+			// listen on the wrong family produces an undialable
+			// advertised transfer address; peers' transfer pulls
+			// would all connection-refused. Fix: align
+			// transfer_listen with the Pod's IP family (use
+			// `[::]:port` on v6-only / dual-stack clusters,
+			// `0.0.0.0:port` on v4-only clusters, or `:port` to
+			// let Go open a dual-stack socket on Linux).
+			return "transfer listener family mismatches Pod IP; check transfer_listen vs Pod IP family", false
 		}
 		// Single-node cluster carve-out: with only self in the
 		// members view there are no peers to dial, so the kad-dht
@@ -1562,23 +1595,96 @@ func rewriteWildcardMultiaddr(ma, podIP string) string {
 // "" so members.Snapshot() composes podIP:transferPort instead (the
 // Snapshot fallback path); concrete binds (e.g. a NodePort override)
 // are published verbatim.
+//
+// Family-safety: wildcard-bound listeners only listen on the family
+// the wildcard names (`0.0.0.0` → v4 only, `::` → v6 only on Linux
+// with `IPV6_V6ONLY=1`, which is the kernel default unless the Go
+// runtime explicitly clears it; `net.Listen("tcp", ":port")` with an
+// empty host clears `IPV6_V6ONLY` and becomes dual-stack). When the
+// listen family does NOT match the pod IP family, returning a
+// composed `podIP:port` annotation would point peers at an address
+// the kernel has no socket bound to — a guaranteed connection
+// refused. Return "" in that case so the annotation is omitted; the
+// caller (readiness probe via transferAddrFamilyMismatch) is
+// responsible for failing readiness so the broken pod never goes
+// Ready and never appears in peers' Snapshot views. This mirrors the
+// cross-family skip in rewriteWildcardMultiaddr for libp2p
+// multiaddrs.
 func advertisedTransferAddr(transferListen, podIP string) string {
 	host, port, err := net.SplitHostPort(transferListen)
 	if err != nil {
 		return transferListen
 	}
-	if host == "" || host == "0.0.0.0" || host == "::" {
+	switch host {
+	case "":
+		// Empty host → Go listens dual-stack on Linux (IPv6
+		// wildcard with IPV6_V6ONLY cleared, accepting both
+		// families via v4-mapped-in-v6). Any pod-IP family is
+		// dialable from a peer of either family. Outside K8s
+		// podIP is empty → return "" so members.Snapshot's
+		// fallback (also empty) leaves the annotation unset.
 		if podIP == "" {
-			// Outside Kubernetes: leave empty so Snapshot's
-			// podIP:transferPort fallback fires (which itself is
-			// a no-op without a Pod IP — but that's the right
-			// failure mode: no advertised address at all rather
-			// than an unreachable 0.0.0.0).
+			return ""
+		}
+		return net.JoinHostPort(podIP, port)
+	case "0.0.0.0":
+		if podIP == "" {
+			return ""
+		}
+		ip := net.ParseIP(podIP)
+		if ip == nil || ip.To4() == nil {
+			// v4 listener, v6 pod IP → cross-family, undialable.
+			return ""
+		}
+		return net.JoinHostPort(podIP, port)
+	case "::":
+		if podIP == "" {
+			return ""
+		}
+		ip := net.ParseIP(podIP)
+		if ip == nil || ip.To4() != nil {
+			// v6 listener, v4 pod IP → cross-family, undialable.
 			return ""
 		}
 		return net.JoinHostPort(podIP, port)
 	}
 	return transferListen
+}
+
+// transferAddrFamilyMismatch reports whether the transfer listener is
+// wildcard-bound to a single IP family that does not match the pod's
+// IP family — a misconfiguration that produces an undialable
+// advertised address and must fail /readyz so the rollout halts
+// instead of silently shipping a broken pod.
+//
+// True iff: listen host is `0.0.0.0` or `::`, podIP is non-empty,
+// and the listener's family != podIP family. The empty-host case
+// (`:port`) is Go's dual-stack default on Linux and is never a
+// mismatch. The non-K8s path (podIP == "") is never a mismatch
+// because advertising nothing is the intended behaviour there.
+//
+// Pairs with advertisedTransferAddr: this returns true exactly when
+// the advertisedTransferAddr -> "" outcome was caused by a
+// cross-family misconfiguration (not by absent podIP).
+func transferAddrFamilyMismatch(transferListen, podIP string) bool {
+	if podIP == "" {
+		return false
+	}
+	host, _, err := net.SplitHostPort(transferListen)
+	if err != nil {
+		return false
+	}
+	ip := net.ParseIP(podIP)
+	if ip == nil {
+		return false
+	}
+	switch host {
+	case "0.0.0.0":
+		return ip.To4() == nil // pod is v6, listener is v4
+	case "::":
+		return ip.To4() != nil // pod is v4, listener is v6
+	}
+	return false
 }
 
 // coldStartAdapter bridges *coldstart.Resolver to mirror.ColdStartResolver
