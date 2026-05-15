@@ -1,0 +1,87 @@
+# Demo-only Deployment for the ACR counting-proxy spike.
+# See docs/acr-counting-proxy-demo.md §10 step 1.
+#
+# One-time prerequisites (NOT managed by this manifest):
+#   kubectl create namespace gantry-demo
+#   kubectl apply -f service.yaml
+#   kubectl apply -f secret.yaml          # copied from secret.example.yaml
+#
+# Edit UPSTREAM_REGISTRY below (or kustomize-patch it) before applying.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: acr-origin-proxy
+  namespace: gantry-demo
+  labels:
+    app.kubernetes.io/name: acr-origin-proxy
+    app.kubernetes.io/component: demo-proxy
+    app.kubernetes.io/part-of: gantry-demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: acr-origin-proxy
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: acr-origin-proxy
+        app.kubernetes.io/component: demo-proxy
+        app.kubernetes.io/part-of: gantry-demo
+      # Prometheus scrape annotations are intentionally omitted in
+      # step 1: the spike has no /metrics endpoint yet. Step 2 adds
+      # counters and the corresponding prometheus.io/* annotations.
+    spec:
+      containers:
+        - name: proxy
+          image: acr-origin-proxy:dev
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: proxy
+              containerPort: 5002
+              protocol: TCP
+          env:
+            - name: UPSTREAM_REGISTRY
+              value: "https://REPLACE_ME.azurecr.io"
+            - name: AUTH_MODE
+              value: "auto"
+            - name: ACR_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: acr-admin-creds
+                  key: username
+            - name: ACR_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: acr-admin-creds
+                  key: password
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: proxy
+            initialDelaySeconds: 1
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: proxy
+            initialDelaySeconds: 5
+            periodSeconds: 30
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "256Mi"
+            limits:
+              cpu: "4"
+              memory: "1Gi"
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            seccompProfile:
+              type: RuntimeDefault
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
