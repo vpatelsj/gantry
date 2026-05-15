@@ -15,6 +15,7 @@ import (
 	"github.com/gantry/gantry/internal/cache"
 	"github.com/gantry/gantry/internal/config"
 	"github.com/gantry/gantry/internal/digest"
+	"github.com/gantry/gantry/internal/ifaces"
 	"github.com/gantry/gantry/internal/mirror"
 	"github.com/gantry/gantry/internal/origin"
 )
@@ -437,6 +438,11 @@ func TestMirror_OriginSuccessMetric_FiresOnlyOnCacheCommit(t *testing.T) {
 		defer func() { _ = c.Close() }()
 
 		var successCalls int32
+		// Twelfth-review: terminal counter for downstream failures.
+		// Capture the (kind,class) values so we can assert the
+		// exact label set this truncation maps to.
+		var downstreamCalls int32
+		var downstreamKinds, downstreamClasses []string
 		oc, err := origin.New(cfg)
 		if err != nil {
 			t.Fatal(err)
@@ -444,6 +450,11 @@ func TestMirror_OriginSuccessMetric_FiresOnlyOnCacheCommit(t *testing.T) {
 		m := mirror.New(cfg, c, oc,
 			mirror.WithOriginSuccessMetric(func(_ string, _ int64) {
 				atomic.AddInt32(&successCalls, 1)
+			}),
+			mirror.WithDownstreamFailureMetric(func(kind, class string) {
+				atomic.AddInt32(&downstreamCalls, 1)
+				downstreamKinds = append(downstreamKinds, kind)
+				downstreamClasses = append(downstreamClasses, class)
 			}),
 		)
 		srv := httptest.NewServer(m.Handler())
@@ -466,9 +477,133 @@ func TestMirror_OriginSuccessMetric_FiresOnlyOnCacheCommit(t *testing.T) {
 		if n := atomic.LoadInt32(&successCalls); n != 0 {
 			t.Fatalf("successCalls after truncated origin = %d, want 0 (io.Copy returned an error before cw.Commit; this is the cache-commit-skipped path the success metric must NOT count)", n)
 		}
+		// The truncation may surface in EITHER io.Copy
+		// (truncated read) OR cw.Commit (digest mismatch on
+		// finalize). Both paths fire the downstream failure
+		// hook, so we expect exactly 1.
+		if n := atomic.LoadInt32(&downstreamCalls); n != 1 {
+			t.Fatalf("downstreamCalls after truncated origin = %d, want 1 (origin returned 2xx; the downstream io.Copy or cw.Commit failed; must move arithmetic off in-flight)", n)
+		}
+		if len(downstreamKinds) != 1 || downstreamKinds[0] != "layer" {
+			t.Fatalf("downstreamKinds = %v, want [layer]", downstreamKinds)
+		}
+		if len(downstreamClasses) != 1 || downstreamClasses[0] != string(ifaces.FailureTransient) {
+			t.Fatalf("downstreamClasses = %v, want [transient] (downstream failures reserved class)", downstreamClasses)
+		}
 		// The cache must also be empty since commit never ran.
 		if ok, _ := c.Has(context.Background(), d); ok {
 			t.Errorf("cache.Has(d) = true after truncated origin pull; want false (commit must not have run)")
 		}
 	})
+}
+
+// TestMirror_OriginPullArithmeticIdentity pins the twelfth-review
+// arithmetic invariant for the mirror direct-origin path:
+//
+//	p2p_origin_pull_total{kind}  ==  p2p_origin_pull_success_total{kind}
+//	                              +  p2p_origin_pull_failure_total{kind,class=any}
+//	                              +  (in-flight at scrape time)
+//
+// Before this batch, downstream failures (io.Copy stall / cw.Commit
+// digest mismatch) bumped neither success nor failure, so started
+// drifted positive on every cache-commit-skipped path. This test
+// drives the mirror through one success and one truncation, and
+// asserts started == success + failure == 2 with zero in-flight at
+// the end.
+func TestMirror_OriginPullArithmeticIdentity(t *testing.T) {
+	good := []byte("good-body")
+	gd := digestOf(good)
+	truncBody := []byte("full-body-but-truncated-here")
+	td := digestOf(truncBody)
+
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/blobs/"+gd.String()):
+			w.Header().Set("Content-Length", fmt.Sprintf("%d", len(good)))
+			_, _ = w.Write(good)
+		case strings.HasSuffix(r.URL.Path, "/blobs/"+td.String()):
+			// Advertise full length but write only a few bytes
+			// then drop the connection so io.Copy in serveDigest
+			// returns an error.
+			w.Header().Set("Content-Length", fmt.Sprintf("%d", len(truncBody)))
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(truncBody[:5])
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer up.Close()
+
+	cfg := &config.Config{UpstreamRegistries: []config.UpstreamRegistry{
+		{Name: "reg.example.com", Endpoint: up.URL},
+	}}
+	c, err := cache.Open(t.TempDir(), 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = c.Close() }()
+
+	var (
+		started    int32
+		successes  int32
+		failures   int32
+		downstream int32
+	)
+	oc, err := origin.New(cfg,
+		origin.WithMetrics(
+			func(_ string) { atomic.AddInt32(&started, 1) },
+			func(_, _ string) { atomic.AddInt32(&failures, 1) },
+		),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := mirror.New(cfg, c, oc,
+		mirror.WithOriginSuccessMetric(func(_ string, _ int64) {
+			atomic.AddInt32(&successes, 1)
+		}),
+		mirror.WithDownstreamFailureMetric(func(_, _ string) {
+			atomic.AddInt32(&downstream, 1)
+		}),
+	)
+	srv := httptest.NewServer(m.Handler())
+	defer srv.Close()
+
+	// Successful pull.
+	resp, err := http.Get(srv.URL + "/v2/lib/n/blobs/" + gd.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	// Truncated pull.
+	resp, err = http.Get(srv.URL + "/v2/lib/n/blobs/" + td.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	// Identity: started == success + failure + downstream.
+	// In-flight is zero because both requests have returned.
+	s := atomic.LoadInt32(&started)
+	su := atomic.LoadInt32(&successes)
+	fa := atomic.LoadInt32(&failures)
+	dn := atomic.LoadInt32(&downstream)
+	if s != 2 {
+		t.Errorf("started = %d, want 2 (one GET per pull)", s)
+	}
+	if su != 1 {
+		t.Errorf("successes = %d, want 1 (only the good pull committed)", su)
+	}
+	if fa != 0 {
+		t.Errorf("origin-side failures = %d, want 0 (both pulls got 200 from origin)", fa)
+	}
+	if dn != 1 {
+		t.Errorf("downstream failures = %d, want 1 (the truncation)", dn)
+	}
+	if s != su+fa+dn {
+		t.Errorf("arithmetic identity broken: started=%d != success(%d)+failure(%d)+downstream(%d) = %d", s, su, fa, dn, su+fa+dn)
+	}
 }

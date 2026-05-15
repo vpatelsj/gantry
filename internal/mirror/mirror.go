@@ -135,14 +135,15 @@ func (s *Server) Drain() { s.draining.Store(true) }
 func (s *Server) MarkReady() { s.ready.Store(true) }
 
 type metricsHooks struct {
-	onCacheHit         func()
-	onCacheMiss        func()
-	onOriginSuccess    func(kind string, bytes int64)
-	onPeerFetch        func(outcome string)
-	onPeerFetchLatency func(outcome string, d time.Duration)
-	onPeerDialResult   func(success bool)
-	onDhtLookup        func(outcome string, dur time.Duration)
-	onProvideError     func(op string)
+	onCacheHit                func()
+	onCacheMiss               func()
+	onOriginSuccess           func(kind string, bytes int64)
+	onOriginDownstreamFailure func(kind, class string)
+	onPeerFetch               func(outcome string)
+	onPeerFetchLatency        func(outcome string, d time.Duration)
+	onPeerDialResult          func(success bool)
+	onDhtLookup               func(outcome string, dur time.Duration)
+	onProvideError            func(op string)
 }
 
 // Option configures Server construction.
@@ -158,17 +159,32 @@ func WithLogger(l *slog.Logger) Option {
 }
 
 // WithMetrics registers metric callbacks for cache hit and cache
-// miss observed by the mirror. The origin-pull-started, success, and
-// failure counters are intentionally NOT plumbed here — they are
-// owned by origin.WithMetrics in the origin Client, which is the
-// single chokepoint every origin pull goes through (both the
-// mirror's direct-origin fallback below AND the coordinated
-// please_pull / runOriginPull goroutine in cmd/gantry). Counting at
-// the mirror would silently undercount every please_pull-coordinated
-// pull and break the started == success + failure + in-flight
-// arithmetic identity that all three counters rely on. Success is
-// the deliberate exception (see WithOriginSuccessMetric) because
-// origin cannot know whether the caller actually committed bytes.
+// miss observed by the mirror. The origin pull-family counters are
+// intentionally NOT plumbed here — they're split across origin and
+// mirror to keep one source of truth per counter:
+//
+//   - p2p_origin_pull_total{kind} and p2p_origin_failure_total{class}
+//     belong to origin.WithMetrics in the origin Client. Origin is
+//     the single chokepoint that both the mirror direct-origin path
+//     and the coordinated please_pull / runOriginPull goroutine
+//     route through, so counting there means dashboards see one
+//     source of truth and the operator-facing "is origin sick?"
+//     alert (p2p_origin_failure_total) stays consistent across both
+//     paths and free of false positives from downstream failures.
+//   - p2p_origin_pull_success_total{kind} belongs to the mirror
+//     (WithOriginSuccessMetric) because origin can't know whether
+//     the caller actually committed bytes — see that option's doc.
+//   - p2p_origin_pull_failure_total{kind,class} is fed from BOTH
+//     halves: origin's failure hook bumps it on true origin-side
+//     failures (with double-bump of p2p_origin_failure_total), and
+//     the mirror's WithDownstreamFailureMetric bumps it on
+//     downstream failures (with class=transient, NO double-bump of
+//     p2p_origin_failure_total).
+//
+// Counting any of these at the mirror's WithMetrics hook would
+// silently undercount the please_pull-coordinated path (the bulk of
+// pulls on a hot cluster) and break the started == success + failure
+// + in-flight arithmetic identity that all three counters rely on.
 func WithMetrics(cacheHit, cacheMiss func()) Option {
 	return func(s *Server) {
 		s.metrics.onCacheHit = cacheHit
@@ -197,6 +213,47 @@ func WithMetrics(cacheHit, cacheMiss func()) Option {
 func WithOriginSuccessMetric(originSuccess func(kind string, bytes int64)) Option {
 	return func(s *Server) {
 		s.metrics.onOriginSuccess = originSuccess
+	}
+}
+
+// WithDownstreamFailureMetric registers a callback fired by the
+// mirror's direct-origin path when the body has been received from
+// origin but a DOWNSTREAM step (io.Copy stall, cw.Commit digest
+// mismatch / cache I/O error, directVerifier mismatch) fails before
+// the cluster has produced a usable artifact.
+//
+// Why this is separate from the origin failure-hook
+// (origin.WithMetrics' failure closure in cmd/gantry/main.go):
+//   - origin.WithMetrics' failure closure is the origin-side
+//     terminal counter — it bumps BOTH p2p_origin_pull_failure_total
+//     (operator dashboards) AND p2p_origin_failure_total (the
+//     "is origin sick?" alert). Origin-side failures are the
+//     ones where the origin pull never started, never returned
+//     2xx, or returned a non-2xx body. Counting downstream
+//     failures (where origin DID return 2xx but the body
+//     stalled / corrupted en route to the cache) against the
+//     same closure would falsely accuse origin of being sick.
+//   - This hook bumps ONLY p2p_origin_pull_failure_total
+//     (per-(kind,class) detail) with class="transient", leaving
+//     p2p_origin_failure_total reserved for true origin-side
+//     failures. Operators see the failure detail without the
+//     alert false-positive.
+//
+// Together with onOriginSuccess and the origin-side failure
+// closure, this restores the per-pull arithmetic identity
+// for the GET path:
+//
+//	p2p_origin_pull_total{kind}  ==  p2p_origin_pull_success_total{kind}
+//	                              +  p2p_origin_pull_failure_total{kind,class=any}
+//	                              +  (in-flight at scrape time)
+//
+// The twelfth code review flagged the missing terminal counter
+// for downstream failures as the second of the two reasons that
+// identity drifted positive in production traces. (The first
+// was HEAD, fixed in Batch 61 by adding origin.Head.)
+func WithDownstreamFailureMetric(downstreamFailure func(kind, class string)) Option {
+	return func(s *Server) {
+		s.metrics.onOriginDownstreamFailure = downstreamFailure
 	}
 }
 
@@ -617,7 +674,15 @@ func (s *Server) serveDigest(w http.ResponseWriter, r *http.Request, upstream, r
 	written, err := io.Copy(dest, pr)
 	if err != nil {
 		// Bytes already sent; we can't undo. Cache will be aborted by defer.
+		// This is a terminal downstream failure: origin returned 2xx
+		// and we drained part of the body, but the stream stalled
+		// before EOF. Count it against p2p_origin_pull_failure_total
+		// (class=transient) so the per-pull arithmetic
+		// (started == success + failure + in_flight) holds. We do
+		// NOT also bump p2p_origin_failure_total — origin gave us
+		// 2xx, the failure is downstream.
 		logger.Debug("mirror: copy stalled", slog.Int64("written", written), slog.Any("err", err))
+		s.fireOriginDownstreamFailure(kind, ifaces.FailureTransient)
 		return
 	}
 	if directVerifier != nil {
@@ -629,7 +694,12 @@ func (s *Server) serveDigest(w http.ResponseWriter, r *http.Request, upstream, r
 			)
 			// Corrupted bytes: do NOT count as origin success.
 			// The client already got them, but the cluster did
-			// not produce a usable cached/verifiable copy.
+			// not produce a usable cached/verifiable copy. This
+			// is a downstream-detected failure (origin returned
+			// 2xx; we caught the mismatch via the in-process
+			// digestpipe verifier) so it goes to the downstream
+			// counter, not to origin's failure family.
+			s.fireOriginDownstreamFailure(kind, ifaces.FailureTransient)
 			return
 		}
 		// Direct-stream verifier passed: bytes were delivered to
@@ -643,7 +713,16 @@ func (s *Server) serveDigest(w http.ResponseWriter, r *http.Request, upstream, r
 	if cwerr == nil {
 		if err := cw.Commit(ctx); err != nil {
 			// The client already got the bytes; cache just doesn't keep them.
+			// cw.Commit is where the cache's internal digestpipe runs;
+			// a non-nil error here means EITHER cache I/O failed OR
+			// the stream's digest didn't match d. Either way it's a
+			// terminal downstream failure of THIS pull (no usable
+			// cached copy produced) and must move the arithmetic
+			// off in-flight. Origin returned 2xx, so we route this
+			// to the downstream counter, NOT to the origin failure
+			// family.
 			logger.Warn("mirror: cache commit failed", slog.Any("err", err))
+			s.fireOriginDownstreamFailure(kind, ifaces.FailureTransient)
 			return
 		}
 		// Re-advertise into the DHT now that we hold a byte-identical
@@ -945,10 +1024,38 @@ func (s *Server) reAdvertiseDigest(d digest.Digest, op string, logger *slog.Logg
 }
 
 // bumpCacheHit / bumpCacheMiss are no-ops if no metric hooks were
-// registered. There is intentionally no bumpOriginPull or
-// bumpOriginFailure here — see the WithMetrics doc comment for why
-// the origin-pull-started / -failure / -success counters all live
-// in origin.WithMetrics instead.
+// registered. There is intentionally no bumpOriginPull,
+// bumpOriginFailure, bumpOriginSuccess, or bumpOriginDownstreamFailure
+// helper here. The origin pull-family counters are split deliberately
+// across two packages (see the WithMetrics, WithOriginSuccessMetric,
+// and WithDownstreamFailureMetric doc comments):
+//
+//   - p2p_origin_pull_total{kind}            : bumped by origin.Client
+//     at Pull entry (via origin.WithMetrics' onPullStart hook).
+//     origin.Client.Head deliberately does NOT bump this counter.
+//   - p2p_origin_pull_failure_total{kind,class} : bumped from two
+//     places — origin.Client.recordFailure (true origin-side
+//     failures: non-2xx, network errors) AND the mirror's
+//     fireOriginDownstreamFailure (downstream failures after
+//     origin returned 2xx: io.Copy stall, cw.Commit, directVerifier).
+//   - p2p_origin_failure_total{class}        : bumped ONLY by
+//     origin.Client.recordFailure (true origin-side failures).
+//     Reserved for the "is the origin sick?" operator alert; the
+//     mirror's downstream-failure hook does NOT bump it.
+//   - p2p_origin_pull_success_total{kind}    : bumped by the mirror
+//     (fireOriginSuccess) after cw.Commit succeeds or the direct-
+//     stream digest verifier passes, AND by the puller pump's
+//     runOriginPull after that path's cw.Commit. Origin cannot
+//     emit success because origin has no way to know whether the
+//     caller actually committed bytes.
+//
+// Together this layout preserves the per-pull arithmetic identity:
+//
+//	started == success + (origin_failure + downstream_failure) + in_flight
+//
+// while keeping the operator-facing "origin sick" alert
+// (p2p_origin_failure_total) free of false positives from local
+// cache I/O errors or origin truncations.
 func (s *Server) bumpCacheHit() {
 	if s.metrics.onCacheHit != nil {
 		s.metrics.onCacheHit()
@@ -974,6 +1081,22 @@ func (s *Server) fireOriginSuccess(kind ifaces.OriginRefKind, bytes int64) {
 		return
 	}
 	s.metrics.onOriginSuccess(kind.MetricLabel(), bytes)
+}
+
+// fireOriginDownstreamFailure emits the per-(kind,class)
+// p2p_origin_pull_failure_total via the hook registered with
+// WithDownstreamFailureMetric. Call sites must invoke this on
+// terminal failures of the downstream pipeline (io.Copy / cw.Commit
+// / directVerifier.Verify) AFTER origin returned 2xx. Origin-side
+// failures (origin.Pull returned an *ifaces.OriginError) are
+// counted separately by origin.WithMetrics' failure closure and
+// must NOT also fire this hook — see WithDownstreamFailureMetric's
+// doc for the cleanup of the two counters.
+func (s *Server) fireOriginDownstreamFailure(kind ifaces.OriginRefKind, class ifaces.FailureClass) {
+	if s.metrics.onOriginDownstreamFailure == nil {
+		return
+	}
+	s.metrics.onOriginDownstreamFailure(kind.MetricLabel(), string(class))
 }
 
 func (s *Server) bumpPeerFetch(outcome string) {

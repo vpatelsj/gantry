@@ -178,26 +178,48 @@ func runAgent(args []string) error {
 	originSuccess := func(kind string, _ int64) {
 		inst.originPullSuccess.WithLabelValues(kind).Inc()
 	}
+	// Twelfth-review fix: terminal counter for DOWNSTREAM failures
+	// (io.Copy stall after origin returned 2xx / cw.Commit /
+	// directVerifier mismatch / cache writer open). These are
+	// pull-arithmetic terminals — without them
+	// p2p_origin_pull_total{kind} drifted above
+	// p2p_origin_pull_success_total + p2p_origin_pull_failure_total
+	// on every downstream failure path. We route them to
+	// p2p_origin_pull_failure_total{kind,class=transient} but
+	// deliberately do NOT bump p2p_origin_failure_total: that
+	// counter is reserved for true origin-side failures (origin
+	// returned a non-2xx response) so the operator-facing "is
+	// origin sick?" alert doesn't false-positive on local cache
+	// I/O errors or origin truncations that look upstream from
+	// here.
+	originDownstreamFailure := func(kind, class string) {
+		inst.originPullFailure.WithLabelValues(kind, class).Inc()
+	}
 	originClient, err := origin.New(c,
 		origin.WithLogger(logger),
 		origin.WithMetrics(
 			func(kind string) { inst.originPullTotal.WithLabelValues(kind).Inc() },
 			// Failure: bump BOTH the per-(kind,class) counter
 			// p2p_origin_pull_failure_total AND the per-class
-			// p2p_origin_failure_total. The two are documented in
-			// §7.6 separately — the former lets dashboards split
-			// failures by what was being pulled (manifest vs
-			// config vs layer), the latter is the operator-facing
-			// "is the origin sick?" alert signal. Previously the
-			// per-class counter was only fed by the mirror direct
-			// path; this left the please_pull-coordinated path
-			// (the bulk of pulls on a hot cluster) silently
-			// uncounted. Wiring it here, at the single origin
-			// chokepoint, means both paths feed both counters
-			// from the same closure — there is one source of
-			// truth for both metrics, and the two are guaranteed
-			// to agree on what counts as a "terminal origin
-			// failure".
+			// p2p_origin_failure_total. This closure fires only
+			// on TRUE origin-side failures (origin.recordFailure
+			// inside origin.Client). Downstream failures (io.Copy
+			// / Commit after origin returned 2xx) go through a
+			// separate closure — see originDownstreamFailure
+			// above — that bumps ONLY the per-(kind,class)
+			// detail counter and leaves p2p_origin_failure_total
+			// undisturbed so the "is origin sick?" alert stays
+			// accurate.
+			//
+			// Previously the per-class counter was only fed by
+			// the mirror direct path; this left the please_pull-
+			// coordinated path (the bulk of pulls on a hot
+			// cluster) silently uncounted. Wiring it here at the
+			// single origin chokepoint means both paths feed
+			// both counters from the same closure — there is
+			// one source of truth for both metrics, and the
+			// two are guaranteed to agree on what counts as a
+			// "terminal origin-SIDE failure".
 			func(kind, class string) {
 				inst.originPullFailure.WithLabelValues(kind, class).Inc()
 				inst.originFailureTotal.WithLabelValues(class).Inc()
@@ -430,7 +452,7 @@ func runAgent(args []string) error {
 	var pullerPumpWG sync.WaitGroup
 	pullerPump := newPullerPump(inflightMap, originClient, cstore, disco, negCache, logger, &pullerPumpWG, func() {
 		p2.dhtProvideErr.WithLabelValues("origin_pull_announce").Inc()
-	}, originSuccess)
+	}, originSuccess, originDownstreamFailure)
 	coordOpts := []coord.Option{
 		coord.WithLogger(logger),
 		coord.WithMetrics(coord.MetricsHooks{
@@ -578,6 +600,7 @@ func runAgent(args []string) error {
 			func() {}, // cache miss already counted by cache hook
 		),
 		mirror.WithOriginSuccessMetric(originSuccess),
+		mirror.WithDownstreamFailureMetric(originDownstreamFailure),
 		mirror.WithDiscovery(disco, peerClient),
 		mirror.WithPeerMetrics(
 			func(outcome string) { p2.peerFetch.WithLabelValues(outcome).Inc() },
@@ -1943,7 +1966,7 @@ func (p *layerPrefetchAdapter) OnManifestServed(ctx context.Context, registry, r
 //   - On terminal origin failure, the goroutine classifies via the
 //     *ifaces.OriginError wrapper and records the failure so the next
 //     pull_intent_query response surfaces recently_failed.
-func newPullerPump(infl *inflight.Map, originClient ifaces.OriginPuller, cstore ifaces.Cache, disco *discovery.Host, neg *negcache.Cache, logger *slog.Logger, wg *sync.WaitGroup, onProvideErr func(), onOriginSuccess func(kind string, bytes int64)) coord.PullerPump {
+func newPullerPump(infl *inflight.Map, originClient ifaces.OriginPuller, cstore ifaces.Cache, disco *discovery.Host, neg *negcache.Cache, logger *slog.Logger, wg *sync.WaitGroup, onProvideErr func(), onOriginSuccess func(kind string, bytes int64), onDownstreamFailure func(kind, class string)) coord.PullerPump {
 	lg := logger.With(slog.String("subsystem", "puller-pump"))
 	return func(_ context.Context, registry, repository string, d digest.Digest, kind ifaces.OriginRefKind) (time.Time, bool, *coord.NegativeEntry) {
 		// §5.8 short-circuit: if we're inside a cooldown window, refuse
@@ -1977,7 +2000,7 @@ func newPullerPump(infl *inflight.Map, originClient ifaces.OriginPuller, cstore 
 			if wg != nil {
 				defer wg.Done()
 			}
-			runOriginPull(originClient, cstore, disco, neg, lg, h, registry, repository, d, kind, onProvideErr, onOriginSuccess)
+			runOriginPull(originClient, cstore, disco, neg, lg, h, registry, repository, d, kind, onProvideErr, onOriginSuccess, onDownstreamFailure)
 		}()
 		return startedAt, false, nil
 	}
@@ -1997,7 +2020,7 @@ func newPullerPump(infl *inflight.Map, originClient ifaces.OriginPuller, cstore 
 //     puller on a flapping local disk while still self-healing.
 //   - On commit success, we clear any prior entry so the ladder resets
 //     for the next failure run.
-func runOriginPull(originClient ifaces.OriginPuller, cstore ifaces.Cache, disco *discovery.Host, neg *negcache.Cache, lg *slog.Logger, h *inflight.Handle, registry, repository string, d digest.Digest, kind ifaces.OriginRefKind, onProvideErr func(), onOriginSuccess func(kind string, bytes int64)) {
+func runOriginPull(originClient ifaces.OriginPuller, cstore ifaces.Cache, disco *discovery.Host, neg *negcache.Cache, lg *slog.Logger, h *inflight.Handle, registry, repository string, d digest.Digest, kind ifaces.OriginRefKind, onProvideErr func(), onOriginSuccess func(kind string, bytes int64), onDownstreamFailure func(kind, class string)) {
 	defer h.Done()
 
 	// Background context: the requesting peer's stream is already
@@ -2047,6 +2070,16 @@ func runOriginPull(originClient ifaces.OriginPuller, cstore ifaces.Cache, disco 
 	w, err := cstore.Writer(ctx, d)
 	if err != nil {
 		recordOriginFailure(neg, d, err, lg, "cache writer open failed", registry, repository)
+		// Origin returned 2xx (we got past originClient.Pull above)
+		// but the cache writer couldn't open — terminal downstream
+		// failure. Bump p2p_origin_pull_failure_total{class=transient}
+		// so the per-pull arithmetic
+		// (started == success + failure + in_flight) holds.
+		// Origin's failure family is NOT bumped: origin gave us
+		// 2xx, the failure is downstream.
+		if onDownstreamFailure != nil {
+			onDownstreamFailure(kind.MetricLabel(), string(ifaces.FailureTransient))
+		}
 		return
 	}
 	defer func() { _ = w.Abort(ctx) }()
@@ -2054,10 +2087,29 @@ func runOriginPull(originClient ifaces.OriginPuller, cstore ifaces.Cache, disco 
 	written, err := io.Copy(w, rc)
 	if err != nil {
 		recordOriginFailure(neg, d, err, lg, "origin pull copy failed", registry, repository)
+		// io.Copy could have failed because origin truncated the
+		// stream OR because the local cache writer errored. We
+		// can't easily distinguish — but we already passed origin's
+		// boundary (it returned 2xx), so we count this as a
+		// downstream-class failure, same as the mirror path's
+		// io.Copy-stalled bucket. Operators correlate with origin's
+		// upstream health via other signals (DNS, TCP, registry
+		// SLO).
+		if onDownstreamFailure != nil {
+			onDownstreamFailure(kind.MetricLabel(), string(ifaces.FailureTransient))
+		}
 		return
 	}
 	if err := w.Commit(ctx); err != nil {
 		recordOriginFailure(neg, d, err, lg, "cache commit failed (digest mismatch or io error)", registry, repository)
+		// Commit failure means EITHER the cache's internal
+		// digestpipe caught a content mismatch (origin lied) OR
+		// the local cache had an I/O error at finalize. Either
+		// way it's a terminal downstream failure of this pull;
+		// no usable cached copy exists.
+		if onDownstreamFailure != nil {
+			onDownstreamFailure(kind.MetricLabel(), string(ifaces.FailureTransient))
+		}
 		return
 	}
 
