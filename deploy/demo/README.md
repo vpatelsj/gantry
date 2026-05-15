@@ -21,13 +21,14 @@ the entire demo** with no residual state in the rest of the repo.
 
 | Path                                                | Build-plan step | Status |
 | --------------------------------------------------- | --------------- | ------ |
-| [`acr-origin-proxy/`](acr-origin-proxy/)            | 1 (spike), 2 (full) | step 1 implemented |
+| [`acr-origin-proxy/`](acr-origin-proxy/)            | 1 (spike), 2 (full) | step 2 implemented |
 | [`infra/`](infra/)                                  | 0 / 0.5         | Azure provisioning scripts implemented |
 | [`Makefile`](Makefile)                              | 1               | implemented |
-| `hosts.toml.baseline.template`                      | 3               | not implemented yet |
-| `hosts.toml.gantry.template`                        | 3               | not implemented yet |
-| `configmap.gantry-demo.yaml`                        | 3               | not implemented yet |
-| `harness/`                                          | 4–8             | not implemented yet |
+| `hosts.toml.baseline.template`                      | 3               | implemented |
+| `hosts.toml.gantry.template`                        | 3               | implemented |
+| `hosts-toml-installer.yaml`                         | 3               | implemented |
+| `configmap.gantry-demo.yaml`                        | 3               | implemented |
+| `harness/`                                          | 4–8             | step 4 skeleton implemented |
 | `grafana-dashboard.json`                            | 9               | not implemented yet |
 
 ## Usage
@@ -36,11 +37,15 @@ The local `Makefile` is the **only** entry point — never add a target
 to the root Makefile. Invoke as:
 
 ```bash
-make -C deploy/demo proxy-build      # build the spike binary
+make -C deploy/demo proxy-build      # build the proxy binary
 make -C deploy/demo proxy-vet
 make -C deploy/demo proxy-image      # build the container image
+make -C deploy/demo harness          # run the build-tagged harness skeleton tests
+make -C deploy/demo harness-baseline # opt-in live baseline phase
+make -C deploy/demo infra-hosts-baseline
+make -C deploy/demo infra-hosts-gantry
 ```
 
-The spike binary's own README explains how to run it locally against
-a real ACR for the Phase 0.5 auth gate:
+The proxy README explains how to run it locally against a real ACR
+and inspect `/metrics` plus `/debug/summary`:
 [`acr-origin-proxy/README.md`](acr-origin-proxy/README.md).

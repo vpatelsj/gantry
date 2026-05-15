@@ -1,30 +1,23 @@
-# `acr-origin-proxy` — auth + reachability spike
+# `acr-origin-proxy` — ACR counting proxy
 
 Demo-only counting reverse proxy in front of an Azure Container
 Registry for the Gantry demo plan
 ([`docs/acr-counting-proxy-demo.md`](../../../docs/acr-counting-proxy-demo.md)).
 
-## Status: SPIKE (build-plan step 1 of plan §10)
+## Status: full counting proxy (build-plan step 2 of plan §10)
 
-This is the **smallest possible** implementation of plan §3.5 (auth)
-and §3.6 (streaming). It can be deployed against a real ACR to
-validate, by hand, the two blockers that gate the rest of the demo:
+This is the demo-only reverse proxy that sits in front of ACR for both
+the baseline and Gantry paths. It implements:
 
-1. ACR Bearer-challenge handling (token exchange at the realm
-   endpoint and one-shot reissue per scope).
-2. Node-reachability of the proxy from AKS nodes via the chosen
-   address (ClusterIP literal, internal LoadBalancer, NodePort, or
-   hostNetwork+hostPort) — see plan §4.5.
+- ACR Basic and Bearer-challenge auth handling (plan §3.5)
+- OCI path classification (`blob`, `manifest_by_digest`,
+  `manifest_by_tag`, `ping`, `other`) (plan §3.4)
+- Prometheus `/metrics` on port 9090 (plan §3.3)
+- `/debug/summary` JSON on port 9090 for scripted assertions
+- Streaming response body accounting with a 64 KiB copy buffer
+- Optional synthetic blob-inflight throttling, disabled by default
 
-It **deliberately does not** implement:
-
-- Path classification (§3.4)
-- Prometheus `/metrics`, `/debug/summary`, started/completed counter
-  pair (§3.3)
-- Unit tests (§3.8)
-- Synthetic-throttle support (§7)
-
-Those land in build-plan step 2 onward.
+It is still a demo artifact, not production infrastructure.
 
 ## Environment
 
@@ -35,8 +28,11 @@ Those land in build-plan step 2 onward.
 | `ACR_PASSWORD`                | yes      |         | ACR admin password (DEMO ONLY)                   |
 | `AUTH_MODE`                   | no       | `auto`  | `basic` \| `bearer` \| `auto` (plan §3.5)        |
 | `LISTEN_ADDR`                 | no       | `:5002` | Bind address.                                    |
+| `METRICS_LISTEN_ADDR`         | no       | `:9090` | `/metrics`, `/debug/summary`, `/healthz`.        |
 | `MAX_TOKEN_LIFETIME_SECONDS`  | no       | `1800`  | Hard cap on a cached Bearer token's lifetime.    |
 | `REFRESH_SKEW_SECONDS`        | no       | `30`    | Refresh tokens this many seconds before expiry.  |
+| `THROTTLE_BLOB_INFLIGHT`      | no       | `0`     | Optional synthetic 429 threshold; 0 disables it. |
+| `THROTTLE_RETRY_AFTER_SECONDS`| no       | `5`     | `Retry-After` value for synthetic 429s.           |
 
 ## Run locally (Phase 0.5 manual gate)
 
@@ -66,11 +62,18 @@ curl -sv -o /dev/null -w "%{http_code}\n" \
 ```
 
 Watch the proxy's log lines: each request prints `method`, `path`,
-upstream `status`, `bytes`, and `auth_refreshed=true|false`. The
-first request to a given scope should print
-`auth_refreshed=true` followed by a `token-refresh:` line; subsequent
-requests to the same scope (until the cached token expires) must
-print `auth_refreshed=false`.
+path class, upstream/client byte counts, and
+`auth_refreshed=true|false`. Then inspect the counters:
+
+```bash
+curl -fsS http://127.0.0.1:9090/debug/summary | jq .
+curl -fsS http://127.0.0.1:9090/metrics | grep '^origin_'
+```
+
+For a Bearer challenge, the first request to a given scope should
+increment `origin_auth_token_refresh_total{result="success"}`; a
+second request to the same scope should reuse the cached token until
+it enters the refresh-skew window.
 
 ## Deploy to `gantry-demo` namespace
 
@@ -85,7 +88,8 @@ kubectl apply -f service.yaml
 kubectl apply -f deployment.yaml
 ```
 
-The Service exposes port 5002 inside the cluster; pick the
-node-reachable address per plan §4.5 (default: the Service's
-ClusterIP literal — record the verified `ip route`/`curl` evidence
-from a node before committing to that path).
+The Service exposes port 5002 for proxy traffic and port 9090 for
+metrics/debug endpoints inside the cluster. Pick the node-reachable
+address for port 5002 per plan §4.5 (default: the Service's ClusterIP
+literal — record the verified `ip route`/`curl` evidence from a node
+before committing to that path).

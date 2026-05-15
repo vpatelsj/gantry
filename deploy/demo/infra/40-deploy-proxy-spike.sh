@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Deploy the current Phase 0.5 auth/reachability proxy spike.
+# Deploy the demo ACR counting proxy.
 
 set -euo pipefail
 
@@ -42,6 +42,7 @@ sed \
     >"${tmpdir}/deployment.yaml"
 
 kubectl apply -f "${tmpdir}/deployment.yaml"
+kubectl -n "${GANTRY_DEMO_NAMESPACE}" rollout restart deploy/acr-origin-proxy
 kubectl -n "${GANTRY_DEMO_NAMESPACE}" rollout status deploy/acr-origin-proxy --timeout=5m
 
 cluster_ip="$(kubectl -n "${GANTRY_DEMO_NAMESPACE}" get svc acr-origin-proxy -o jsonpath='{.spec.clusterIP}')"
@@ -59,12 +60,13 @@ kubectl -n "${GANTRY_DEMO_NAMESPACE}" run "acr-proxy-health-$RANDOM" \
 
 cat <<EOF
 
-Proxy spike is deployed.
+Proxy is deployed.
 ClusterIP: ${cluster_ip}
 
-Current implementation note:
-  This is the auth/reachability spike. It has /healthz and request logs,
-  but it does not yet expose /metrics or /debug/summary.
+Metrics and debug endpoints:
+  kubectl -n ${GANTRY_DEMO_NAMESPACE} port-forward svc/acr-origin-proxy 9090:9090
+  curl -fsS http://127.0.0.1:9090/debug/summary | jq .
+  curl -fsS http://127.0.0.1:9090/metrics | grep '^origin_'
 
 Next validation helpers:
   deploy/demo/infra/50-smoke-proxy-auth.sh ${1:-${DEMO_INFRA_DIR}/env.local}

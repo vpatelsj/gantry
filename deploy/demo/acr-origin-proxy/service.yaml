@@ -1,4 +1,4 @@
-# Demo-only Service for the ACR counting-proxy spike.
+# Demo-only Service for the ACR counting proxy.
 # ClusterIP per docs/acr-counting-proxy-demo.md §4.1.
 #
 # Node reachability of this Service's ClusterIP from AKS nodes is the
@@ -21,9 +21,11 @@ spec:
   selector:
     app.kubernetes.io/name: acr-origin-proxy
   ports:
-    # Metrics port (9090) is reserved for build-plan step 2 and not
-    # exposed yet.
     - name: proxy
       port: 5002
       targetPort: proxy
+      protocol: TCP
+    - name: metrics
+      port: 9090
+      targetPort: metrics
       protocol: TCP

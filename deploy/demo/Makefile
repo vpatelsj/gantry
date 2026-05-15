@@ -51,12 +51,19 @@ proxy-run-local:
 		LISTEN_ADDR=127.0.0.1:5002 \
 		go run .
 
-# ---- harness: reserved for build-plan step 4 -------------------------------
+# ---- harness ---------------------------------------------------------------
 
 .PHONY: harness
 harness:
-	@echo "harness: not implemented yet (build plan step 4)"
-	@exit 2
+	cd harness && go test -tags=demo ./...
+
+.PHONY: harness-baseline
+harness-baseline:
+	set -a; \
+	[ ! -f $(INFRA_DIR)/.state.env ] || . $(INFRA_DIR)/.state.env; \
+	[ ! -f $(ENV_FILE) ] || . $(ENV_FILE); \
+	set +a; \
+	cd harness && DEMO_RUN_LIVE=1 go test -tags=demo -run TestPhaseBaseline -timeout=90m ./...
 
 # ---- greenfield Azure infra ------------------------------------------------
 
@@ -83,6 +90,14 @@ infra-smoke:
 .PHONY: infra-node-reachability
 infra-node-reachability:
 	$(INFRA_DIR)/60-check-node-reachability.sh $(ENV_FILE)
+
+.PHONY: infra-hosts-baseline
+infra-hosts-baseline:
+	$(INFRA_DIR)/70-install-hosts-toml.sh $(ENV_FILE) baseline
+
+.PHONY: infra-hosts-gantry
+infra-hosts-gantry:
+	$(INFRA_DIR)/70-install-hosts-toml.sh $(ENV_FILE) gantry
 
 .PHONY: infra-destroy
 infra-destroy:

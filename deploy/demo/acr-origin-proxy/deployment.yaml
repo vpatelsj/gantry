@@ -1,5 +1,5 @@
-# Demo-only Deployment for the ACR counting-proxy spike.
-# See docs/acr-counting-proxy-demo.md §10 step 1.
+# Demo-only Deployment for the ACR counting proxy.
+# See docs/acr-counting-proxy-demo.md §10 step 2.
 #
 # One-time prerequisites (NOT managed by this manifest):
 #   kubectl create namespace gantry-demo
@@ -27,23 +27,29 @@ spec:
         app.kubernetes.io/name: acr-origin-proxy
         app.kubernetes.io/component: demo-proxy
         app.kubernetes.io/part-of: gantry-demo
-      # Prometheus scrape annotations are intentionally omitted in
-      # step 1: the spike has no /metrics endpoint yet. Step 2 adds
-      # counters and the corresponding prometheus.io/* annotations.
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+        prometheus.io/path: "/metrics"
     spec:
       containers:
         - name: proxy
           image: acr-origin-proxy:dev
-          imagePullPolicy: IfNotPresent
+          imagePullPolicy: Always
           ports:
             - name: proxy
               containerPort: 5002
+              protocol: TCP
+            - name: metrics
+              containerPort: 9090
               protocol: TCP
           env:
             - name: UPSTREAM_REGISTRY
               value: "https://REPLACE_ME.azurecr.io"
             - name: AUTH_MODE
               value: "auto"
+            - name: METRICS_LISTEN_ADDR
+              value: ":9090"
             - name: ACR_USERNAME
               valueFrom:
                 secretKeyRef:

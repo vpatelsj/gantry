@@ -7,18 +7,19 @@ demo from scratch:
 - ACR with demo-only admin credentials enabled
 - AKS node pool sized for the 20-node pull comparison
 - kube-prometheus-stack for cluster visibility
-- The current `acr-origin-proxy` Phase 0.5 spike deployed in Kubernetes
+- The current `acr-origin-proxy` counting proxy deployed in Kubernetes
 
 They intentionally live under `deploy/demo/infra/` so the whole demo
 surface remains isolated from production manifests.
 
 ## Current implementation boundary
 
-The proxy in `deploy/demo/acr-origin-proxy/` is build-plan step 1 only:
-auth and reachability. It exposes `/healthz` and request logs, but it
-does not yet expose `/metrics`, `/debug/summary`, path-class counters,
-the hosts.toml installer, or the baseline/cold/warm harness. Use these
-scripts to reach and validate Phase 0.5 before building the rest.
+The proxy in `deploy/demo/acr-origin-proxy/` implements build-plan
+step 2: auth, streaming, OCI path classification, Prometheus metrics,
+and `/debug/summary`. The fail-closed hosts.toml templates, installer
+DaemonSet, and demo Gantry ConfigMap template are also present. The
+build-tagged harness skeleton is present; baseline/cold/warm phase
+logic and the Grafana dashboard remain follow-up build-plan steps.
 
 ## Quick start
 
@@ -43,7 +44,7 @@ scripts to reach and validate Phase 0.5 before building the rest.
    deploy/demo/infra/30-install-monitoring.sh deploy/demo/infra/env.local
    ```
 
-5. Deploy the proxy spike:
+5. Deploy the proxy:
 
    ```bash
    deploy/demo/infra/40-deploy-proxy-spike.sh deploy/demo/infra/env.local
@@ -54,6 +55,20 @@ scripts to reach and validate Phase 0.5 before building the rest.
    ```bash
    deploy/demo/infra/50-smoke-proxy-auth.sh deploy/demo/infra/env.local
    deploy/demo/infra/60-check-node-reachability.sh deploy/demo/infra/env.local
+   ```
+
+7. Install fail-closed node routing when you are ready to run a phase:
+
+   ```bash
+   deploy/demo/infra/70-install-hosts-toml.sh deploy/demo/infra/env.local baseline
+   deploy/demo/infra/70-install-hosts-toml.sh deploy/demo/infra/env.local gantry
+   ```
+
+   The installer DaemonSet stays alive for log inspection. Delete it
+   after confirming every node wrote the expected file:
+
+   ```bash
+   kubectl -n gantry-demo delete ds/hosts-toml-installer
    ```
 
 The scripts write non-secret generated state to `.state.env`. Secrets

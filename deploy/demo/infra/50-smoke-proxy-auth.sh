@@ -80,3 +80,11 @@ fi
 
 log "Recent proxy logs"
 kubectl -n "${GANTRY_DEMO_NAMESPACE}" logs deploy/acr-origin-proxy --tail=80
+
+echo "Proxy debug summary"
+kubectl -n "${GANTRY_DEMO_NAMESPACE}" exec "${pod}" -- \
+    curl -fsS "http://acr-origin-proxy:9090/debug/summary" | jq .
+
+echo "Proxy origin metric names"
+kubectl -n "${GANTRY_DEMO_NAMESPACE}" exec "${pod}" -- \
+    curl -fsS "http://acr-origin-proxy:9090/metrics" | awk '/^origin_/ {print $1}' | sort -u

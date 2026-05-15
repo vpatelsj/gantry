@@ -1,0 +1,7 @@
+# Demo baseline: proxy is the only upstream. If the proxy is
+# unreachable, pulls fail loudly instead of falling back to ACR.
+
+server = "http://${PROXY_CLUSTER_IP}:5002"
+
+[host."http://${PROXY_CLUSTER_IP}:5002"]
+  capabilities = ["pull", "resolve"]

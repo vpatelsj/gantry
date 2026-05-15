@@ -1,0 +1,8 @@
+# Demo Gantry path: local Gantry first; fallback is the proxy, not ACR.
+# If Gantry and the proxy are both unavailable, pulls fail loudly.
+
+server = "http://${PROXY_CLUSTER_IP}:5002"
+
+[host."http://127.0.0.1:5000"]
+  capabilities = ["pull", "resolve"]
+  skip_verify = true
