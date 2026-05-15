@@ -1,0 +1,164 @@
+# Sidecar-loaded Grafana dashboard for the demo. The label
+# `grafana_dashboard: "1"` matches the kube-prometheus-stack values in
+# 30-install-prom.sh so the dashboard JSON is auto-imported.
+#
+# Panels (all metric names verified in cmd/gantry/main.go):
+#   - Origin pull rate         — rate(p2p_origin_pull_total[1m])
+#   - Origin pull success rate — rate(p2p_origin_pull_success_total[1m])
+#   - Peer fetch rate (mirror) — rate(p2p_peer_fetch_total[1m]) — what
+#                                 each node received from a peer; this
+#                                 is the demo's "peer hit" signal.
+#   - Cache hit rate           — rate(p2p_cache_hit_total[1m])
+#   - In-flight pulls          — p2p_in_flight_pulls
+#   - DHT health               — p2p_dht_health_score
+#   - Gantry CPU / memory      — cAdvisor, scoped by pod=~"gantry-.*"
+#
+# All panels are mirror/cache/coord/discovery-driven. None of them rely
+# on cdsub-only series, so they render even though the demo overlay
+# disables cdsub via containerd_socket: "" (path-(c) caveat).
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gantry-demo-dashboard
+  namespace: monitoring
+  labels:
+    grafana_dashboard: "1"
+data:
+  gantry-demo.json: |-
+    {
+      "uid": "gantry-demo",
+      "title": "Gantry — ACR demo",
+      "schemaVersion": 38,
+      "version": 1,
+      "refresh": "10s",
+      "time": { "from": "now-30m", "to": "now" },
+      "tags": ["gantry", "demo"],
+      "panels": [
+        {
+          "id": 1,
+          "type": "timeseries",
+          "title": "Origin pull rate (started)",
+          "description": "rate(p2p_origin_pull_total[1m]). Coordinator path: only the rank-0 node per digest pulls from origin.",
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (kind) (rate(p2p_origin_pull_total[1m]))",
+              "legendFormat": "{{kind}}"
+            }
+          ]
+        },
+        {
+          "id": 2,
+          "type": "timeseries",
+          "title": "Origin pull success rate",
+          "description": "rate(p2p_origin_pull_success_total[1m]).",
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (kind) (rate(p2p_origin_pull_success_total[1m]))",
+              "legendFormat": "{{kind}}"
+            }
+          ]
+        },
+        {
+          "id": 3,
+          "type": "timeseries",
+          "title": "Peer fetch rate (mirror — peer-served bytes)",
+          "description": "rate(p2p_peer_fetch_total[1m]). The headline 'peer hit' signal: each node serving from another node's cache instead of origin.",
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (outcome) (rate(p2p_peer_fetch_total[1m]))",
+              "legendFormat": "{{outcome}}"
+            }
+          ]
+        },
+        {
+          "id": 4,
+          "type": "timeseries",
+          "title": "Cache hit rate",
+          "description": "rate(p2p_cache_hit_total[1m]). In Phase 6b (warm cache) this should account for ~all serve traffic.",
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum(rate(p2p_cache_hit_total[1m]))",
+              "legendFormat": "cache hits/s"
+            }
+          ]
+        },
+        {
+          "id": 5,
+          "type": "timeseries",
+          "title": "In-flight pulls",
+          "description": "p2p_in_flight_pulls — current concurrent pulls per node (singleflight + coord serializing).",
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (pod) (p2p_in_flight_pulls)",
+              "legendFormat": "{{pod}}"
+            }
+          ]
+        },
+        {
+          "id": 6,
+          "type": "stat",
+          "title": "DHT health score (avg)",
+          "description": "p2p_dht_health_score. Should be ≥ 0.7 cluster-wide before recording.",
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "avg(p2p_dht_health_score)",
+              "legendFormat": "avg"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  { "color": "red", "value": null },
+                  { "color": "yellow", "value": 0.5 },
+                  { "color": "green", "value": 0.7 }
+                ]
+              },
+              "min": 0, "max": 1
+            }
+          }
+        },
+        {
+          "id": 7,
+          "type": "timeseries",
+          "title": "Gantry CPU (cores)",
+          "description": "rate(container_cpu_usage_seconds_total{pod=~\"gantry-.*\"}[1m]).",
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 24 },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (pod) (rate(container_cpu_usage_seconds_total{namespace=\"gantry-system\",pod=~\"gantry-.*\",container=\"gantry\"}[1m]))",
+              "legendFormat": "{{pod}}"
+            }
+          ]
+        },
+        {
+          "id": 8,
+          "type": "timeseries",
+          "title": "Gantry working-set memory",
+          "description": "container_memory_working_set_bytes for gantry pods.",
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 24 },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (pod) (container_memory_working_set_bytes{namespace=\"gantry-system\",pod=~\"gantry-.*\",container=\"gantry\"})",
+              "legendFormat": "{{pod}}"
+            }
+          ]
+        }
+      ]
+    }

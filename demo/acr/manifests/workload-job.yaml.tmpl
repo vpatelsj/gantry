@@ -1,0 +1,69 @@
+# Workload Job — substituted by 40-baseline.sh, 60-with-gantry.sh, and
+# 62-cached-rerun.sh.
+#
+# Knobs (envsubst):
+#   ${IMAGE_REF}    — full pull spec, e.g. acrname.azurecr.io/demo:1715800000.
+#   ${NODE_COUNT}   — fan-out (= parallelism = completions).
+#   ${RUN_LABEL}    — "baseline" | "cold" | "warm" — distinguishes the
+#                     three takes when the same Job spec is re-applied,
+#                     and labels pod logs for 70-compare.sh.
+#
+# Per-pod behaviour:
+#   1. echo "POD_READY <ISO-8601>"  ← timestamp captured *inside* the
+#      pod the moment the image-pull-to-container-start transition
+#      completes, so log scrape gives precise per-pod ready times
+#      without `kubectl get pod -w` polling races.
+#   2. cat /run-id                   ← sanity that the right tag landed.
+#   3. sleep 30                      ← keep the pod around long enough
+#      for KQL ingest + log scrape.
+#
+# imagePullPolicy: Always forces manifest re-resolution on every pod
+# start so containerd can't short-circuit by reusing an in-memory
+# manifest reference.
+#
+# podAntiAffinity (required, kubernetes.io/hostname) makes the scheduler
+# put exactly one pod per node — anything less and we'd be measuring
+# fewer effective pull origins than NODE_COUNT.
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: gantry-demo-workload-${RUN_LABEL}
+  namespace: default
+  labels:
+    app.kubernetes.io/name: gantry-demo-workload
+    gantry.demo/run-label: "${RUN_LABEL}"
+spec:
+  parallelism: ${NODE_COUNT}
+  completions: ${NODE_COUNT}
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 1800
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: gantry-demo-workload
+        gantry.demo/run-label: "${RUN_LABEL}"
+    spec:
+      restartPolicy: Never
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app.kubernetes.io/name: gantry-demo-workload
+              topologyKey: kubernetes.io/hostname
+      containers:
+        - name: workload
+          image: "${IMAGE_REF}"
+          imagePullPolicy: Always
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              echo "POD_READY $(date -u +%FT%T.%NZ) node=${NODE_NAME}"
+              cat /run-id
+              sleep 30

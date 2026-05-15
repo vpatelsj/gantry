@@ -1,0 +1,22 @@
+# ClusterIP Service fronting the metrics port. Required so the
+# ServiceMonitor has a Service object to select; the actual scrape
+# targets are the Pod IPs (kube-prometheus-stack picks them up via
+# Endpoints).
+apiVersion: v1
+kind: Service
+metadata:
+  name: gantry-metrics
+  namespace: gantry-system
+  labels:
+    app.kubernetes.io/name: gantry
+    app.kubernetes.io/component: metrics
+spec:
+  type: ClusterIP
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: gantry
+  ports:
+    - name: metrics
+      port: 9095
+      targetPort: metrics
+      protocol: TCP

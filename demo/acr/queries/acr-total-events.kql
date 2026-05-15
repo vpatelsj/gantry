@@ -1,0 +1,18 @@
+// queries/acr-total-events.kql
+//
+// Headline query: how many repository operations did ACR serve over
+// the run window? Counts every manifest GET, config blob GET, and per-
+// layer blob GET. Substantially more granular than the coarse Azure
+// Monitor TotalPullCount (which is image-level).
+//
+// Variables substituted by envsubst before run:
+//   ${ACR_LOGIN_SERVER}, ${START_ISO}, ${END_ISO}, ${RUN_ID},
+//   ${DEMO_REPO}.
+//
+// Filter to the demo repo + window so concurrent ACR users don't
+// contaminate the count.
+ContainerRegistryRepositoryEvents
+| where TimeGenerated between (datetime("${START_ISO}") .. datetime("${END_ISO}"))
+| where Repository == "${DEMO_REPO}"
+| summarize Events = count() by OperationName, ResultType, Repository, bin(TimeGenerated, 1m)
+| order by TimeGenerated asc, OperationName asc

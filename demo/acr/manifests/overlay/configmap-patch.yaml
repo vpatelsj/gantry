@@ -1,0 +1,63 @@
+# ConfigMap patch: replace the entire data.config.yaml with a demo
+# variant that points at the demo ACR and disables cdsub.
+#
+# `containerd_socket: ""` is path-(c) of the deploy/daemonset.yaml caveat
+# (lines 220–249) — keeps gantry at UID 65532 with no socket-permission
+# surgery; cdsub goes NoOp; gantry's own pulls + peer transfers populate
+# the cache, which is everything the demo needs.
+#
+# ${ACR_LOGIN_SERVER} is substituted by 51a-deploy-gantry.sh.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gantry-config
+  namespace: gantry-system
+data:
+  config.yaml: |
+    mirror_listen: "0.0.0.0:5000"
+    mirror_bind_allow_non_loopback: true
+    transfer_listen: "0.0.0.0:5001"
+    metrics_listen: "0.0.0.0:9095"
+
+    libp2p_listen:
+      - "/ip4/0.0.0.0/tcp/4001"
+      - "/ip4/0.0.0.0/udp/4001/quic-v1"
+    libp2p_identity_path: "/var/lib/gantry/libp2p/identity.key"
+
+    members_label_selector: "app.kubernetes.io/name=gantry"
+
+    cache_dir: "/var/lib/gantry/cache"
+    cache_budget_bytes: 53687091200
+    cache_forced_eviction_headroom_pct: 5
+    eviction_provider_count_threshold: 3
+
+    # cdsub disabled — see file header.
+    containerd_socket: ""
+    containerd_namespace: "k8s.io"
+
+    upstream_registries:
+      - name: "${ACR_LOGIN_SERVER}"
+        endpoint: "https://${ACR_LOGIN_SERVER}"
+        credentials_path: "/etc/gantry/registry/${ACR_LOGIN_SERVER}"
+
+    hrw_k: 3
+    hrw_topology_scope: "cluster"
+    zone_label_key: "topology.kubernetes.io/zone"
+
+    nf5_jitter_base: "3s"
+    nf5_per_node_rate_limit: 2
+    bootstrap_window: "30s"
+    bootstrap_routing_table_pct: 25
+    topk_expansion_factor_degraded: 2
+
+    origin_failure_cooldown_initial: "5s"
+    origin_failure_cooldown_max: "5m"
+    origin_failure_cooldown_multiplier: 2
+    origin_failure_honor_window_cap: "30s"
+    origin_failure_classes_trusted_cluster_wide:
+      - "auth"
+      - "not_found"
+      - "rate_limited"
+
+    log_level: "info"
+    log_format: "json"

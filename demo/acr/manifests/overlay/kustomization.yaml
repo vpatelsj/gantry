@@ -1,0 +1,40 @@
+# Kustomize overlay layered on deploy/ for the demo.
+#
+# Patches:
+#   - DaemonSet image  → ${ACR_LOGIN_SERVER}/gantry:${GANTRY_IMAGE_TAG}
+#   - ConfigMap        → upstream_registries pointing at the demo ACR
+#                         + containerd_socket: "" (cdsub NoOp; demo
+#                         uses path-(c) of the daemonset.yaml caveat)
+#   - Adds Secret      → gantry-registry-credentials, mounted at
+#                         /etc/gantry/registry/<acr>.azurecr.io
+#   - Adds ServiceMonitor for Prometheus discovery
+#   - Adds Service     → ClusterIP fronting metrics:9095 so the
+#                         ServiceMonitor has a target object
+#
+# The Secret is materialised by 51a-deploy-gantry.sh from
+# `az acr credential show` output and applied alongside this overlay.
+#
+# Apply:
+#   kustomize build manifests/overlay | kubectl apply -f -
+#   (51a-deploy-gantry.sh does the equivalent with `kubectl apply -k`).
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: gantry-system
+
+resources:
+  - ../../../../deploy/serviceaccount.yaml
+  - ../../../../deploy/configmap.yaml
+  - ../../../../deploy/daemonset.yaml
+  - service.yaml
+  - servicemonitor.yaml
+
+patches:
+  - path: daemonset-image.yaml
+    target:
+      kind: DaemonSet
+      name: gantry
+  - path: configmap-patch.yaml
+    target:
+      kind: ConfigMap
+      name: gantry-config
