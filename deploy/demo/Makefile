@@ -11,9 +11,11 @@
 #   cd deploy/demo && make <target>
 
 PROXY_DIR := acr-origin-proxy
+INFRA_DIR := infra
 IMAGE_NAME ?= acr-origin-proxy
 IMAGE_TAG  ?= dev
 NAMESPACE  ?= gantry-demo
+ENV_FILE   ?= $(CURDIR)/$(INFRA_DIR)/env.local
 
 .PHONY: all
 all: proxy-build
@@ -55,3 +57,33 @@ proxy-run-local:
 harness:
 	@echo "harness: not implemented yet (build plan step 4)"
 	@exit 2
+
+# ---- greenfield Azure infra ------------------------------------------------
+
+.PHONY: infra-provision
+infra-provision:
+	$(INFRA_DIR)/10-provision-azure.sh $(ENV_FILE)
+
+.PHONY: infra-images
+infra-images:
+	$(INFRA_DIR)/20-build-push-images.sh $(ENV_FILE)
+
+.PHONY: infra-monitoring
+infra-monitoring:
+	$(INFRA_DIR)/30-install-monitoring.sh $(ENV_FILE)
+
+.PHONY: infra-proxy
+infra-proxy:
+	$(INFRA_DIR)/40-deploy-proxy-spike.sh $(ENV_FILE)
+
+.PHONY: infra-smoke
+infra-smoke:
+	$(INFRA_DIR)/50-smoke-proxy-auth.sh $(ENV_FILE)
+
+.PHONY: infra-node-reachability
+infra-node-reachability:
+	$(INFRA_DIR)/60-check-node-reachability.sh $(ENV_FILE)
+
+.PHONY: infra-destroy
+infra-destroy:
+	$(INFRA_DIR)/90-destroy-azure.sh $(ENV_FILE)

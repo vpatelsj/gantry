@@ -22,6 +22,7 @@ the entire demo** with no residual state in the rest of the repo.
 | Path                                                | Build-plan step | Status |
 | --------------------------------------------------- | --------------- | ------ |
 | [`acr-origin-proxy/`](acr-origin-proxy/)            | 1 (spike), 2 (full) | step 1 implemented |
+| [`infra/`](infra/)                                  | 0 / 0.5         | Azure provisioning scripts implemented |
 | [`Makefile`](Makefile)                              | 1               | implemented |
 | `hosts.toml.baseline.template`                      | 3               | not implemented yet |
 | `hosts.toml.gantry.template`                        | 3               | not implemented yet |

@@ -1,0 +1,4 @@
+.state.env
+env.local
+*.local.env
+tmp/
