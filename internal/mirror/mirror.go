@@ -623,6 +623,37 @@ func (s *Server) serveDigest(w http.ResponseWriter, r *http.Request, upstream, r
 
 	s.bumpCacheMiss()
 
+	// 1a. HEAD short-circuit (fourteenth-review fix).
+	//
+	// HEAD is purely metadata: containerd uses it to learn the blob's
+	// Content-Length / existence before issuing a GET. It MUST NOT:
+	//   - send please_pull RPCs (would commit cluster-wide work on a
+	//     metadata probe),
+	//   - body-GET from a peer (would cache-warm and burn peer fetch
+	//     budget for a request that never reads the body),
+	//   - bump p2p_origin_pull_total (HEAD is the origin.Head path, not
+	//     the origin.Pull path; success and downstream-failure can
+	//     never fire here, so counting starts breaks the arithmetic).
+	//
+	// Before this fix the HEAD branch lived AFTER the peer/cold-start
+	// cascade, so a HEAD cache-miss with DHT providers would still
+	// trigger a full peer GET into local cache, and a HEAD cache-miss
+	// with an empty DHT would still consult cold-start (potentially
+	// please_pull-ing). Branching here keeps the metric contract
+	// simple: HEAD is metadata-only, GET is byte-producing and
+	// cache-warming. A subsequent GET for the same digest takes the
+	// normal cache-miss path below and warms the cache then.
+	if r.Method == http.MethodHead {
+		pRef := ifaces.OriginRef{Registry: upstream, Repository: repo, Digest: d, Kind: kind}
+		hsize, herr := s.origin.Head(ctx, pRef)
+		if herr != nil {
+			writeOriginError(w, herr, logger)
+			return
+		}
+		writeBlobHeaders(w, d, hsize, kind)
+		return
+	}
+
 	// 2. Peer fallback (Phase 2). If both DHT and PeerDialer are wired,
 	// try up to maxPeerAttempts providers from FindProviders. The result
 	// is tri-state per design §5.1's "v1 transfer policy":
@@ -686,23 +717,9 @@ func (s *Server) serveDigest(w http.ResponseWriter, r *http.Request, upstream, r
 	// inflated the started counter against operations that could
 	// fire neither success (no commit) nor downstream-failure
 	// (no body copy). See origin.Client.Head's comment for the
-	// full rationale.
+	// full rationale. HEAD is short-circuited above (step 1a) so it
+	// never reaches this section.
 	pRef := ifaces.OriginRef{Registry: upstream, Repository: repo, Digest: d, Kind: kind}
-	if r.Method == http.MethodHead {
-		// Metadata-only path. Single round-trip to origin to learn
-		// the blob's Content-Length, write headers, return. Does
-		// NOT touch the cache writer, does NOT bump any pull-family
-		// counter. A subsequent GET for the same digest follows the
-		// normal cache-miss origin path below and warms the cache
-		// then.
-		hsize, herr := s.origin.Head(ctx, pRef)
-		if herr != nil {
-			writeOriginError(w, herr, logger)
-			return
-		}
-		writeBlobHeaders(w, d, hsize, kind)
-		return
-	}
 
 	pr, psize, perr := s.origin.Pull(ctx, pRef)
 	if perr != nil {
