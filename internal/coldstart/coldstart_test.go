@@ -25,6 +25,11 @@ type stubCoord struct {
 	pleasePullRegs  []string
 	pleasePullRepos []string
 	pleasePullErrs  map[ifaces.NodeID]error
+	// pleasePullOutcomes, when non-nil for a given (node, digest), is
+	// returned verbatim from PleasePull. Used by rule-7 cooldown /
+	// failure / unspecified tests to simulate the puller's state
+	// changing between pull_intent_query and please_pull.
+	pleasePullOutcomes map[ifaces.NodeID]map[digest.Digest]ifaces.PleasePullOutcome
 }
 
 func (s *stubCoord) PullIntentQuery(_ context.Context, id ifaces.NodeID, _ digest.Digest) (ifaces.PullIntent, error) {
@@ -48,6 +53,12 @@ func (s *stubCoord) PleasePull(_ context.Context, id ifaces.NodeID, registry, re
 	}
 	out := make([]ifaces.PleasePullOutcome, len(ds))
 	for i, d := range ds {
+		if perNode, ok := s.pleasePullOutcomes[id]; ok {
+			if o, ok := perNode[d]; ok {
+				out[i] = o
+				continue
+			}
+		}
 		out[i] = ifaces.PleasePullOutcome{Digest: d, Outcome: ifaces.PleasePullStarted}
 	}
 	return out, nil
@@ -546,6 +557,187 @@ func TestRule7_HealthyDhtFiresColdStartAtTopK(t *testing.T) {
 	}
 	if len(coord.pleasePullCalls) != 1 {
 		t.Fatalf("please_pull dialed %d times; want exactly 1 (lowest-rank reachable)", len(coord.pleasePullCalls))
+	}
+}
+
+// TestRule7_PleasePullAlreadyPulling asserts that an ALREADY_PULLING
+// outcome is treated identically to STARTED — the cascade falls
+// through to the DHT poll. This is the common race where the
+// requester's rule-1 read saw the puller idle, but by the time
+// please_pull lands the puller has already begun (e.g., a
+// concurrent resolver beat us). Polling the DHT is correct: a
+// provider record will land when the in-flight pull completes.
+func TestRule7_PleasePullAlreadyPulling(t *testing.T) {
+	d := digest.MustParse("sha256:" + rep('a', 64))
+	nodes := clusterNodes()
+	top := hrw.TopK(nodes, d, 3)
+	coord := &stubCoord{
+		intents: map[ifaces.NodeID]ifaces.PullIntent{
+			top[0].Node.ID: {},
+			top[1].Node.ID: {},
+			top[2].Node.ID: {},
+		},
+		pleasePullOutcomes: map[ifaces.NodeID]map[digest.Digest]ifaces.PleasePullOutcome{
+			top[0].Node.ID: {d: {Digest: d, Outcome: ifaces.PleasePullAlreadyPulling}},
+		},
+	}
+	disco := &stubDisco{
+		health:    1.0,
+		providers: [][]ifaces.Provider{nil, {{NodeID: "x", Addr: "x:5001"}}},
+	}
+	r := buildResolver(t, coord, disco, "self", nodes, coldstart.MetricsHooks{}, time.Now)
+
+	res, err := r.Resolve(context.Background(), d, ifaces.KindBlob, "reg.example.com", "test/repo", 0)
+	if err != nil {
+		t.Fatalf("Resolve err = %v; want success on ALREADY_PULLING (poll DHT)", err)
+	}
+	if len(res.Providers) != 1 || res.Providers[0].Addr != "x:5001" {
+		t.Fatalf("Providers = %+v; want x:5001 from DHT poll", res.Providers)
+	}
+	if len(coord.pleasePullCalls) != 1 {
+		t.Fatalf("please_pull dialed %d times; want 1", len(coord.pleasePullCalls))
+	}
+}
+
+// TestRule7_PleasePullRecentlyFailedTrusted asserts that when the
+// puller's please_pull response reports RECENTLY_FAILED with a
+// trusted failure class (auth / not_found / rate_limited), the
+// resolver short-circuits with ErrFailureShortCircuit *without
+// polling the DHT*. This is the "state changed between rule-1 and
+// rule-7" race the seventh review called out: the puller's local
+// negative cache transitioned mid-cascade, and the requester must
+// surface the same cluster-wide rule the rule-1 path would have.
+func TestRule7_PleasePullRecentlyFailedTrusted(t *testing.T) {
+	classes := []ifaces.FailureClass{
+		ifaces.FailureAuth,
+		ifaces.FailureNotFound,
+		ifaces.FailureRateLimited,
+	}
+	for _, fc := range classes {
+		fc := fc
+		t.Run(string(fc), func(t *testing.T) {
+			d := digest.MustParse("sha256:" + rep('a', 64))
+			nodes := clusterNodes()
+			top := hrw.TopK(nodes, d, 3)
+			now := time.Now()
+			coord := &stubCoord{
+				intents: map[ifaces.NodeID]ifaces.PullIntent{
+					top[0].Node.ID: {},
+					top[1].Node.ID: {},
+					top[2].Node.ID: {},
+				},
+				pleasePullOutcomes: map[ifaces.NodeID]map[digest.Digest]ifaces.PleasePullOutcome{
+					top[0].Node.ID: {d: {
+						Digest:        d,
+						Outcome:       ifaces.PleasePullRecentlyFailed,
+						FailureClass:  fc,
+						CooldownUntil: now.Add(time.Minute),
+					}},
+				},
+			}
+			disco := &stubDisco{health: 1.0}
+			r := buildResolver(t, coord, disco, "self", nodes, coldstart.MetricsHooks{}, func() time.Time { return now })
+
+			_, err := r.Resolve(context.Background(), d, ifaces.KindBlob, "reg.example.com", "test/repo", 0)
+			if !errors.Is(err, coldstart.ErrFailureShortCircuit) {
+				t.Fatalf("class=%s err = %v; want ErrFailureShortCircuit", fc, err)
+			}
+			if len(coord.pleasePullCalls) != 1 {
+				t.Fatalf("class=%s please_pull dialed %d times; want 1", fc, len(coord.pleasePullCalls))
+			}
+		})
+	}
+}
+
+// TestRule7_PleasePullRecentlyFailedTransient asserts that when the
+// puller reports RECENTLY_FAILED with class=transient, the resolver
+// installs the honor window (so subsequent Resolves short-circuit)
+// and returns ErrCooldownActive *without polling the DHT*. The
+// honor-window install must use outcome.CooldownUntil — bounded by
+// TransientCooldownCap, identical to rule 4.
+func TestRule7_PleasePullRecentlyFailedTransient(t *testing.T) {
+	d := digest.MustParse("sha256:" + rep('a', 64))
+	nodes := clusterNodes()
+	top := hrw.TopK(nodes, d, 3)
+	clock := time.Now()
+	clockFn := func() time.Time { return clock }
+	coord := &stubCoord{
+		intents: map[ifaces.NodeID]ifaces.PullIntent{
+			top[0].Node.ID: {},
+			top[1].Node.ID: {},
+			top[2].Node.ID: {},
+		},
+		pleasePullOutcomes: map[ifaces.NodeID]map[digest.Digest]ifaces.PleasePullOutcome{
+			top[0].Node.ID: {d: {
+				Digest:        d,
+				Outcome:       ifaces.PleasePullRecentlyFailed,
+				FailureClass:  ifaces.FailureTransient,
+				CooldownUntil: clock.Add(20 * time.Second),
+			}},
+		},
+	}
+	disco := &stubDisco{health: 1.0}
+	r := buildResolver(t, coord, disco, "self", nodes, coldstart.MetricsHooks{}, clockFn)
+
+	// First Resolve observes the transient outcome and installs
+	// the honor window.
+	if _, err := r.Resolve(context.Background(), d, ifaces.KindBlob, "reg.example.com", "test/repo", 0); !errors.Is(err, coldstart.ErrCooldownActive) {
+		t.Fatalf("first Resolve err = %v; want ErrCooldownActive", err)
+	}
+	if len(coord.pleasePullCalls) != 1 {
+		t.Fatalf("please_pull dialed %d times; want 1 (first Resolve)", len(coord.pleasePullCalls))
+	}
+	firstIntentCalls := coord.intentCalls
+
+	// Second Resolve within the honor window: must short-circuit
+	// without any probe traffic or another please_pull.
+	if _, err := r.Resolve(context.Background(), d, ifaces.KindBlob, "reg.example.com", "test/repo", 0); !errors.Is(err, coldstart.ErrCooldownActive) {
+		t.Fatalf("second Resolve err = %v; want ErrCooldownActive (honor window)", err)
+	}
+	if coord.intentCalls != firstIntentCalls {
+		t.Errorf("second Resolve issued %d new pull_intent_query calls; want 0 (honor window)",
+			coord.intentCalls-firstIntentCalls)
+	}
+	if len(coord.pleasePullCalls) != 1 {
+		t.Errorf("second Resolve issued additional please_pull (total %d); want still 1",
+			len(coord.pleasePullCalls))
+	}
+}
+
+// TestRule7_PleasePullUnspecifiedExhausts asserts that an empty or
+// UNSPECIFIED outcome from the puller maps to ErrExhausted without
+// polling the DHT. Polling would burn the per-digest stall budget
+// waiting for a provider record that may never appear, because the
+// puller never committed to starting a pull.
+func TestRule7_PleasePullUnspecifiedExhausts(t *testing.T) {
+	d := digest.MustParse("sha256:" + rep('a', 64))
+	nodes := clusterNodes()
+	top := hrw.TopK(nodes, d, 3)
+	coord := &stubCoord{
+		intents: map[ifaces.NodeID]ifaces.PullIntent{
+			top[0].Node.ID: {},
+			top[1].Node.ID: {},
+			top[2].Node.ID: {},
+		},
+		pleasePullOutcomes: map[ifaces.NodeID]map[digest.Digest]ifaces.PleasePullOutcome{
+			top[0].Node.ID: {d: {Digest: d, Outcome: ifaces.PleasePullUnspecified}},
+		},
+	}
+	// If the resolver polled the DHT, this stack would eventually
+	// return "x:5001"; the assertion that providers is empty proves
+	// the poll never ran.
+	disco := &stubDisco{
+		health:    1.0,
+		providers: [][]ifaces.Provider{{{NodeID: "x", Addr: "x:5001"}}},
+	}
+	r := buildResolver(t, coord, disco, "self", nodes, coldstart.MetricsHooks{}, time.Now)
+
+	res, err := r.Resolve(context.Background(), d, ifaces.KindBlob, "reg.example.com", "test/repo", 0)
+	if !errors.Is(err, coldstart.ErrExhausted) {
+		t.Fatalf("Resolve err = %v; want ErrExhausted on UNSPECIFIED", err)
+	}
+	if res != nil {
+		t.Errorf("Resolution = %+v; want nil on UNSPECIFIED (no DHT poll)", res)
 	}
 }
 

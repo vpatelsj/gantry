@@ -476,8 +476,45 @@ func (r *Resolver) probe(ctx context.Context, d digest.Digest, kind ifaces.Origi
 	}
 
 	// Cold-start: please_pull, then DHT-poll for completion.
-	if err := r.sendPleasePull(ctx, *puller, d, kind, registry, repository); err != nil {
+	outcome, err := r.sendPleasePull(ctx, *puller, d, kind, registry, repository)
+	if err != nil {
 		return nil, prefix(expandLabel, "rule7_please_pull_failed"), ErrExhausted
+	}
+	// Interpret the per-digest outcome BEFORE polling. The puller's
+	// state can change between pull_intent_query (rule 1 evaluation)
+	// and please_pull (rule 7 dispatch) — e.g. an in-flight pull may
+	// have hit a 401 and entered the negative cache in between. Acting
+	// on the stale rule-1 view would silently waste a per-digest stall
+	// budget on a DHT poll that can never succeed; worse, on
+	// RECENTLY_FAILED we MUST surface the same cluster-wide
+	// short-circuit / honor-window semantics as rule 1 / rule 4.
+	switch outcome.Outcome {
+	case ifaces.PleasePullStarted, ifaces.PleasePullAlreadyPulling:
+		// Pull is committed (or already running) — falls through
+		// to the DHT poll below.
+	case ifaces.PleasePullRecentlyFailed:
+		if isTrustedFailureClass(outcome.FailureClass, r.opts.TrustedFailureClasses) {
+			// auth / not_found / rate_limited: the puller's local
+			// negative cache reports a class for which retry-now
+			// is provably useless cluster-wide. Identical handling
+			// to rule 1, just observed one RPC later because the
+			// transition happened mid-cascade.
+			return nil, prefix(expandLabel, "rule7_failure_short_circuit"), ErrFailureShortCircuit
+		}
+		// Transient: apply the same local honor window that rule 4
+		// uses, bounded by TransientCooldownCap. Return
+		// ErrCooldownActive so the next Resolve within the window
+		// short-circuits without re-probing.
+		r.recordHonorWindow(d, outcome.CooldownUntil)
+		return nil, prefix(expandLabel, "rule7_cooldown"), ErrCooldownActive
+	default:
+		// PleasePullUnspecified or an unrecognised enum value: the
+		// puller did not commit to starting a pull, so the DHT
+		// provider record may never appear. Polling for the full
+		// stall budget would be a multi-second wait for nothing;
+		// surface exhaustion immediately so the caller can fail or
+		// back off.
+		return nil, prefix(expandLabel, "rule7_please_pull_unspecified"), ErrExhausted
 	}
 	providers, err := r.pollDHT(ctx, d, kind, expectedSize)
 	if err != nil {
@@ -532,13 +569,33 @@ func findFailureShortCircuit(rs []response, trusted []ifaces.FailureClass) *resp
 		if !rs[i].intent.RecentlyFailed {
 			continue
 		}
-		for _, t := range trusted {
-			if rs[i].intent.FailureClass == t {
-				return &rs[i]
-			}
+		if isTrustedFailureClass(rs[i].intent.FailureClass, trusted) {
+			return &rs[i]
 		}
 	}
 	return nil
+}
+
+// isTrustedFailureClass reports whether class is in the operator's
+// trusted-failure-class allow-list (§5.8). Trusted failure classes
+// (auth / not_found / rate_limited) are those for which a single
+// origin response is sufficient evidence to short-circuit cluster-
+// wide: every node would hit the same wall on retry-now. Transient
+// is intentionally excluded — it may resolve on the next attempt and
+// a single bad response must not propagate.
+//
+// Used by both findFailureShortCircuit (rule 1, evaluating peer
+// PullIntent responses) and the rule-7 please_pull dispatcher
+// (evaluating PleasePullRecentlyFailed outcomes from the designated
+// puller). Keeping the predicate in one place ensures the two
+// rules' definitions of "trusted" cannot drift.
+func isTrustedFailureClass(class ifaces.FailureClass, trusted []ifaces.FailureClass) bool {
+	for _, t := range trusted {
+		if class == t {
+			return true
+		}
+	}
+	return false
 }
 
 func findCacheHit(rs []response) *response {
@@ -658,19 +715,23 @@ func (r *Resolver) providersFor(v *response, top []hrw.Scored) *Resolution {
 	return &Resolution{Providers: out, Outcome: "rule2_cache_hit"}
 }
 
-func (r *Resolver) sendPleasePull(ctx context.Context, puller response, d digest.Digest, kind ifaces.OriginRefKind, registry, repository string) error {
+func (r *Resolver) sendPleasePull(ctx context.Context, puller response, d digest.Digest, kind ifaces.OriginRefKind, registry, repository string) (ifaces.PleasePullOutcome, error) {
 	// §4.4 invariant: please_pull is a single repo per batch. If the
 	// caller didn't supply registry+repository, refuse to send a
 	// malformed RPC (the server would reject it) and surface a
 	// terminal error so the cascade reports rule7_please_pull_failed
 	// instead of silently succeeding.
 	if registry == "" || repository == "" {
-		return fmt.Errorf("coldstart: please_pull requires non-empty registry+repository (got %q/%q)", registry, repository)
+		return ifaces.PleasePullOutcome{Digest: d}, fmt.Errorf("coldstart: please_pull requires non-empty registry+repository (got %q/%q)", registry, repository)
 	}
 	// Single-digest call; batching is the orchestrator-caller's job
 	// (the mirror at the layer-fanout level groups by puller).
 	ctx, cancel := context.WithTimeout(ctx, r.opts.QueryTimeout)
 	defer cancel()
+	var (
+		outcomes []ifaces.PleasePullOutcome
+		err      error
+	)
 	// When the designated puller is self, skip the libp2p stream and
 	// drive the local pullerPump directly. Identity of "puller is
 	// self" is whatever Members.Self() reports — the synthetic
@@ -680,11 +741,28 @@ func (r *Resolver) sendPleasePull(ctx context.Context, puller response, d digest
 	// = our own peer.ID does not resolve to a network address) or
 	// round-trip through libp2p for no benefit.
 	if r.opts.LocalPull != nil && puller.node.ID == r.opts.Members.Self() {
-		_, err := r.opts.LocalPull.StartLocalPull(ctx, registry, repository, kind, []digest.Digest{d})
-		return err
+		outcomes, err = r.opts.LocalPull.StartLocalPull(ctx, registry, repository, kind, []digest.Digest{d})
+	} else {
+		outcomes, err = r.opts.Coord.PleasePull(ctx, puller.node.ID, registry, repository, kind, []digest.Digest{d})
 	}
-	_, err := r.opts.Coord.PleasePull(ctx, puller.node.ID, registry, repository, kind, []digest.Digest{d})
-	return err
+	if err != nil {
+		return ifaces.PleasePullOutcome{Digest: d}, err
+	}
+	// The server SHOULD return exactly one outcome per requested
+	// digest; be defensive in case the wire is desynced. Look for our
+	// digest specifically rather than assuming index 0 — a buggy
+	// implementation that returned outcomes in different order than
+	// the request would silently drive the wrong cascade branch.
+	for _, o := range outcomes {
+		if o.Digest == d {
+			return o, nil
+		}
+	}
+	// Empty / mismatched response: caller maps PleasePullUnspecified
+	// to ErrExhausted rather than polling the DHT (the puller never
+	// committed to starting a pull, so the provider record may never
+	// land).
+	return ifaces.PleasePullOutcome{Digest: d}, nil
 }
 
 func (r *Resolver) pollDHT(ctx context.Context, d digest.Digest, kind ifaces.OriginRefKind, expectedSize int64) ([]ifaces.Provider, error) {
