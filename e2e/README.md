@@ -1,8 +1,12 @@
 # gantry — end-to-end test suite
 
 This directory holds the kind-based integration suite. It boots a real
-Kubernetes cluster on Docker, builds the gantry container image,
-deploys the DaemonSet, and exercises a pull through the mirror.
+Kubernetes cluster on Docker, builds the gantry container image, and
+deploys the DaemonSet. The currently-implemented smoke test asserts
+that every pod reaches `/readyz=200`; the actual containerd
+pull-through path (configuring `hosts.toml` so node-local containerd
+routes image pulls through the gantry mirror) is still TODO — see
+`Future scenarios` below.
 
 ## Status
 
@@ -101,6 +105,14 @@ matches "smallest to largest dependency on other scenarios."
   a 10-minute test timeout to absorb that.
 - The default kind containerd uses namespace `k8s.io`, matching the
   gantry `containerd_namespace` default — no extra config needed.
-- The DaemonSet socket-permissions caveat from `deploy/daemonset.yaml`
-  applies inside kind too. The harness sets `securityContext.fsGroup`
-  on the e2e pod template to mirror the workaround.
+- The DaemonSet's containerd-socket caveat (`deploy/daemonset.yaml`)
+  applies inside kind too: the pod runs as UID 65532 and
+  `containerd.sock` is `root:root 0660` on the node, so the agent
+  cannot open it. The current smoke test does NOT patch
+  `securityContext.fsGroup` — the agent's cdsub layer falls back to
+  `NoOpSource` when the socket is unreadable, which is enough for the
+  readiness-gate-only smoke test. Once the e2e suite starts asserting
+  containerd-backed announcements or secondary blob serving, the
+  harness will need to patch `spec.template.spec.securityContext.fsGroup`
+  on the DaemonSet (or relax the socket permissions on the kind node)
+  before the agent can read from containerd.
