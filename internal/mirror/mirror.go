@@ -137,7 +137,6 @@ func (s *Server) MarkReady() { s.ready.Store(true) }
 type metricsHooks struct {
 	onCacheHit         func()
 	onCacheMiss        func()
-	onOriginFailure    func(class string)
 	onOriginSuccess    func(kind string, bytes int64)
 	onPeerFetch        func(outcome string)
 	onPeerFetchLatency func(outcome string, d time.Duration)
@@ -158,21 +157,22 @@ func WithLogger(l *slog.Logger) Option {
 	}
 }
 
-// WithMetrics registers metric callbacks for cache hit, cache miss,
-// and origin failure observed by the mirror. The origin-pull-started
-// counter is intentionally NOT plumbed here — it is owned by
-// origin.WithMetrics in the origin Client, which is the single
-// chokepoint every origin pull goes through (both the mirror's
-// direct-origin fallback below AND the coordinated please_pull /
-// runOriginPull goroutine in cmd/gantry). Counting starts at the
-// mirror would silently undercount every please_pull-coordinated
+// WithMetrics registers metric callbacks for cache hit and cache
+// miss observed by the mirror. The origin-pull-started, success, and
+// failure counters are intentionally NOT plumbed here — they are
+// owned by origin.WithMetrics in the origin Client, which is the
+// single chokepoint every origin pull goes through (both the
+// mirror's direct-origin fallback below AND the coordinated
+// please_pull / runOriginPull goroutine in cmd/gantry). Counting at
+// the mirror would silently undercount every please_pull-coordinated
 // pull and break the started == success + failure + in-flight
-// arithmetic identity that all three counters rely on.
-func WithMetrics(cacheHit, cacheMiss func(), originFailure func(class string)) Option {
+// arithmetic identity that all three counters rely on. Success is
+// the deliberate exception (see WithOriginSuccessMetric) because
+// origin cannot know whether the caller actually committed bytes.
+func WithMetrics(cacheHit, cacheMiss func()) Option {
 	return func(s *Server) {
 		s.metrics.onCacheHit = cacheHit
 		s.metrics.onCacheMiss = cacheMiss
-		s.metrics.onOriginFailure = originFailure
 	}
 }
 
@@ -547,14 +547,20 @@ func (s *Server) serveDigest(w http.ResponseWriter, r *http.Request, upstream, r
 		}
 	}
 
-	// 3. Origin pull, stream-and-cache. The started-counter is bumped
-	// inside origin.Pull (via origin.WithMetrics) so both the mirror
-	// direct-origin and the coordinated please_pull paths count one
-	// 'started' apiece against the same counter.
+	// 3. Origin pull, stream-and-cache. The started, failure, AND
+	// success counters are all bumped inside origin.Pull (via
+	// origin.WithMetrics) — origin is the single chokepoint that
+	// both the mirror direct-origin path and the coordinated
+	// please_pull / runOriginPull goroutine route through, so
+	// counting there means dashboards see one source of truth and
+	// the failure breakdown by class is consistent across both
+	// paths. (Success is the deliberate exception — origin emits
+	// STARTED and FAILURE at its own boundary; we emit SUCCESS
+	// from below after cw.Commit because origin has no way to know
+	// whether the caller actually committed bytes.)
 	pRef := ifaces.OriginRef{Registry: upstream, Repository: repo, Digest: d, Kind: kind}
 	pr, psize, perr := s.origin.Pull(ctx, pRef)
 	if perr != nil {
-		s.bumpOriginFailure(perr)
 		writeOriginError(w, perr, logger)
 		return
 	}
@@ -949,10 +955,11 @@ func (s *Server) reAdvertiseDigest(d digest.Digest, op string, logger *slog.Logg
 	}()
 }
 
-// bumpCacheHit / bumpCacheMiss / bumpOriginFailure are no-ops if no
-// metric hooks were registered. There is intentionally no
-// bumpOriginPull here — see the WithMetrics doc comment for why the
-// origin-pull-started counter lives in origin.WithMetrics instead.
+// bumpCacheHit / bumpCacheMiss are no-ops if no metric hooks were
+// registered. There is intentionally no bumpOriginPull or
+// bumpOriginFailure here — see the WithMetrics doc comment for why
+// the origin-pull-started / -failure / -success counters all live
+// in origin.WithMetrics instead.
 func (s *Server) bumpCacheHit() {
 	if s.metrics.onCacheHit != nil {
 		s.metrics.onCacheHit()
@@ -962,17 +969,6 @@ func (s *Server) bumpCacheMiss() {
 	if s.metrics.onCacheMiss != nil {
 		s.metrics.onCacheMiss()
 	}
-}
-func (s *Server) bumpOriginFailure(err error) {
-	if s.metrics.onOriginFailure == nil {
-		return
-	}
-	var oe *ifaces.OriginError
-	class := string(ifaces.FailureUnspecified)
-	if errors.As(err, &oe) {
-		class = string(oe.Class)
-	}
-	s.metrics.onOriginFailure(class)
 }
 
 // fireOriginSuccess emits p2p_origin_pull_success_total via the hook

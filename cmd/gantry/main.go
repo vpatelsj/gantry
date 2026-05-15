@@ -182,7 +182,26 @@ func runAgent(args []string) error {
 		origin.WithLogger(logger),
 		origin.WithMetrics(
 			func(kind string) { inst.originPullTotal.WithLabelValues(kind).Inc() },
-			func(kind, class string) { inst.originPullFailure.WithLabelValues(kind, class).Inc() },
+			// Failure: bump BOTH the per-(kind,class) counter
+			// p2p_origin_pull_failure_total AND the per-class
+			// p2p_origin_failure_total. The two are documented in
+			// §7.6 separately — the former lets dashboards split
+			// failures by what was being pulled (manifest vs
+			// config vs layer), the latter is the operator-facing
+			// "is the origin sick?" alert signal. Previously the
+			// per-class counter was only fed by the mirror direct
+			// path; this left the please_pull-coordinated path
+			// (the bulk of pulls on a hot cluster) silently
+			// uncounted. Wiring it here, at the single origin
+			// chokepoint, means both paths feed both counters
+			// from the same closure — there is one source of
+			// truth for both metrics, and the two are guaranteed
+			// to agree on what counts as a "terminal origin
+			// failure".
+			func(kind, class string) {
+				inst.originPullFailure.WithLabelValues(kind, class).Inc()
+				inst.originFailureTotal.WithLabelValues(class).Inc()
+			},
 		),
 	)
 	if err != nil {
@@ -545,7 +564,6 @@ func runAgent(args []string) error {
 		mirror.WithMetrics(
 			func() {}, // cache hit already counted by cache hook
 			func() {}, // cache miss already counted by cache hook
-			func(class string) { inst.originFailureTotal.WithLabelValues(class).Inc() },
 		),
 		mirror.WithOriginSuccessMetric(originSuccess),
 		mirror.WithDiscovery(disco, peerClient),
