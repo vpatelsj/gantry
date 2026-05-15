@@ -135,26 +135,30 @@ func (h *harness) applyManifests(ctx context.Context) {
 		filepath.Join(h.repoRoot, "deploy", "configmap.yaml")); err != nil {
 		h.t.Fatalf("apply configmap: %v", err)
 	}
-	// NetworkPolicy is intentionally NOT part of the default e2e
-	// rollout. The hardening manifest lives at
-	// deploy/examples/networkpolicy.yaml and is templated — every
-	// rule defers CIDR/namespace choices to the operator (see
-	// deploy/README.md § Hardening overlays). Applying it as-is here
-	// would either fail validation (unresolved placeholders) or
-	// silently isolate the agent pods from the kind-cluster control
-	// plane and break the smoke test before rollout. A dedicated
-	// hardening-overlay e2e variant can opt in via the
-	// GANTRY_E2E_NETWORKPOLICY env var once we have a kind-friendly
-	// concrete copy to ship.
-	if os.Getenv("GANTRY_E2E_NETWORKPOLICY") != "" {
-		if err := h.run(ctx, "kubectl", "apply", "-f",
-			filepath.Join(h.repoRoot, "deploy", "examples", "networkpolicy.yaml")); err != nil {
-			h.t.Fatalf("apply networkpolicy (opt-in): %v", err)
-		}
-	}
-	// Rewrite the DaemonSet image to gantry:e2e using kubectl's
-	// -k overlay would require a kustomization file; for now use
-	// `sed` via kubectl apply -f - with stdin.
+	// NetworkPolicy is intentionally NOT applied by the e2e harness.
+	// The hardening manifest at deploy/examples/networkpolicy.yaml
+	// is templated — every rule defers CIDR/namespace choices to the
+	// operator (see deploy/README.md § Hardening overlays). It is
+	// designed for a production cluster with known control-plane,
+	// node-CIDR, and namespace values; on kind those values are
+	// either dynamic or unknown at apply time, so applying the
+	// template as-is would either fail validation (unresolved
+	// placeholders) or silently isolate the agent pods from the
+	// kind control plane and break every downstream check.
+	//
+	// A previous revision exposed an opt-in GANTRY_E2E_NETWORKPOLICY
+	// env var, but that flag was unusable as shipped: setting it
+	// against the template caused the apply to fail, so no
+	// caller could meaningfully turn it on. The eleventh review
+	// flagged this as dead code. Removed in favor of a future
+	// kind-friendly NetworkPolicy template + dedicated hardening
+	// variant; tracked as TODO below.
+	//
+	// TODO(hardening-e2e): generate a kind-specific NetworkPolicy
+	// with concrete control-plane and node CIDRs at harness setup
+	// time, then add a separate e2e variant (TestE2E_Hardening)
+	// that applies it. The production-reference template at
+	// deploy/examples/networkpolicy.yaml is unchanged.
 	if err := h.applyDaemonSet(ctx); err != nil {
 		h.t.Fatalf("apply daemonset: %v", err)
 	}
