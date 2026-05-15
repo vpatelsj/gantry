@@ -27,25 +27,44 @@ load_state() {
 }
 
 apply_workload_job() {
-    local image_ref="$1" run_label="$2"
+    local image_ref="$1" run_label="$2" job_id="${3:-0}"
     local rendered
     rendered="$(mktemp -t workload-XXXXXX.yaml)"
     IMAGE_REF="${image_ref}" \
         NODE_COUNT="${NODE_COUNT}" \
         RUN_LABEL="${run_label}" \
-        envsubst '${IMAGE_REF} ${NODE_COUNT} ${RUN_LABEL}' \
+        JOB_ID="${job_id}" \
+        envsubst '${IMAGE_REF} ${NODE_COUNT} ${RUN_LABEL} ${JOB_ID}' \
         < manifests/workload-job.yaml.tmpl > "${rendered}"
-    echo "==> Applying workload Job (run-label=${run_label}, image=${image_ref})"
-    kubectl apply -f "${rendered}"
+    echo "==> Applying workload Job (run-label=${run_label}, job-id=${job_id}, image=${image_ref})" >&2
+    kubectl apply -f "${rendered}" >&2
     echo "${rendered}"
 }
 
 wait_workload_job() {
-    local run_label="$1" timeout="${2:-30m}"
-    local job="gantry-demo-workload-${run_label}"
-    echo "==> Waiting for Job/${job} (timeout ${timeout})"
+    local run_label="$1" timeout="${2:-30m}" job_id="${3:-0}"
+    local job="gantry-demo-workload-${run_label}-${job_id}"
+    echo "==> Waiting for Job/${job} (timeout ${timeout})" >&2
     kubectl wait --for=condition=complete \
         "job/${job}" -n default --timeout="${timeout}"
+}
+
+# wait_jobs_by_label <label-selector> <timeout>
+#
+# Waits for ALL Jobs matching the label selector to reach
+# condition=complete. Used by the parallel hammer so we can apply N
+# Jobs in one burst then block until they're all done.
+wait_jobs_by_label() {
+    local sel="$1" timeout="${2:-30m}"
+    local jobs
+    jobs="$(kubectl get jobs -n default -l "${sel}" -o name)"
+    if [[ -z "${jobs}" ]]; then
+        echo "  no jobs match selector ${sel}; nothing to wait for" >&2
+        return 0
+    fi
+    echo "==> Waiting for all jobs matching ${sel} (timeout ${timeout})" >&2
+    # shellcheck disable=SC2086
+    kubectl wait --for=condition=complete -n default ${jobs} --timeout="${timeout}"
 }
 
 assert_no_hosts_toml() {
@@ -337,7 +356,9 @@ EOF
 #   { pods: [{pod, node, pulling, pulled, duration_seconds}],
 #     summary: { count, min, p50, p95, max, mean } }
 #
-# Instant; no Azure dependency.
+# Instant; no Azure dependency. Returns an empty-but-valid summary when
+# no pods match the selector (callers can be hammers that delete pods
+# between iterations).
 scrape_pull_events() {
     local run_label="$1" out_file="$2"
     local rows="[]"
@@ -359,16 +380,98 @@ scrape_pull_events() {
                 '. + [{pod:$pod, node:$node, pulling:$pulling, pulled:$pulled, duration_seconds:$dur}]')"
         fi
     done
-    echo "${rows}" | jq '{
-        pods: .,
-        summary: ([.[].duration_seconds] | {
-            count: length,
-            min:   (min // 0),
-            p50:   (sort | .[length/2|floor] // 0),
-            p95:   (sort | .[((length-1)*0.95)|floor] // 0),
-            max:   (max // 0),
-            mean:  ((add // 0) / (length // 1))
-        })
-    }' > "${out_file}"
+    # Empty-safe summary: divisor of mean is `(length // 1)` (jq's
+    # alternative operator returns the right side when the left is null,
+    # NOT when it's 0), so guard zero-length explicitly.
+    echo "${rows}" | jq '
+        . as $rows
+        | {
+            pods: $rows,
+            summary: (
+                if ($rows | length) == 0 then
+                    {count:0, min:0, p50:0, p95:0, max:0, mean:0}
+                else
+                    ($rows | map(.duration_seconds)) as $d
+                    | {
+                        count: ($d | length),
+                        min:   ($d | min),
+                        p50:   ($d | sort | .[($d|length)/2|floor]),
+                        p95:   ($d | sort | .[(($d|length-1)*0.95)|floor]),
+                        max:   ($d | max),
+                        mean:  (($d | add) / ($d | length))
+                    }
+                end
+            )
+        }
+    ' > "${out_file}"
     echo "  pull events: $(jq -r '.summary | "count=\(.count) min=\(.min)s p50=\(.p50)s p95=\(.p95)s max=\(.max)s"' "${out_file}")" >&2
+}
+
+# scrape_pull_events_append <run_label> <append_file>
+#
+# Hammer-friendly variant: appends the current pods' pull events to a
+# JSON-array file. Use inside a loop that deletes the workload Job
+# between iterations — call this BEFORE the delete so events are still
+# present.
+#
+# The append file is a JSON array of {pod, node, pulling, pulled,
+# duration_seconds, iteration} objects. aggregate_pull_events_file
+# turns it into the same {pods,summary} shape as scrape_pull_events.
+scrape_pull_events_append() {
+    local run_label="$1" append_file="$2" iteration="${3:-0}"
+    [[ -f "${append_file}" ]] || echo '[]' > "${append_file}"
+    for p in $(kubectl get pods -l "gantry.demo/run-label=${run_label}" -o name 2>/dev/null); do
+        local pn=${p#pod/}
+        local node pulling pulled
+        node="$(kubectl get pod "${pn}" -o jsonpath='{.spec.nodeName}' 2>/dev/null)"
+        pulling="$(kubectl get events --field-selector "involvedObject.name=${pn},reason=Pulling" \
+            -o jsonpath='{.items[0].firstTimestamp}' 2>/dev/null)"
+        pulled="$(kubectl get events --field-selector "involvedObject.name=${pn},reason=Pulled" \
+            -o jsonpath='{.items[0].firstTimestamp}' 2>/dev/null)"
+        if [[ -n "${pulling}" && -n "${pulled}" ]]; then
+            local t1 t2 dur
+            t1=$(date -u -d "${pulling}" +%s 2>/dev/null || echo 0)
+            t2=$(date -u -d "${pulled}"  +%s 2>/dev/null || echo 0)
+            dur=$(( t2 - t1 ))
+            local tmp; tmp="$(mktemp)"
+            jq --arg pod "${pn}" --arg node "${node}" \
+                --arg pulling "${pulling}" --arg pulled "${pulled}" \
+                --argjson dur "${dur}" --argjson it "${iteration}" \
+                '. + [{pod:$pod, node:$node, pulling:$pulling, pulled:$pulled, duration_seconds:$dur, iteration:$it}]' \
+                "${append_file}" > "${tmp}" && mv "${tmp}" "${append_file}"
+        fi
+    done
+}
+
+# aggregate_pull_events_file <append_file> <out_file>
+#
+# Convert an array of pull-event records (produced by
+# scrape_pull_events_append) into the canonical {pods, summary} shape.
+aggregate_pull_events_file() {
+    local append_file="$1" out_file="$2"
+    if [[ ! -s "${append_file}" ]]; then
+        echo '{"pods":[], "summary":{"count":0,"min":0,"p50":0,"p95":0,"max":0,"mean":0}}' > "${out_file}"
+        return
+    fi
+    jq '
+        . as $rows
+        | {
+            pods: $rows,
+            summary: (
+                if ($rows | length) == 0 then
+                    {count:0, min:0, p50:0, p95:0, max:0, mean:0}
+                else
+                    ($rows | map(.duration_seconds)) as $d
+                    | {
+                        count: ($d | length),
+                        min:   ($d | min),
+                        p50:   ($d | sort | .[($d|length)/2|floor]),
+                        p95:   ($d | sort | .[(($d|length-1)*0.95)|floor]),
+                        max:   ($d | max),
+                        mean:  (($d | add) / ($d | length))
+                    }
+                end
+            )
+        }
+    ' "${append_file}" > "${out_file}"
 }

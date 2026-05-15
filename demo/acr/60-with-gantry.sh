@@ -54,9 +54,10 @@ if (( overlap_count > 0 )); then
 fi
 echo "  ok: zero overlap."
 
-# Garbage-collect baseline workload.
-echo "==> Deleting baseline Job"
-kubectl delete job gantry-demo-workload-baseline -n default --ignore-not-found
+# Garbage-collect baseline workload (the hammer leaves N labeled Jobs).
+echo "==> Deleting baseline Jobs"
+kubectl get jobs -n default -l gantry.demo/run-label=baseline -o name 2>/dev/null \
+    | xargs -r kubectl delete -n default --ignore-not-found --wait=false
 
 # Snapshot Prom counters BEFORE the run for later delta computation.
 echo "==> Snapshotting Prometheus counters (before)"

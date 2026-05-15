@@ -7,6 +7,10 @@
 #   ${RUN_LABEL}    — "baseline" | "cold" | "warm" — distinguishes the
 #                     three takes when the same Job spec is re-applied,
 #                     and labels pod logs for 70-compare.sh.
+#   ${JOB_ID}       — per-Job suffix that disambiguates parallel
+#                     iterations of the baseline hammer. Must be unique
+#                     per concurrently-running Job (default "0" for
+#                     non-hammered single-Job apply).
 #
 # Per-pod behaviour:
 #   1. echo "POD_READY <ISO-8601>"  ← timestamp captured *inside* the
@@ -21,18 +25,21 @@
 # start so containerd can't short-circuit by reusing an in-memory
 # manifest reference.
 #
-# podAntiAffinity (required, kubernetes.io/hostname) makes the scheduler
-# put exactly one pod per node — anything less and we'd be measuring
-# fewer effective pull origins than NODE_COUNT.
+# podAntiAffinity (required, kubernetes.io/hostname) is scoped by
+# gantry.demo/job-id so multiple parallel Jobs (the hammer fires N at
+# once) can each place exactly one pod per node WITHOUT colliding with
+# each other. With the old cluster-wide selector, only 20 pods total
+# could ever run because pod #21 would find every node already taken.
 ---
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: gantry-demo-workload-${RUN_LABEL}
+  name: gantry-demo-workload-${RUN_LABEL}-${JOB_ID}
   namespace: default
   labels:
     app.kubernetes.io/name: gantry-demo-workload
     gantry.demo/run-label: "${RUN_LABEL}"
+    gantry.demo/job-id: "${JOB_ID}"
 spec:
   parallelism: ${NODE_COUNT}
   completions: ${NODE_COUNT}
@@ -43,6 +50,7 @@ spec:
       labels:
         app.kubernetes.io/name: gantry-demo-workload
         gantry.demo/run-label: "${RUN_LABEL}"
+        gantry.demo/job-id: "${JOB_ID}"
     spec:
       restartPolicy: Never
       affinity:
@@ -50,7 +58,7 @@ spec:
           requiredDuringSchedulingIgnoredDuringExecution:
             - labelSelector:
                 matchLabels:
-                  app.kubernetes.io/name: gantry-demo-workload
+                  gantry.demo/job-id: "${JOB_ID}"
               topologyKey: kubernetes.io/hostname
       containers:
         - name: workload

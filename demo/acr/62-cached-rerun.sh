@@ -108,7 +108,8 @@ PROM_BEFORE="${ARTIFACTS_DIR}/cached-${RUN_ID}-prom-before.json"
 } > "${PROM_BEFORE}"
 
 # 4. Re-apply the workload Job with same RUN_ID under run-label=warm.
-kubectl delete job gantry-demo-workload-cold -n default --ignore-not-found
+kubectl get jobs -n default -l gantry.demo/run-label=cold -o name 2>/dev/null \
+    | xargs -r kubectl delete -n default --ignore-not-found --wait=false
 
 START_ISO="$(date -u +%FT%TZ)"
 echo "${START_ISO}" > .cached-start

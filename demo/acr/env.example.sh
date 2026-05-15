@@ -45,11 +45,13 @@ export RUN_ID="${RUN_ID:-}"
 
 # How many baseline workload iterations 40-baseline.sh runs back-to-back
 # to drive ACR pull load high enough to risk Basic-SKU throttling.
-# Each iteration mints a fresh tag (so containerd can't serve from its
-# content store) and produces ~640 ACR repository events. 5 iterations
-# ≈ 3200 events over ~5 min — usually enough to bite Basic limits.
+# Implementation: 40-baseline.sh pre-builds all N images first (Phase A),
+# then fires the workload Jobs back-to-back with no build pauses (Phase
+# B), so the Phase-B burst rate is the actual ACR-side load. Each
+# iteration produces ~640 ACR repository events. 10 iterations ≈ 6400
+# events over ~2 min — usually enough to bite Basic-SKU ReadOps.
 # Set to 1 for the original single-pass behaviour.
-export BASELINE_HAMMER_ITERATIONS="${BASELINE_HAMMER_ITERATIONS:-5}"
+export BASELINE_HAMMER_ITERATIONS="${BASELINE_HAMMER_ITERATIONS:-10}"
 
 # ---------- Gantry image ----------
 # Tag pushed to <acr>.azurecr.io/gantry by 50-build-gantry.sh.

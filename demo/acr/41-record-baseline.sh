@@ -24,22 +24,18 @@ RUN_ID="$(cat .run-id-baseline)"
 START_ISO="$(cat .baseline-start)"
 END_ISO="$(cat .baseline-end)"
 ARTIFACT="${ARTIFACTS_DIR}/baseline-${RUN_ID}.json"
+PULL_APPEND="${ARTIFACTS_DIR}/baseline-pull-events.append.json"
 PULL_EVENTS="${ARTIFACTS_DIR}/baseline-${RUN_ID}-pull-events.json"
+POD_READY_LOG="${ARTIFACTS_DIR}/baseline-pod-ready.log"
 THROTTLE_SUMMARY="${ARTIFACTS_DIR}/baseline-${RUN_ID}-throttle.json"
 THROTTLE_RAW_DIR="${ARTIFACTS_DIR}/baseline-${RUN_ID}-throttle-raw"
 
-echo "==> POD_READY timestamps from pod logs"
-POD_READY_LOG="${ARTIFACTS_DIR}/baseline-${RUN_ID}-pod-ready.log"
-: > "${POD_READY_LOG}"
-for pod in $(kubectl get pods -l gantry.demo/run-label=baseline -o jsonpath='{.items[*].metadata.name}'); do
-    kubectl logs --tail=20 "${pod}" 2>/dev/null \
-        | grep -E '^POD_READY ' \
-        | sed "s|^|${pod} |" >> "${POD_READY_LOG}"
-done
-echo "  $(wc -l < "${POD_READY_LOG}") POD_READY rows → ${POD_READY_LOG}"
+echo "==> POD_READY rows (collected by 40-baseline.sh during the hammer)"
+echo "  $(wc -l < "${POD_READY_LOG}") rows → ${POD_READY_LOG}"
 
-echo "==> Kubelet Pulling/Pulled events per pod"
-scrape_pull_events baseline "${PULL_EVENTS}"
+echo "==> Aggregating pull events (collected by 40-baseline.sh per iteration)"
+aggregate_pull_events_file "${PULL_APPEND}" "${PULL_EVENTS}"
+echo "  $(jq -r '.summary | "count=\(.count) min=\(.min)s p50=\(.p50)s p95=\(.p95)s max=\(.max)s mean=\(.mean)s"' "${PULL_EVENTS}")"
 
 echo "==> Containerd journald 429/throttle scan (real-time, no Azure ingest)"
 scrape_containerd_429s "${START_ISO}" "${END_ISO}" "${THROTTLE_SUMMARY}" "${THROTTLE_RAW_DIR}"
