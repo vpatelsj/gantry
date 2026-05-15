@@ -33,6 +33,7 @@ demo/acr/.last-digest-*
 demo/acr/.last-layers-*.txt
 demo/acr/.baseline-start
 demo/acr/.baseline-end
+demo/acr/.baseline-run-ids
 demo/acr/.with-gantry-start
 demo/acr/.with-gantry-end
 demo/acr/.cached-start
