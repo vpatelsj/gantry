@@ -912,16 +912,20 @@ func isProductionMode(c *config.Config) bool {
 //     `go run` invocations take.
 //
 //   - Production mode (any of NodeName / PodName / MembersNamespace
-//     non-empty): an informer construction or Start failure is
-//     fatal. Returning a single-self stub here would advertise a
-//     healthy agent that is silently running with no peer
-//     coordination at all — worse than crash-looping, because the
-//     operator sees no signal.
+//     non-empty): an informer construction failure, OR a sync that
+//     does not complete within memberSyncTimeout, is fatal.
+//     Returning a single-self stub here would advertise a healthy
+//     agent that is silently running with no peer coordination at
+//     all — worse than crash-looping, because the operator sees no
+//     signal. A WaitForSync deadline in particular is the canonical
+//     symptom of broken RBAC / API egress / service-account perms;
+//     the previous implementation called Manager.Start(ctx) with
+//     the long-lived app context which blocked indefinitely on
+//     those failures, never reaching the 10s deadline branch.
 //
-//   - WaitForSync timeout remains a warning regardless of mode: the
-//     informer may sync moments later, the bootstrap loop retries
-//     dialing periodically, and the readiness probe blocks until
-//     the routing table is non-empty.
+//   - Dev-mode WaitForSync timeout: warn and fall back to the
+//     single-self stub so local `go run` against a missing or
+//     misconfigured kubeconfig still boots.
 func buildMembers(ctx context.Context, c *config.Config, disco *discovery.Host, logger *slog.Logger) (ifaces.Members, func(), error) {
 	prodMode := isProductionMode(c)
 	// Required inputs for the real informer path.
@@ -947,26 +951,42 @@ func buildMembers(ctx context.Context, c *config.Config, disco *discovery.Host, 
 		logger.Warn("members.New failed; falling back to single-self stub (dev mode)", slog.Any("err", err))
 		return singleSelfMembers(c, disco), func() {}, nil
 	}
-	if err := mgr.Start(ctx); err != nil {
+	// Start kicks off the informer goroutines without blocking. The
+	// sync deadline below is *the* policy knob: production mode
+	// treats a timeout as a fatal startup failure (the canonical
+	// symptom of broken RBAC / API egress / service-account perms);
+	// dev mode warns and falls back to the single-self stub.
+	mgr.Start()
+	syncCtx, syncCancel := context.WithTimeout(ctx, memberSyncTimeout)
+	syncErr := mgr.WaitForSync(syncCtx)
+	syncCancel()
+	if syncErr != nil {
 		if prodMode {
 			mgr.Stop()
-			return nil, nil, fmt.Errorf("members.Start: %w", err)
+			return nil, nil, fmt.Errorf("members initial sync (timeout=%s): %w", memberSyncTimeout, syncErr)
 		}
-		logger.Warn("members.Start failed; falling back to single-self stub (dev mode)", slog.Any("err", err))
+		logger.Warn("members initial sync failed; falling back to single-self stub (dev mode)",
+			slog.Duration("timeout", memberSyncTimeout),
+			slog.Any("err", syncErr),
+		)
 		mgr.Stop()
 		return singleSelfMembers(c, disco), func() {}, nil
 	}
-	syncCtx, syncCancel := context.WithTimeout(ctx, 10*time.Second)
-	if err := mgr.WaitForSync(syncCtx); err != nil {
-		logger.Warn("members initial sync timed out", slog.Any("err", err))
-	}
-	syncCancel()
 	logger.Info("members informer ready",
 		slog.String("node_name", c.NodeName),
 		slog.Int("peers", len(mgr.Snapshot())),
 	)
 	return mgr, mgr.Stop, nil
 }
+
+// memberSyncTimeout caps how long buildMembers waits for the initial
+// list+watch on the pod and node informers before failing (prod) or
+// degrading to the single-self stub (dev). 10s is generous for a
+// healthy apiserver — a real timeout almost always means RBAC, API
+// egress, or service-account permissions are broken; failing fast
+// surfaces that as an immediate deploy-time signal rather than a
+// silent "why isn't dedup working?" mystery.
+const memberSyncTimeout = 10 * time.Second
 
 // singleSelfMembers returns a single-entry Members view for dev/test
 // runs that have no Kubernetes cluster behind them.

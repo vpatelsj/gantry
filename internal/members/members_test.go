@@ -87,8 +87,9 @@ func TestSnapshot_JoinsPodIPAndNodeZone(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if err := m.Start(ctx); err != nil {
-		t.Fatalf("Start: %v", err)
+	m.Start()
+	if err := m.WaitForSync(ctx); err != nil {
+		t.Fatalf("WaitForSync: %v", err)
 	}
 
 	if got, want := m.Self(), "node-a"; string(got) != want {
@@ -144,8 +145,9 @@ func TestSnapshot_ExcludesNonRunning(t *testing.T) {
 	t.Cleanup(m.Stop)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if err := m.Start(ctx); err != nil {
-		t.Fatalf("Start: %v", err)
+	m.Start()
+	if err := m.WaitForSync(ctx); err != nil {
+		t.Fatalf("WaitForSync: %v", err)
 	}
 	if got := m.Snapshot(); len(got) != 0 {
 		t.Errorf("Snapshot = %+v, want empty (pending pods excluded)", got)
@@ -169,8 +171,9 @@ func TestSnapshot_OmitsPodsWithoutIP(t *testing.T) {
 	t.Cleanup(m.Stop)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if err := m.Start(ctx); err != nil {
-		t.Fatalf("Start: %v", err)
+	m.Start()
+	if err := m.WaitForSync(ctx); err != nil {
+		t.Fatalf("WaitForSync: %v", err)
 	}
 	if got := m.Snapshot(); len(got) != 0 {
 		t.Errorf("Snapshot = %+v, want empty", got)
@@ -197,8 +200,9 @@ func TestZoneLabelKey_Override(t *testing.T) {
 	t.Cleanup(m.Stop)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if err := m.Start(ctx); err != nil {
-		t.Fatalf("Start: %v", err)
+	m.Start()
+	if err := m.WaitForSync(ctx); err != nil {
+		t.Fatalf("WaitForSync: %v", err)
 	}
 	got := m.Snapshot()
 	if len(got) != 1 || got[0].Zone != "z1" {
@@ -248,8 +252,9 @@ func TestSnapshot_TransferPortComposesAddr(t *testing.T) {
 	t.Cleanup(m.Stop)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if err := m.Start(ctx); err != nil {
-		t.Fatalf("Start: %v", err)
+	m.Start()
+	if err := m.WaitForSync(ctx); err != nil {
+		t.Fatalf("WaitForSync: %v", err)
 	}
 	got := m.Snapshot()
 	if len(got) != 1 || got[0].Addr != "10.0.0.7:5001" {
@@ -278,8 +283,9 @@ func TestSnapshot_AnnotationsPopulateFields(t *testing.T) {
 	t.Cleanup(m.Stop)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if err := m.Start(ctx); err != nil {
-		t.Fatalf("Start: %v", err)
+	m.Start()
+	if err := m.WaitForSync(ctx); err != nil {
+		t.Fatalf("WaitForSync: %v", err)
 	}
 	got := m.Snapshot()
 	if len(got) != 1 {
@@ -411,8 +417,9 @@ func TestSnapshotForBootstrap_IncludesNotReadyPodsWithAnnotations(t *testing.T) 
 	t.Cleanup(m.Stop)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if err := m.Start(ctx); err != nil {
-		t.Fatalf("Start: %v", err)
+	m.Start()
+	if err := m.WaitForSync(ctx); err != nil {
+		t.Fatalf("WaitForSync: %v", err)
 	}
 
 	got := m.SnapshotForBootstrap()

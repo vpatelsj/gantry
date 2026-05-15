@@ -163,12 +163,19 @@ func New(opts Options) (*Manager, error) {
 	}, nil
 }
 
-// Start begins the informers' list-and-watch and blocks until both have
-// synced (or ctx is cancelled).
-func (m *Manager) Start(ctx context.Context) error {
+// Start begins the informers' list-and-watch in the background. It
+// does NOT wait for initial sync — callers MUST follow Start with a
+// WaitForSync(ctx) call under a bounded context so they own the
+// sync-deadline policy (production mode treats a timeout as fatal,
+// dev mode warns and continues; see cmd/gantry/main.go.buildMembers
+// for the canonical use). Previously Start blocked on
+// WaitForSync(ctx) using the long-lived app context, which made the
+// 10s bounded WaitForSync in buildMembers dead code — an RBAC /
+// permissions failure could pin startup indefinitely instead of
+// reaching the deadline branch.
+func (m *Manager) Start() {
 	m.podFactory.Start(m.stopCh)
 	m.nodeFactory.Start(m.stopCh)
-	return m.WaitForSync(ctx)
 }
 
 // Stop tears down the informers. Safe to call multiple times.
