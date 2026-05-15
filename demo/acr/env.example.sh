@@ -52,6 +52,9 @@ export RUN_ID="${RUN_ID:-}"
 # events over ~2 min — usually enough to bite Basic-SKU ReadOps.
 # Set to 1 for the original single-pass behaviour.
 export BASELINE_HAMMER_ITERATIONS="${BASELINE_HAMMER_ITERATIONS:-10}"
+export BASELINE_HAMMER_REPLICAS_PER_IMAGE="${BASELINE_HAMMER_REPLICAS_PER_IMAGE:-1}"
+export BASELINE_REUSE_RUN_IDS="${BASELINE_REUSE_RUN_IDS:-0}"
+export BASELINE_CAPTURE_POD_READY_LOGS="${BASELINE_CAPTURE_POD_READY_LOGS:-0}"
 
 # ---------- Gantry image ----------
 # Tag pushed to <acr>.azurecr.io/gantry by 50-build-gantry.sh.

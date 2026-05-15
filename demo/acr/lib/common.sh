@@ -443,6 +443,60 @@ scrape_pull_events_append() {
     done
 }
 
+# scrape_pull_events_bulk <run_label> <append_file> [iteration]
+#
+# Bulk variant for large parallel hammers. It snapshots pods and events
+# once, then joins them in jq, avoiding thousands of per-pod kubectl calls.
+scrape_pull_events_bulk() {
+    local run_label="$1" append_file="$2" iteration="${3:-0}"
+    local pods_json events_json
+    pods_json="$(mktemp -t gantry-pods-XXXXXX.json)"
+    events_json="$(mktemp -t gantry-events-XXXXXX.json)"
+    trap 'rm -f "${pods_json}" "${events_json}"' RETURN
+
+    kubectl get pods -l "gantry.demo/run-label=${run_label}" -o json > "${pods_json}"
+    kubectl get events -o json > "${events_json}"
+
+    jq -n \
+        --slurpfile pods "${pods_json}" \
+        --slurpfile events "${events_json}" \
+        --arg run_label "${run_label}" \
+        --argjson iteration "${iteration}" '
+        ($pods[0].items
+            | map(select(.metadata.labels["gantry.demo/run-label"] == $run_label))
+            | map({name:.metadata.name, node:.spec.nodeName})) as $pods_list
+        | ($events[0].items
+            | map(select((.reason == "Pulling" or .reason == "Pulled")
+                and (.involvedObject.kind == "Pod")))) as $events_list
+        | [
+            $pods_list[] as $p
+            | ($events_list
+                | map(select(.involvedObject.name == $p.name and .reason == "Pulling")
+                    | (.firstTimestamp // .eventTime // .lastTimestamp // null))
+                | map(select(. != null and . != ""))
+                | sort
+                | first) as $pulling
+            | ($events_list
+                | map(select(.involvedObject.name == $p.name and .reason == "Pulled")
+                    | (.firstTimestamp // .eventTime // .lastTimestamp // null))
+                | map(select(. != null and . != ""))
+                | sort
+                | first) as $pulled
+            | select($pulling != null and $pulled != null)
+            | {
+                pod: $p.name,
+                node: $p.node,
+                pulling: $pulling,
+                pulled: $pulled,
+                duration_seconds: (($pulled | fromdateiso8601) - ($pulling | fromdateiso8601)),
+                iteration: $iteration
+            }
+        ]
+    ' > "${append_file}"
+
+    echo "  pull events: $(jq 'length' "${append_file}") rows" >&2
+}
+
 # aggregate_pull_events_file <append_file> <out_file>
 #
 # Convert an array of pull-event records (produced by

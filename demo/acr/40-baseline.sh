@@ -17,8 +17,9 @@
 #     simultaneously. Total concurrent pod pulls = NODE_COUNT × N.
 #
 # With the default 10 iterations × 20 nodes that's 200 simultaneous
-# image pulls against a single Basic-SKU ACR — enough to bite ReadOps
-# rate limits, which is the throttling signal we're trying to capture.
+# image pulls against a single Basic-SKU ACR. For aggressive throttling
+# probes, BASELINE_HAMMER_REPLICAS_PER_IMAGE can replay each already-built
+# tag multiple times without paying another image-build round.
 #
 # Override: set BASELINE_HAMMER_ITERATIONS=1 to keep the original
 # single-run behaviour.
@@ -31,22 +32,28 @@ source ./lib/common.sh
 load_state
 
 ITERATIONS="${BASELINE_HAMMER_ITERATIONS:-10}"
+REPLICAS_PER_IMAGE="${BASELINE_HAMMER_REPLICAS_PER_IMAGE:-1}"
+REUSE_RUN_IDS="${BASELINE_REUSE_RUN_IDS:-0}"
 
 # Hard-fail if hosts.toml is present anywhere — otherwise the "baseline"
 # would secretly route through gantry's mirror.
 assert_no_hosts_toml "${ACR_LOGIN_SERVER}"
 
 # ---------- Phase A: pre-build all images ----------
-> .baseline-run-ids
-echo "==> Pre-building ${ITERATIONS} fresh image tag(s)"
-for i in $(seq 1 "${ITERATIONS}"); do
-    echo "  build ${i}/${ITERATIONS}"
-    RUN_HISTORY_ROLE=baseline ./20-push-demo-image.sh >/dev/null
-    cat .run-id-baseline >> .baseline-run-ids
-    echo "" >> .baseline-run-ids
-done
-sed -i '/^$/d' .baseline-run-ids
-echo "==> Pre-build complete: $(wc -l < .baseline-run-ids) tags ready"
+if [[ "${REUSE_RUN_IDS}" == "1" && -s .baseline-run-ids ]]; then
+    echo "==> Reusing $(wc -l < .baseline-run-ids) pre-built image tag(s) from .baseline-run-ids"
+else
+    > .baseline-run-ids
+    echo "==> Pre-building ${ITERATIONS} fresh image tag(s)"
+    for i in $(seq 1 "${ITERATIONS}"); do
+        echo "  build ${i}/${ITERATIONS}"
+        RUN_HISTORY_ROLE=baseline ./20-push-demo-image.sh >/dev/null
+        cat .run-id-baseline >> .baseline-run-ids
+        echo "" >> .baseline-run-ids
+    done
+    sed -i '/^$/d' .baseline-run-ids
+    echo "==> Pre-build complete: $(wc -l < .baseline-run-ids) tags ready"
+fi
 
 # ---------- Phase B: fire all workload Jobs IN PARALLEL ----------
 # Each iteration = one Job, distinct gantry.demo/job-id, same fan-out
@@ -68,23 +75,33 @@ kubectl get jobs -n default -l gantry.demo/run-label=baseline -o name 2>/dev/nul
     | xargs -r kubectl delete -n default --wait=false
 
 i=0
-echo "==> Firing ${ITERATIONS} Jobs in parallel"
+TOTAL_JOBS=$(( $(wc -l < .baseline-run-ids) * REPLICAS_PER_IMAGE ))
+echo "==> Firing ${TOTAL_JOBS} Jobs in parallel (${REPLICAS_PER_IMAGE} replica(s) per image tag)"
 while IFS= read -r RUN_ID; do
-    i=$(( i + 1 ))
     IMAGE_REF="${ACR_LOGIN_SERVER}/${DEMO_REPO}:${RUN_ID}"
-    apply_workload_job "${IMAGE_REF}" baseline "${i}" >/dev/null
+    for _ in $(seq 1 "${REPLICAS_PER_IMAGE}"); do
+        i=$(( i + 1 ))
+        apply_workload_job "${IMAGE_REF}" baseline "${i}" >/dev/null
+    done
 done < .baseline-run-ids
 
-echo "==> Waiting for all ${ITERATIONS} Jobs to complete"
+echo "==> Waiting for all ${TOTAL_JOBS} Jobs to complete"
 wait_jobs_by_label gantry.demo/run-label=baseline 60m
 
 echo "==> Scraping pod events + POD_READY logs (before Job delete)"
-scrape_pull_events_append baseline "${PULL_APPEND}" 0
-for pod in $(kubectl get pods -l gantry.demo/run-label=baseline -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
-    kubectl logs --tail=20 "${pod}" 2>/dev/null \
-        | grep -E '^POD_READY ' \
-        | sed "s|^|${pod} |" >> "${POD_READY_LOG}"
-done
+scrape_pull_events_bulk baseline "${PULL_APPEND}" 0
+if [[ "${BASELINE_CAPTURE_POD_READY_LOGS:-0}" == "1" ]]; then
+    kubectl get pods -l gantry.demo/run-label=baseline -o name 2>/dev/null \
+        | sed 's|^pod/||' \
+        | xargs -r -n1 -P20 sh -c '
+            pod="$1"
+            kubectl logs --tail=20 "${pod}" 2>/dev/null \
+                | grep -E "^POD_READY " \
+                | sed "s|^|${pod} |"
+        ' sh >> "${POD_READY_LOG}"
+else
+    echo "  skipping POD_READY log scrape; set BASELINE_CAPTURE_POD_READY_LOGS=1 to collect it"
+fi
 
 # Cleanup.
 kubectl get jobs -n default -l gantry.demo/run-label=baseline -o name 2>/dev/null \
@@ -95,7 +112,9 @@ echo "${END_ISO}" > .baseline-end
 
 echo
 echo "Baseline hammer complete."
-echo "  iterations: ${ITERATIONS}"
+echo "  image tags: $(wc -l < .baseline-run-ids)"
+echo "  replicas per tag: ${REPLICAS_PER_IMAGE}"
+echo "  jobs: ${TOTAL_JOBS}"
 echo "  run-id list: $(tr '\n' ' ' < .baseline-run-ids)"
 echo "  window: ${START_ISO} .. ${END_ISO}"
 echo "  pull events captured: $(jq 'length' "${PULL_APPEND}")"

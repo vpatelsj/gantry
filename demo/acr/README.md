@@ -74,8 +74,10 @@ kubectl apply -f manifests/grafana-dashboard-configmap.yaml
 # --- Recording starts here ---
 
 # Phase 4 — baseline (no gantry; loops the workload BASELINE_HAMMER_ITERATIONS
-# times to drive enough load to risk Basic-SKU throttling). 41-record
-# captures pull-event durations + a real-time containerd-journald 429 scan.
+# times to drive enough load to risk Basic-SKU throttling). For a denser
+# no-prebuild replay, set BASELINE_REUSE_RUN_IDS=1 and
+# BASELINE_HAMMER_REPLICAS_PER_IMAGE>1 after one clean baseline run.
+# 41-record captures pull-event durations + a real-time containerd-journald 429 scan.
 ./40-baseline.sh
 ./41-record-baseline.sh
 
