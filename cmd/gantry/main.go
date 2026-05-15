@@ -286,14 +286,19 @@ func runAgent(args []string) error {
 	// every Running pod that has published a p2p-addrs annotation,
 	// which is the set of peers we actually expect kad-dht to learn
 	// about, so the score reflects real convergence pressure.
+	//
+	// IMPORTANT: the target is "other peers we expect to see in the
+	// routing table" — i.e. snapshot-1 to exclude self, NOT the raw
+	// snapshot count. A 2-node cluster has bootstrapPeerCount=2 but
+	// can only ever populate 1 routing-table entry (the other node);
+	// returning 2 would make health score capped at 0.5 even in a
+	// fully-converged 2-node cluster. Single-node carve-out returns
+	// 0 so the lone-agent health score is well-defined (matches
+	// bootstrapConvergenceTarget's behaviour).
 	const kademliaMaxRoutingTable = 256
 	if monitor := disco.Monitor(); monitor != nil {
 		monitor.SetRoutingTableTarget(func() int {
-			sz := bootstrapPeerCount(memberView)
-			if sz > kademliaMaxRoutingTable {
-				return kademliaMaxRoutingTable
-			}
-			return sz
+			return routingTableTarget(bootstrapPeerCount(memberView), kademliaMaxRoutingTable)
 		})
 	}
 
@@ -1427,6 +1432,35 @@ func bootstrapPeerCount(m ifaces.Members) int {
 		return len(b.SnapshotForBootstrap())
 	}
 	return len(m.Snapshot())
+}
+
+// routingTableTarget computes the expected steady-state kad-dht
+// routing-table size given a bootstrap snapshot size and a per-
+// cluster cap. The target is the number of *other* peers we expect
+// the routing table to learn about — snapshotSize-1 — clamped to
+// maxSize.
+//
+// A 2-node cluster has snapshotSize=2 but only ever populates one
+// routing-table entry (the other node), so the target is 1 not 2.
+// Returning the raw snapshotSize would peg the DHT health score at
+// (size/snapshotSize) ≤ (snapshotSize-1)/snapshotSize even in a
+// fully-converged cluster — e.g. 1/2 = 0.5 in a 2-node deploy,
+// 2/3 ≈ 0.66 in a 3-node deploy — flagging healthy small clusters
+// as degraded.
+//
+// Single-node carve-out: snapshotSize ≤ 1 → 0 ("no peers to dial,
+// any positive target would loop forever"), matching
+// bootstrapConvergenceTarget's behaviour so the bootstrap loop and
+// the health score agree on what 'converged' means.
+func routingTableTarget(snapshotSize, maxSize int) int {
+	if snapshotSize <= 1 {
+		return 0
+	}
+	peers := snapshotSize - 1
+	if peers > maxSize {
+		return maxSize
+	}
+	return peers
 }
 
 // bootstrapPeerAddrs collects every published p2p multiaddr across all

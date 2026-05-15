@@ -359,3 +359,43 @@ func (s *bootstrapStub) Self() ifaces.NodeID                 { return "self" }
 func (s *bootstrapStub) Snapshot() []ifaces.Node             { return s.snapshot }
 func (s *bootstrapStub) SnapshotForBootstrap() []ifaces.Node { return s.boot }
 func (s *bootstrapStub) WaitForSync(_ context.Context) error { return nil }
+
+// TestRoutingTableTarget guards eighth-review #3: the kad-dht
+// routing-table target is the count of *other* peers we expect to
+// learn about — snapshotSize-1 — NOT the raw snapshot size. Passing
+// snapshotSize as target meant a fully-converged N-node cluster
+// could only ever reach (N-1)/N of the target, pegging the DHT
+// health score at < 1.0 (0.5 in a 2-node deploy, 0.66 in a 3-node
+// deploy, 0.75 in a 4-node deploy …) and tripping degraded-cluster
+// alerts on healthy clusters.
+//
+// Single-node carve-out: snapshot ≤ 1 → 0. The lone-agent case
+// must not produce a positive target (the routing table has nothing
+// to learn) and the bootstrap loop already encodes that contract via
+// bootstrapConvergenceTarget; routingTableTarget agrees.
+func TestRoutingTableTarget(t *testing.T) {
+	cases := []struct {
+		name         string
+		snapshotSize int
+		maxSize      int
+		want         int
+	}{
+		{"empty snapshot returns 0", 0, 256, 0},
+		{"single-self snapshot returns 0 (lone-agent carve-out)", 1, 256, 0},
+		{"2-node cluster expects 1 peer in routing table", 2, 256, 1},
+		{"3-node cluster expects 2 peers in routing table", 3, 256, 2},
+		{"10-node cluster expects 9 peers in routing table", 10, 256, 9},
+		{"snapshot exactly at cap returns cap (snapshot-1 = max)", 257, 256, 256},
+		{"snapshot above cap clamps to cap", 1000, 256, 256},
+		{"small max applies (snapshot-1 > max)", 100, 4, 4},
+		{"small max with snapshot just over: snapshot-1 ≤ max returns snapshot-1", 5, 4, 4},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := routingTableTarget(tc.snapshotSize, tc.maxSize); got != tc.want {
+				t.Errorf("routingTableTarget(snapshotSize=%d, maxSize=%d) = %d; want %d",
+					tc.snapshotSize, tc.maxSize, got, tc.want)
+			}
+		})
+	}
+}
