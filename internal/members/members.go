@@ -29,7 +29,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -232,7 +234,13 @@ func (m *Manager) Snapshot() []ifaces.Node {
 		}
 		addr := p.Status.PodIP
 		if m.transferPort > 0 {
-			addr = fmt.Sprintf("%s:%d", p.Status.PodIP, m.transferPort)
+			// net.JoinHostPort wraps IPv6 literals in brackets,
+			// producing [::1]:5001 instead of the broken ::1:5001 a
+			// raw fmt.Sprintf("%s:%d", ...) would emit. Required for
+			// IPv6 or dual-stack clusters where PodIP is a v6
+			// literal — without bracketing, url.Parse and net.Dial
+			// both fail downstream.
+			addr = net.JoinHostPort(p.Status.PodIP, strconv.Itoa(m.transferPort))
 		}
 		// Annotation override wins so operators can publish a
 		// non-default transfer endpoint (NodePort, separate listener).
@@ -313,7 +321,12 @@ func (m *Manager) SnapshotForBootstrap() []ifaces.Node {
 		}
 		addr := p.Status.PodIP
 		if m.transferPort > 0 {
-			addr = fmt.Sprintf("%s:%d", p.Status.PodIP, m.transferPort)
+			// net.JoinHostPort: see Snapshot() for the IPv6
+			// bracketing rationale. SnapshotForBootstrap feeds
+			// the bootstrap dial loop directly; an IPv6 literal
+			// without brackets here would silently break libp2p
+			// dialing on v6 clusters.
+			addr = net.JoinHostPort(p.Status.PodIP, strconv.Itoa(m.transferPort))
 		}
 		if a := p.Annotations[AnnotationTransferAddr]; a != "" {
 			addr = a
