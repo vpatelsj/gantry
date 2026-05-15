@@ -24,6 +24,8 @@ type stubCoord struct {
 	pleasePullCalls []ifaces.NodeID
 	pleasePullRegs  []string
 	pleasePullRepos []string
+	pleasePullKinds []ifaces.OriginRefKind
+	pleasePullDgs   [][]digest.Digest
 	pleasePullErrs  map[ifaces.NodeID]error
 	// pleasePullOutcomes, when non-nil for a given (node, digest), is
 	// returned verbatim from PleasePull. Used by rule-7 cooldown /
@@ -42,12 +44,16 @@ func (s *stubCoord) PullIntentQuery(_ context.Context, id ifaces.NodeID, _ diges
 	return s.intents[id], nil
 }
 
-func (s *stubCoord) PleasePull(_ context.Context, id ifaces.NodeID, registry, repository string, _ ifaces.OriginRefKind, ds []digest.Digest) ([]ifaces.PleasePullOutcome, error) {
+func (s *stubCoord) PleasePull(_ context.Context, id ifaces.NodeID, registry, repository string, kind ifaces.OriginRefKind, ds []digest.Digest) ([]ifaces.PleasePullOutcome, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.pleasePullCalls = append(s.pleasePullCalls, id)
 	s.pleasePullRegs = append(s.pleasePullRegs, registry)
 	s.pleasePullRepos = append(s.pleasePullRepos, repository)
+	s.pleasePullKinds = append(s.pleasePullKinds, kind)
+	// Copy ds so the caller can reuse the slice without aliasing.
+	dsCopy := append([]digest.Digest(nil), ds...)
+	s.pleasePullDgs = append(s.pleasePullDgs, dsCopy)
 	if err, ok := s.pleasePullErrs[id]; ok {
 		return nil, err
 	}

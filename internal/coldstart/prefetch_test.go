@@ -263,3 +263,142 @@ func TestPrefetchLayers_MetricsFireOnce(t *testing.T) {
 		t.Fatalf("OnPrefetchBatch digests: got %d want 5", digestCount)
 	}
 }
+
+// TestPrefetchChildren_SplitsByKindOnSamePuller is the load-bearing
+// invariant for the tenth-review observability fix: a single
+// manifest serve typically produces ONE config + N layers, and when
+// HRW happens to land both on the same puller the §5.2a "all digests
+// in a batch MUST share kind" rule forces TWO PleasePull RPCs (one
+// per kind) rather than one mixed batch. Without this split, the
+// config bucket on p2p_origin_pull_total stays permanently zero
+// because the wire would carry every child as KindBlob.
+func TestPrefetchChildren_SplitsByKindOnSamePuller(t *testing.T) {
+	cluster := clusterNodes()
+	self := ifaces.NodeID("n3")
+	// Two digests both HRW'ing to n0 — one config, one blob.
+	dgs := findManyDigestsForPullers(t, cluster, map[ifaces.NodeID]int{"n0": 2})
+	children := []coldstart.ChildDigest{
+		{Digest: dgs[0], Kind: ifaces.KindConfig},
+		{Digest: dgs[1], Kind: ifaces.KindBlob},
+	}
+
+	coord := &stubCoord{}
+	disco := &stubDisco{health: 1.0}
+	r := buildResolver(t, coord, disco, self, cluster, coldstart.MetricsHooks{}, time.Now)
+
+	if err := r.PrefetchChildren(context.Background(), children, "docker.io", "library/nginx"); err != nil {
+		t.Fatalf("PrefetchChildren: %v", err)
+	}
+
+	coord.mu.Lock()
+	defer coord.mu.Unlock()
+	// One puller, two kinds → exactly two PleasePull RPCs, both to n0.
+	if got, want := len(coord.pleasePullCalls), 2; got != want {
+		t.Fatalf("PleasePull call count: got %d want %d (calls=%v)",
+			got, want, coord.pleasePullCalls)
+	}
+	for i, id := range coord.pleasePullCalls {
+		if id != "n0" {
+			t.Errorf("call[%d] puller: got %s want n0", i, id)
+		}
+	}
+	// Kinds-on-the-wire must include both KindConfig and KindBlob; no
+	// downgrade to a single mixed batch.
+	seen := map[ifaces.OriginRefKind]bool{}
+	for _, k := range coord.pleasePullKinds {
+		seen[k] = true
+	}
+	if !seen[ifaces.KindConfig] {
+		t.Errorf("KindConfig not seen on wire; got %v", coord.pleasePullKinds)
+	}
+	if !seen[ifaces.KindBlob] {
+		t.Errorf("KindBlob not seen on wire; got %v", coord.pleasePullKinds)
+	}
+	// Each RPC must carry exactly one digest (no mixing).
+	for i, ds := range coord.pleasePullDgs {
+		if len(ds) != 1 {
+			t.Errorf("call[%d] batch size: got %d want 1 (kind splitting must not pack across kinds)", i, len(ds))
+		}
+	}
+}
+
+// TestPrefetchChildren_DistinctPullersBatchedPerKind covers the
+// cross-product case: 2 kinds × 2 distinct pullers → 4 PleasePull
+// RPCs. Confirms the (puller, kind) grouping key works in both
+// dimensions.
+func TestPrefetchChildren_DistinctPullersBatchedPerKind(t *testing.T) {
+	cluster := clusterNodes()
+	self := ifaces.NodeID("n3")
+	// Want 2 digests on n0 and 2 digests on n1 — 4 digests total.
+	dgs := findManyDigestsForPullers(t, cluster, map[ifaces.NodeID]int{"n0": 2, "n1": 2})
+
+	// Tag the first two as KindConfig and the second two as KindBlob.
+	// findManyDigestsForPullers' order is "fill n0 first, then n1"
+	// because remaining is updated as it walks i=0..4096, but the
+	// targets map iteration order is not stable. To be safe, partition
+	// after the fact based on each digest's HRW rank-0 puller.
+	bySrc := map[ifaces.NodeID][]digest.Digest{}
+	for _, d := range dgs {
+		bySrc[pickHRW0(cluster, d)] = append(bySrc[pickHRW0(cluster, d)], d)
+	}
+	children := []coldstart.ChildDigest{
+		{Digest: bySrc["n0"][0], Kind: ifaces.KindConfig},
+		{Digest: bySrc["n0"][1], Kind: ifaces.KindBlob},
+		{Digest: bySrc["n1"][0], Kind: ifaces.KindConfig},
+		{Digest: bySrc["n1"][1], Kind: ifaces.KindBlob},
+	}
+
+	coord := &stubCoord{}
+	disco := &stubDisco{health: 1.0}
+	r := buildResolver(t, coord, disco, self, cluster, coldstart.MetricsHooks{}, time.Now)
+
+	if err := r.PrefetchChildren(context.Background(), children, "docker.io", "library/nginx"); err != nil {
+		t.Fatalf("PrefetchChildren: %v", err)
+	}
+
+	coord.mu.Lock()
+	defer coord.mu.Unlock()
+	if got, want := len(coord.pleasePullCalls), 4; got != want {
+		t.Fatalf("PleasePull call count: got %d want %d (kinds=%v pullers=%v)",
+			got, want, coord.pleasePullKinds, coord.pleasePullCalls)
+	}
+	// Each (puller, kind) combination appears exactly once.
+	got := map[string]int{}
+	for i, id := range coord.pleasePullCalls {
+		k := string(id) + "/" + coord.pleasePullKinds[i].String()
+		got[k]++
+	}
+	for _, want := range []string{"n0/config", "n0/blob", "n1/config", "n1/blob"} {
+		if got[want] != 1 {
+			t.Errorf("expected exactly one %s call, got %d (full map: %v)", want, got[want], got)
+		}
+	}
+}
+
+// TestPrefetchLayers_BackCompatTagsAllAsKindBlob proves the
+// PrefetchLayers wrapper preserves its historical "every digest is a
+// blob" behaviour even though it now delegates to PrefetchChildren.
+// Important for older callers (and for the implicit assumption
+// PrefetchLayers' kind is KindBlob inside other tests).
+func TestPrefetchLayers_BackCompatTagsAllAsKindBlob(t *testing.T) {
+	cluster := clusterNodes()
+	self := ifaces.NodeID("n3")
+	digests := findManyDigestsForPullers(t, cluster, map[ifaces.NodeID]int{"n0": 2})
+
+	coord := &stubCoord{}
+	disco := &stubDisco{health: 1.0}
+	r := buildResolver(t, coord, disco, self, cluster, coldstart.MetricsHooks{}, time.Now)
+
+	if err := r.PrefetchLayers(context.Background(), digests, "docker.io", "library/nginx"); err != nil {
+		t.Fatalf("PrefetchLayers: %v", err)
+	}
+
+	coord.mu.Lock()
+	defer coord.mu.Unlock()
+	if got, want := len(coord.pleasePullCalls), 1; got != want {
+		t.Fatalf("PleasePull call count: got %d want %d", got, want)
+	}
+	if coord.pleasePullKinds[0] != ifaces.KindBlob {
+		t.Errorf("kind on wire: got %v want KindBlob (back-compat)", coord.pleasePullKinds[0])
+	}
+}

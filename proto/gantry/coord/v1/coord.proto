@@ -68,14 +68,28 @@ message PullIntentResponse {
 message PleasePullRequest {
   // Kind discriminates the OCI Distribution Spec URL family the puller
   // should target at the upstream registry:
-  //   /v2/<repo>/blobs/<digest>      (KIND_BLOB)
+  //   /v2/<repo>/blobs/<digest>      (KIND_BLOB; image-config blobs are
+  //                                   KIND_CONFIG, all other blobs are
+  //                                   KIND_BLOB)
   //   /v2/<repo>/manifests/<digest>  (KIND_MANIFEST)
+  //   /v2/<repo>/blobs/<digest>      (KIND_CONFIG; per the OCI Distribution
+  //                                   Spec the image-config blob lives in
+  //                                   the same /blobs/ URL family but is
+  //                                   typed separately so per-kind metrics
+  //                                   ("manifest | config | layer") agree
+  //                                   end-to-end across the please_pull
+  //                                   wire boundary)
   // KIND_UNSPECIFIED is treated as KIND_BLOB for back-compat with peers
-  // running pre-Kind builds.
+  // running pre-Kind builds. KIND_CONFIG sent to a pre-KIND_CONFIG peer
+  // is interpreted as KIND_BLOB by pleasePullKindFromProto's default
+  // branch, which is bytes-equivalent (config blobs ARE in /blobs/) —
+  // only the per-kind metric label is lost on that peer, never
+  // correctness.
   enum Kind {
     KIND_UNSPECIFIED = 0;
     KIND_BLOB        = 1;
     KIND_MANIFEST    = 2;
+    KIND_CONFIG      = 3;
   }
 
   // Batched (§5.2a). All digests in a single batch MUST share

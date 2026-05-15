@@ -93,17 +93,31 @@ func (FailureClass) EnumDescriptor() ([]byte, []int) {
 // Kind discriminates the OCI Distribution Spec URL family the puller
 // should target at the upstream registry:
 //
-//	/v2/<repo>/blobs/<digest>      (KIND_BLOB)
+//	/v2/<repo>/blobs/<digest>      (KIND_BLOB; image-config blobs are
+//	                                KIND_CONFIG, all other blobs are
+//	                                KIND_BLOB)
 //	/v2/<repo>/manifests/<digest>  (KIND_MANIFEST)
+//	/v2/<repo>/blobs/<digest>      (KIND_CONFIG; per the OCI Distribution
+//	                                Spec the image-config blob lives in
+//	                                the same /blobs/ URL family but is
+//	                                typed separately so per-kind metrics
+//	                                ("manifest | config | layer") agree
+//	                                end-to-end across the please_pull
+//	                                wire boundary)
 //
 // KIND_UNSPECIFIED is treated as KIND_BLOB for back-compat with peers
-// running pre-Kind builds.
+// running pre-Kind builds. KIND_CONFIG sent to a pre-KIND_CONFIG peer
+// is interpreted as KIND_BLOB by pleasePullKindFromProto's default
+// branch, which is bytes-equivalent (config blobs ARE in /blobs/) —
+// only the per-kind metric label is lost on that peer, never
+// correctness.
 type PleasePullRequest_Kind int32
 
 const (
 	PleasePullRequest_KIND_UNSPECIFIED PleasePullRequest_Kind = 0
 	PleasePullRequest_KIND_BLOB        PleasePullRequest_Kind = 1
 	PleasePullRequest_KIND_MANIFEST    PleasePullRequest_Kind = 2
+	PleasePullRequest_KIND_CONFIG      PleasePullRequest_Kind = 3
 )
 
 // Enum value maps for PleasePullRequest_Kind.
@@ -112,11 +126,13 @@ var (
 		0: "KIND_UNSPECIFIED",
 		1: "KIND_BLOB",
 		2: "KIND_MANIFEST",
+		3: "KIND_CONFIG",
 	}
 	PleasePullRequest_Kind_value = map[string]int32{
 		"KIND_UNSPECIFIED": 0,
 		"KIND_BLOB":        1,
 		"KIND_MANIFEST":    2,
+		"KIND_CONFIG":      3,
 	}
 )
 
@@ -676,18 +692,19 @@ const file_gantry_coord_v1_coord_proto_rawDesc = "" +
 	"\bhrw_rank\x18\x04 \x01(\x05R\ahrwRank\x12'\n" +
 	"\x0frecently_failed\x18\x05 \x01(\bR\x0erecentlyFailed\x12A\n" +
 	"\x0ecooldown_until\x18\x06 \x01(\v2\x1a.google.protobuf.TimestampR\rcooldownUntil\x12B\n" +
-	"\rfailure_class\x18\a \x01(\x0e2\x1d.gantry.coord.v1.FailureClassR\ffailureClass\"\xf7\x01\n" +
+	"\rfailure_class\x18\a \x01(\x0e2\x1d.gantry.coord.v1.FailureClassR\ffailureClass\"\x88\x02\n" +
 	"\x11PleasePullRequest\x12\x18\n" +
 	"\adigests\x18\x01 \x03(\tR\adigests\x12+\n" +
 	"\x11upstream_registry\x18\x02 \x01(\tR\x10upstreamRegistry\x12\x1e\n" +
 	"\n" +
 	"repository\x18\x03 \x01(\tR\n" +
 	"repository\x12;\n" +
-	"\x04kind\x18\x04 \x01(\x0e2'.gantry.coord.v1.PleasePullRequest.KindR\x04kind\">\n" +
+	"\x04kind\x18\x04 \x01(\x0e2'.gantry.coord.v1.PleasePullRequest.KindR\x04kind\"O\n" +
 	"\x04Kind\x12\x14\n" +
 	"\x10KIND_UNSPECIFIED\x10\x00\x12\r\n" +
 	"\tKIND_BLOB\x10\x01\x12\x11\n" +
-	"\rKIND_MANIFEST\x10\x02\"\x86\x04\n" +
+	"\rKIND_MANIFEST\x10\x02\x12\x0f\n" +
+	"\vKIND_CONFIG\x10\x03\"\x86\x04\n" +
 	"\x12PleasePullResponse\x12D\n" +
 	"\aresults\x18\x01 \x03(\v2*.gantry.coord.v1.PleasePullResponse.ResultR\aresults\x1a\xa9\x03\n" +
 	"\x06Result\x12\x16\n" +

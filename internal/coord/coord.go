@@ -777,10 +777,20 @@ func pleasePullStatusFromProto(o coordv1.PleasePullResponse_Result_Outcome) ifac
 // pleasePullKindToProto maps the in-process OriginRefKind enum to the
 // wire-form Kind enum. Unknown / zero is sent as KIND_UNSPECIFIED so a
 // pre-Kind responder still defaults to blob semantics.
+//
+// KIND_CONFIG is bytes-equivalent to KIND_BLOB at the OCI Distribution
+// Spec level (both pull /v2/<repo>/blobs/<digest>) but is preserved on
+// the wire so per-kind metrics ("manifest | config | layer") agree
+// end-to-end across the please_pull boundary. A pre-KIND_CONFIG peer
+// receiving KIND_CONFIG will treat it as KIND_BLOB (the default branch
+// in pleasePullKindFromProto below) — correct bytes, only the metric
+// label downgrades on that peer.
 func pleasePullKindToProto(k ifaces.OriginRefKind) coordv1.PleasePullRequest_Kind {
 	switch k {
 	case ifaces.KindManifest:
 		return coordv1.PleasePullRequest_KIND_MANIFEST
+	case ifaces.KindConfig:
+		return coordv1.PleasePullRequest_KIND_CONFIG
 	case ifaces.KindBlob:
 		return coordv1.PleasePullRequest_KIND_BLOB
 	default:
@@ -795,6 +805,8 @@ func pleasePullKindFromProto(k coordv1.PleasePullRequest_Kind) ifaces.OriginRefK
 	switch k {
 	case coordv1.PleasePullRequest_KIND_MANIFEST:
 		return ifaces.KindManifest
+	case coordv1.PleasePullRequest_KIND_CONFIG:
+		return ifaces.KindConfig
 	default:
 		return ifaces.KindBlob
 	}

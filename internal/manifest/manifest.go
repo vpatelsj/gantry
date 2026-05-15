@@ -15,6 +15,7 @@ import (
 	"fmt"
 
 	"github.com/gantry/gantry/internal/digest"
+	"github.com/gantry/gantry/internal/ifaces"
 )
 
 // schema is the subset of the OCI / Docker schema-2 manifest layout
@@ -56,21 +57,71 @@ type descriptor struct {
 // The function does not error on individual malformed digest strings
 // inside the manifest; those entries are silently skipped. A parse
 // failure on the manifest envelope itself is returned as an error.
+//
+// Prefer TypedChildren over ChildDigests for new callers that need
+// the per-digest kind (image-config blob vs layer blob) — e.g. so
+// the per-kind metric label survives end-to-end through the prefetch
+// fan-out into please_pull and StartLocalPull batches.
 func ChildDigests(body []byte) ([]digest.Digest, error) {
+	typed, err := TypedChildren(body)
+	if err != nil {
+		return nil, err
+	}
+	if typed == nil {
+		return nil, nil
+	}
+	out := make([]digest.Digest, 0, len(typed))
+	for _, c := range typed {
+		out = append(out, c.Digest)
+	}
+	return out, nil
+}
+
+// TypedChild pairs a child digest with the OCI URL-family kind the
+// puller MUST target. Kind is one of ifaces.KindConfig (the manifest's
+// image-config blob, served from /v2/<repo>/blobs/<digest> per the
+// OCI Distribution Spec) or ifaces.KindBlob (every layer descriptor,
+// also served from /v2/<repo>/blobs/<digest>). The two kinds are
+// bytes-equivalent at the registry level but carried separately so
+// observability counters can keep
+//
+//	p2p_origin_pull_total{kind="manifest|config|layer"}
+//
+// honest end-to-end through the prefetch fan-out and the please_pull
+// wire boundary. Without the split every child digest of a manifest
+// would label as "blob" and the "config" bucket would always be
+// empty in practice — the design intent the tenth-review observability
+// recommendation calls out.
+type TypedChild struct {
+	Digest digest.Digest
+	Kind   ifaces.OriginRefKind
+}
+
+// TypedChildren is the kind-preserving cousin of ChildDigests. Source
+// order is the same: config first, then layers top-to-bottom.
+// Foreign-layer descriptors (non-empty `urls`) and image indexes
+// (.manifests with no .layers) are handled exactly as in
+// ChildDigests; only the return type changes. The config digest is
+// tagged KindConfig; every layer is tagged KindBlob (KindLayer is
+// intentionally NOT introduced — the OCI URL family is /blobs/ for
+// both and downstream pullers do not need to distinguish, only the
+// metric label needs to).
+func TypedChildren(body []byte) ([]TypedChild, error) {
 	var m schema
 	if err := json.Unmarshal(body, &m); err != nil {
 		return nil, fmt.Errorf("manifest: parse: %w", err)
 	}
-	// Image index detection: index has .manifests, image manifest has
-	// .layers. If both happen to be populated, prefer image-manifest
-	// interpretation (defensive against weird hand-crafted bodies).
+	// Image index detection (see ChildDigests): index has .manifests,
+	// image manifest has .layers. If both happen to be populated,
+	// prefer image-manifest interpretation (defensive against weird
+	// hand-crafted bodies).
 	if len(m.Manifests) > 0 && len(m.Layers) == 0 {
 		return nil, nil
 	}
-	out := make([]digest.Digest, 0, 1+len(m.Layers))
+	out := make([]TypedChild, 0, 1+len(m.Layers))
 	if m.Config.Digest != "" {
 		if d, err := digest.Parse(m.Config.Digest); err == nil {
-			out = append(out, d)
+			out = append(out, TypedChild{Digest: d, Kind: ifaces.KindConfig})
 		}
 	}
 	for _, l := range m.Layers {
@@ -82,7 +133,7 @@ func ChildDigests(body []byte) ([]digest.Digest, error) {
 			continue
 		}
 		if d, err := digest.Parse(l.Digest); err == nil {
-			out = append(out, d)
+			out = append(out, TypedChild{Digest: d, Kind: ifaces.KindBlob})
 		}
 	}
 	return out, nil

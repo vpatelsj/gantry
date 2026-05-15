@@ -1833,7 +1833,7 @@ func (p *layerPrefetchAdapter) OnManifestServed(ctx context.Context, registry, r
 		)
 		return
 	}
-	children, err := manifest.ChildDigests(body)
+	children, err := manifest.TypedChildren(body)
 	if err != nil {
 		p.logger.Debug("prefetch: manifest parse failed",
 			slog.String("digest", manifestDigest.String()),
@@ -1847,28 +1847,31 @@ func (p *layerPrefetchAdapter) OnManifestServed(ctx context.Context, registry, r
 	}
 
 	// Filter out digests already present locally; they don't need
-	// prefetching.
-	pending := make([]digest.Digest, 0, len(children))
-	for _, d := range children {
-		has, err := p.cache.Has(ctx, d)
+	// prefetching. We carry the per-child Kind through the filter so
+	// the downstream PrefetchChildren call can keep the
+	// config-vs-layer distinction end-to-end (so the
+	// p2p_origin_pull_total{kind="config"} bucket actually counts).
+	pending := make([]coldstart.ChildDigest, 0, len(children))
+	for _, c := range children {
+		has, err := p.cache.Has(ctx, c.Digest)
 		if err != nil {
 			// Treat error as "unknown" — include the digest; the
 			// puller's in-flight dedupe handles the case where it's
 			// already there.
-			pending = append(pending, d)
+			pending = append(pending, coldstart.ChildDigest{Digest: c.Digest, Kind: c.Kind})
 			continue
 		}
 		if !has {
-			pending = append(pending, d)
+			pending = append(pending, coldstart.ChildDigest{Digest: c.Digest, Kind: c.Kind})
 		}
 	}
 	if len(pending) == 0 {
 		return
 	}
-	if err := p.resolver.PrefetchLayers(ctx, pending, registry, repository); err != nil {
-		p.logger.Debug("prefetch: PrefetchLayers reported errors",
+	if err := p.resolver.PrefetchChildren(ctx, pending, registry, repository); err != nil {
+		p.logger.Debug("prefetch: PrefetchChildren reported errors",
 			slog.String("manifest", manifestDigest.String()),
-			slog.Int("layers", len(pending)),
+			slog.Int("children", len(pending)),
 			slog.Any("err", err),
 		)
 	}

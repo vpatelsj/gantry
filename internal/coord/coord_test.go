@@ -340,6 +340,47 @@ func TestPleasePull_KindRoundtrip(t *testing.T) {
 	}
 }
 
+// TestPleasePull_KindConfigRoundtrip extends the kind-roundtrip
+// coverage to the new ifaces.KindConfig variant. The proto enum
+// gained KIND_CONFIG so per-kind metrics ("manifest | config | layer")
+// stay honest across the please_pull wire — without this round-trip
+// a coordinator-driven origin pull of an image-config blob would
+// downgrade to "blob" on the puller and the
+// p2p_origin_pull_total{kind="config"} bucket would be permanently
+// zero in production.
+func TestPleasePull_KindConfigRoundtrip(t *testing.T) {
+	hClient, hServer := makeHostPair(t)
+
+	c, err := cache.Open(t.TempDir(), 1<<30)
+	if err != nil {
+		t.Fatalf("cache.Open: %v", err)
+	}
+	members := fakes.NewMembers(ifaces.NodeID(hServer.ID().String()))
+	infl := inflight.New(inflight.DefaultStalls(), nil)
+
+	var observedKind ifaces.OriginRefKind
+	pump := coord.PullerPump(func(_ context.Context, _, _ string, d digest.Digest, kind ifaces.OriginRefKind) (time.Time, bool, *coord.NegativeEntry) {
+		observedKind = kind
+		h, _, already := infl.Start(d, kind, 0)
+		_ = h
+		return time.Now(), already, nil
+	})
+	srv := coord.NewServer(c, members, infl, coord.WithPullerPump(pump))
+	srv.Bind(hServer)
+
+	cli := coord.NewClient(hClient)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	d := digest.MustParse("sha256:" + rep('c', 64))
+	if _, err := cli.PleasePull(ctx, ifaces.NodeID(hServer.ID().String()), "reg", "repo", ifaces.KindConfig, []digest.Digest{d}); err != nil {
+		t.Fatalf("PleasePull: %v", err)
+	}
+	if observedKind != ifaces.KindConfig {
+		t.Fatalf("observedKind = %v; want KindConfig (wire downgrade detected)", observedKind)
+	}
+}
+
 func TestClient_UnknownNodeReturnsError(t *testing.T) {
 	hClient, _ := makeHostPair(t)
 	cli := coord.NewClient(hClient)

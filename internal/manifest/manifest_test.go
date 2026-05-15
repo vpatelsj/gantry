@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/gantry/gantry/internal/digest"
+	"github.com/gantry/gantry/internal/ifaces"
 	"github.com/gantry/gantry/internal/manifest"
 )
 
@@ -194,5 +195,101 @@ func TestChildDigests_MalformedInnerDigestSkipped(t *testing.T) {
 	}
 	if got[0].String() != "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" {
 		t.Fatalf("got %s", got[0])
+	}
+}
+
+// TestTypedChildren_TagsConfigAsKindConfigAndLayersAsKindBlob is the
+// load-bearing invariant for the tenth-review observability fix: the
+// image-config blob MUST be tagged ifaces.KindConfig so the
+// p2p_origin_pull_total{kind="config"} bucket actually counts when
+// the prefetch path drives PleasePull/StartLocalPull through
+// PrefetchChildren. Layers stay as ifaces.KindBlob because the OCI
+// URL family is /blobs/ for both, and downstream pullers don't need
+// to distinguish — only the metric label does.
+func TestTypedChildren_TagsConfigAsKindConfigAndLayersAsKindBlob(t *testing.T) {
+	t.Parallel()
+
+	got, err := manifest.TypedChildren([]byte(ociImageManifest))
+	if err != nil {
+		t.Fatalf("TypedChildren: %v", err)
+	}
+	// Config first, then two layers, source order.
+	if len(got) != 3 {
+		t.Fatalf("got %d typed children, want 3 (%v)", len(got), got)
+	}
+	if got[0].Digest.String() != "sha256:1111111111111111111111111111111111111111111111111111111111111111" {
+		t.Fatalf("config digest mismatch: %s", got[0].Digest)
+	}
+	if got[0].Kind != ifaces.KindConfig {
+		t.Fatalf("config kind = %v, want KindConfig", got[0].Kind)
+	}
+	for i, c := range got[1:] {
+		if c.Kind != ifaces.KindBlob {
+			t.Errorf("layer[%d] kind = %v, want KindBlob", i, c.Kind)
+		}
+	}
+}
+
+// TestTypedChildren_DockerManifestSameKindingAsOCI confirms the
+// kinding contract is media-type agnostic: schema-2 docker manifests
+// and OCI manifests both place the config in the .config slot and
+// layers in the .layers slot, and TypedChildren MUST tag them the
+// same way for both formats.
+func TestTypedChildren_DockerManifestSameKindingAsOCI(t *testing.T) {
+	t.Parallel()
+
+	got, err := manifest.TypedChildren([]byte(dockerImageManifest))
+	if err != nil {
+		t.Fatalf("TypedChildren: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("got %d, want 2", len(got))
+	}
+	if got[0].Kind != ifaces.KindConfig {
+		t.Fatalf("docker config kind = %v, want KindConfig", got[0].Kind)
+	}
+	if got[1].Kind != ifaces.KindBlob {
+		t.Fatalf("docker layer kind = %v, want KindBlob", got[1].Kind)
+	}
+}
+
+// TestTypedChildren_ImageIndexReturnsNil mirrors ChildDigests'
+// image-index handling: there's no config-or-layer blob to fetch
+// until containerd asks for an architecture-specific manifest.
+func TestTypedChildren_ImageIndexReturnsNil(t *testing.T) {
+	t.Parallel()
+
+	got, err := manifest.TypedChildren([]byte(ociImageIndex))
+	if err != nil {
+		t.Fatalf("TypedChildren: %v", err)
+	}
+	if got != nil {
+		t.Fatalf("image index: got %v, want nil", got)
+	}
+}
+
+// TestChildDigests_MatchesTypedChildren proves the back-compat path
+// is byte-equivalent in ordering and content with the new typed API.
+// If either drifts, both callers (pre-Kind PrefetchLayers and the
+// new PrefetchChildren) would see inconsistent prefetch sets — this
+// guards against that regression.
+func TestChildDigests_MatchesTypedChildren(t *testing.T) {
+	t.Parallel()
+
+	flat, err := manifest.ChildDigests([]byte(ociImageManifest))
+	if err != nil {
+		t.Fatalf("ChildDigests: %v", err)
+	}
+	typed, err := manifest.TypedChildren([]byte(ociImageManifest))
+	if err != nil {
+		t.Fatalf("TypedChildren: %v", err)
+	}
+	if len(flat) != len(typed) {
+		t.Fatalf("length mismatch: flat=%d typed=%d", len(flat), len(typed))
+	}
+	for i := range flat {
+		if flat[i] != typed[i].Digest {
+			t.Errorf("index %d: flat=%s typed=%s", i, flat[i], typed[i].Digest)
+		}
 	}
 }
