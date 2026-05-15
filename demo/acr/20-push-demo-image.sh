@@ -75,6 +75,9 @@ az acr login -n "${ACR_NAME}" >/dev/null
 echo "==> docker buildx build --push ${IMAGE}"
 # Single platform: linux/amd64 to match Standard_D4s_v5 nodes. Use a
 # named builder so we don't pick up an unrelated default with surprises.
+# --provenance=false / --sbom=false suppresses the attestation manifest
+# so the tag points at a single image manifest (not a manifest list);
+# this keeps the layer-digest extraction below trivial.
 BUILDER="gantry-demo-builder"
 docker buildx inspect "${BUILDER}" >/dev/null 2>&1 \
     || docker buildx create --name "${BUILDER}" --driver docker-container >/dev/null
@@ -82,25 +85,57 @@ docker buildx use "${BUILDER}"
 docker buildx build \
     --builder "${BUILDER}" \
     --platform linux/amd64 \
+    --provenance=false \
+    --sbom=false \
     --tag "${IMAGE}" \
     --push \
     "${WORKDIR}"
 
 echo "==> Capturing manifest + layer digests"
-# `az acr manifest show-metadata` is gone in newer az; use the v2 API
-# directly via `az acr repository show-manifests`.
-MANIFEST_JSON="$(az acr manifest list-metadata \
-    --registry "${ACR_NAME}" --name "${DEMO_REPO}" \
-    --orderby time_desc --top 1 -o json | jq '.[0]')"
-MANIFEST_DIGEST="$(echo "${MANIFEST_JSON}" | jq -r '.digest')"
+# Use ACR admin credentials (basic auth) to hit the v2 manifest API.
+# `az acr login --expose-token` returns a refresh token, not an access
+# token, and the v2 API rejects it as a bearer.
+ACR_USER="$(az acr credential show -n "${ACR_NAME}" --query username -o tsv)"
+ACR_PASS="$(az acr credential show -n "${ACR_NAME}" --query 'passwords[0].value' -o tsv)"
 
-# Pull layer digests from the actual manifest (not the metadata doc).
-ACR_TOKEN="$(az acr login --name "${ACR_NAME}" --expose-token --output tsv --query accessToken)"
-LAYERS_JSON="$(curl -fsSL \
-    -H "Authorization: Bearer ${ACR_TOKEN}" \
+# Resolve the manifest the tag points at. If it's a manifest list /
+# image index (multi-platform or attestation-bearing), descend to the
+# linux/amd64 entry.
+RAW="$(curl -fsSL -u "${ACR_USER}:${ACR_PASS}" \
+    -H "Accept: application/vnd.oci.image.index.v1+json" \
+    -H "Accept: application/vnd.docker.distribution.manifest.list.v2+json" \
     -H "Accept: application/vnd.oci.image.manifest.v1+json" \
     -H "Accept: application/vnd.docker.distribution.manifest.v2+json" \
     "https://${ACR_LOGIN_SERVER}/v2/${DEMO_REPO}/manifests/${TAG}")"
+MEDIA_TYPE="$(echo "${RAW}" | jq -r '.mediaType // ""')"
+case "${MEDIA_TYPE}" in
+    *manifest.list*|*image.index*)
+        # Descend to the linux/amd64 platform entry (skip attestation).
+        PLATFORM_DIGEST="$(echo "${RAW}" | jq -r '
+            .manifests[]
+            | select(.platform.os=="linux" and .platform.architecture=="amd64"
+                and (.platform["os.version"] // "") == ""
+                and (.annotations["vnd.docker.reference.type"] // "") != "attestation-manifest")
+            | .digest' | head -1)"
+        LAYERS_JSON="$(curl -fsSL -u "${ACR_USER}:${ACR_PASS}" \
+            -H "Accept: application/vnd.oci.image.manifest.v1+json" \
+            -H "Accept: application/vnd.docker.distribution.manifest.v2+json" \
+            "https://${ACR_LOGIN_SERVER}/v2/${DEMO_REPO}/manifests/${PLATFORM_DIGEST}")"
+        MANIFEST_DIGEST="${PLATFORM_DIGEST}"
+        ;;
+    *)
+        LAYERS_JSON="${RAW}"
+        # Compute the manifest digest from the raw bytes (sha256 of the body).
+        MANIFEST_DIGEST="sha256:$(printf '%s' "${RAW}" | sha256sum | awk '{print $1}')"
+        # Prefer az's reported digest if we can get it (more reliable
+        # than recomputing from the body, which depends on JSON canon).
+        if AZ_MANIFEST_DIGEST="$(az acr manifest list-metadata \
+                --registry "${ACR_NAME}" --name "${DEMO_REPO}" \
+                --orderby time_desc --top 1 -o tsv --query '[0].digest' 2>/dev/null)"; then
+            MANIFEST_DIGEST="${AZ_MANIFEST_DIGEST}"
+        fi
+        ;;
+esac
 echo "${LAYERS_JSON}" | jq -r '.layers[].digest' | sort -u > ".last-layers-${ROLE}.txt"
 
 echo "${RUN_ID}"           > ".run-id-${ROLE}"
