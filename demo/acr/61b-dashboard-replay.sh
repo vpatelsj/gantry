@@ -14,16 +14,12 @@ RUN_ID="$(cat .run-id-with-gantry)"
 START_ISO="$(cat .with-gantry-start)"
 END_ISO="$(cat .with-gantry-end)"
 
-ELAPSED=$(( $(date -u +%s) - $(date -u -d "${END_ISO}" +%s 2>/dev/null \
-    || date -u -j -f %Y-%m-%dT%H:%M:%SZ "${END_ISO}" +%s) ))
-NEEDED=${AZ_INGEST_REPLAY_SECONDS}
-if (( ELAPSED < NEEDED )); then
-    SLEEP=$(( NEEDED - ELAPSED ))
-    echo "==> Sleeping ${SLEEP}s to reach +${NEEDED}s post-end"
-    sleep "${SLEEP}"
-fi
-
 ARTIFACT="${ARTIFACTS_DIR}/with-gantry-${RUN_ID}-replay.json"
+
+# Re-poll for any late-arriving rows; cap at 5 min beyond what 61
+# already waited for.
+echo "==> Polling Log Analytics again for late-arriving rows"
+wait_for_kql_ingest "${START_ISO}" "${END_ISO}" 300 15
 TOTAL_EVENTS="$(run_kql "$(envsubst < queries/acr-total-events.kql)")"
 THR_EVENTS="$(run_kql "$(envsubst < queries/acr-throttling.kql)")"
 TPC="$(acr_metric TotalPullCount      "${START_ISO}" "${END_ISO}")"

@@ -23,3 +23,18 @@ go.work.sum
 # Local env
 .env
 .envrc
+
+# demo/acr runtime artifacts (per-session state, never commit)
+demo/acr/env.sh
+demo/acr/.provision-state
+demo/acr/.run-id
+demo/acr/.run-id-*
+demo/acr/.last-digest-*
+demo/acr/.last-layers-*.txt
+demo/acr/.baseline-start
+demo/acr/.baseline-end
+demo/acr/.with-gantry-start
+demo/acr/.with-gantry-end
+demo/acr/.cached-start
+demo/acr/.cached-end
+demo/acr/artifacts/

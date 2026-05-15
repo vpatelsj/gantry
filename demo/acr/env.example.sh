@@ -43,6 +43,14 @@ export DEMO_LAYER_BYTES="${DEMO_LAYER_BYTES:-20971520}"  # ~20 MiB / layer
 # when intentionally re-using a tag (Phase 6b uses .run-id-with-gantry).
 export RUN_ID="${RUN_ID:-}"
 
+# How many baseline workload iterations 40-baseline.sh runs back-to-back
+# to drive ACR pull load high enough to risk Basic-SKU throttling.
+# Each iteration mints a fresh tag (so containerd can't serve from its
+# content store) and produces ~640 ACR repository events. 5 iterations
+# ≈ 3200 events over ~5 min — usually enough to bite Basic limits.
+# Set to 1 for the original single-pass behaviour.
+export BASELINE_HAMMER_ITERATIONS="${BASELINE_HAMMER_ITERATIONS:-5}"
+
 # ---------- Gantry image ----------
 # Tag pushed to <acr>.azurecr.io/gantry by 50-build-gantry.sh.
 export GANTRY_IMAGE_TAG="${GANTRY_IMAGE_TAG:-demo}"

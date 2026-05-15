@@ -57,10 +57,9 @@ else
     echo "  ok: ${ACR_NAME}"
 fi
 
-echo "==> Checking BUDGET_ALERT_EMAIL is not the placeholder"
-if [[ "${BUDGET_ALERT_EMAIL}" == "you@example.com" ]]; then
-    echo "BUDGET_ALERT_EMAIL is still the placeholder; edit env.sh" >&2
-    err=1
+echo "==> Checking BUDGET_ALERT_EMAIL"
+if [[ "${BUDGET_ALERT_EMAIL}" == "you@example.com" || -z "${BUDGET_ALERT_EMAIL}" ]]; then
+    echo "  WARN: BUDGET_ALERT_EMAIL is unset or the placeholder; 10b-set-budget-alert.sh will skip the budget alert (cluster cost will not be auto-paged)."
 else
     echo "  ok: ${BUDGET_ALERT_EMAIL}"
 fi

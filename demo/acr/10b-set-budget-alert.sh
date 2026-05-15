@@ -16,6 +16,12 @@ fi
 # shellcheck disable=SC1091
 source ./.provision-state
 
+if [[ "${BUDGET_ALERT_EMAIL}" == "you@example.com" || -z "${BUDGET_ALERT_EMAIL}" ]]; then
+    echo "BUDGET_ALERT_EMAIL is unset/placeholder — skipping budget alert setup."
+    echo "Set BUDGET_ALERT_EMAIL in env.sh and re-run if you want a daily cost alert."
+    exit 0
+fi
+
 echo "==> Action group: gantry-demo-budget-ag"
 az monitor action-group create \
     --resource-group "${RG_NAME}" \

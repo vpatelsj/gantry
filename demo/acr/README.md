@@ -60,9 +60,11 @@ source env.sh
 # Phase 1 — provision (one-time per session)
 ./00-prereqs.sh
 ./10-provision.sh
-./10b-set-budget-alert.sh
+./10b-set-budget-alert.sh           # optional; skipped if BUDGET_ALERT_EMAIL is unset
 
-# Phase 2 — build/push the demo image
+# Phase 2 — build/push the first demo image (40-baseline.sh will mint
+# additional fresh tags for each hammer iteration; this initial push
+# only exists so 30-install-prom.sh has something to scrape against).
 ./20-push-demo-image.sh
 
 # Phase 3 — observability stack
@@ -71,7 +73,9 @@ kubectl apply -f manifests/grafana-dashboard-configmap.yaml
 
 # --- Recording starts here ---
 
-# Phase 4 — baseline (no gantry; verify hosts.toml is absent first)
+# Phase 4 — baseline (no gantry; loops the workload BASELINE_HAMMER_ITERATIONS
+# times to drive enough load to risk Basic-SKU throttling). 41-record
+# captures pull-event durations + a real-time containerd-journald 429 scan.
 ./40-baseline.sh
 ./41-record-baseline.sh
 
