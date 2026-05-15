@@ -1875,3 +1875,72 @@ func TestColdStart_TwoNode_OnlyHRW0OriginatesPull(t *testing.T) {
 		t.Errorf("B's Resolution first provider = %s; want n0 (= A)", resolutions[1].Providers[0].NodeID)
 	}
 }
+
+// TestPullerSelectionIgnoresResponderRank asserts that puller
+// selection uses the *requester's* HRW ranking, not whatever rank
+// the responder reports back. Eighth code review #2: a peer mid-
+// rollout or with stale membership informer cache can return a
+// PullIntent with a wrong / -1 / inflated RecipientRank; if the
+// requester sorted reachable responses by that field, two requesters
+// computing the same HRW top-K could disagree on the winner during
+// the convergence window, duplicating origin pulls.
+//
+// Setup: 4-node cluster, self = n3. Pick a digest where the
+// requester computes top = [A=rank0, B=rank1, C=rank2, D=rank3].
+// Have the responder at the requester's rank 0 lie and report
+// RecipientRank=99; have the responder at requester's rank 1 lie
+// and report RecipientRank=-1; have rank 2 report rank 0. All
+// three responders report rule 7 (cold start, no cache, no
+// in-flight). LocalPull is absent.
+//
+// Assertions:
+//   - sendPleasePull is dispatched to *requester* rank 0 (the
+//     node the requester locally computed as rank 0), NOT to
+//     responder-rank-0 (which here is the rank-2 liar).
+//   - Resolution providers start with that same node.
+func TestPullerSelectionIgnoresResponderRank(t *testing.T) {
+	nodes := clusterNodes()
+	self := ifaces.NodeID("n3")
+	d := digest.MustParse("sha256:" + rep('7', 64))
+
+	top := hrw.TopK(nodes, d, 3)
+	requesterRank0 := top[0].Node.ID
+	requesterRank2 := top[2].Node.ID
+	// Pre-fix, lying about responder rank steered selection.
+	intents := map[ifaces.NodeID]ifaces.PullIntent{
+		top[0].Node.ID: {RecipientRank: 99}, // true rank 0, lies as 99 (would be deprioritised)
+		top[1].Node.ID: {RecipientRank: -1}, // true rank 1, lies as unknown
+		top[2].Node.ID: {RecipientRank: 0},  // true rank 2, lies as rank 0 (would WIN pre-fix)
+	}
+	coord := &stubCoord{intents: intents}
+	// Disco returns the *correct* rank-0 node as a provider so
+	// pollDHT terminates after sendPleasePull fires.
+	disco := &stubDisco{
+		health: 1.0,
+		providers: [][]ifaces.Provider{
+			{{NodeID: requesterRank0, Addr: string(requesterRank0) + ":5001"}},
+		},
+	}
+
+	r := buildResolver(t, coord, disco, self, nodes, coldstart.MetricsHooks{}, time.Now)
+	res, err := r.Resolve(context.Background(), d, ifaces.KindManifest, "reg.example.com", "test/repo", 0)
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+
+	// Requester-computed rank 0 must have received the please_pull;
+	// the rank-2 liar must NOT have.
+	coord.mu.Lock()
+	defer coord.mu.Unlock()
+	if len(coord.pleasePullCalls) != 1 {
+		t.Fatalf("PleasePull call count: got %d (%v); want 1", len(coord.pleasePullCalls), coord.pleasePullCalls)
+	}
+	got := coord.pleasePullCalls[0]
+	if got != requesterRank0 {
+		t.Fatalf("please_pull dispatched to %s; want %s (requester rank 0). The rank-2 liar=%s reported rank 0 but must NOT have won.",
+			got, requesterRank0, requesterRank2)
+	}
+	if res == nil || len(res.Providers) == 0 || res.Providers[0].NodeID != requesterRank0 {
+		t.Errorf("Resolution providers[0] = %v; want first = %s (requester rank 0)", res, requesterRank0)
+	}
+}

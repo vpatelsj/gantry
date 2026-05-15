@@ -367,10 +367,16 @@ func (r *Resolver) probe(ctx context.Context, d digest.Digest, kind ifaces.Origi
 		}
 	}
 	// Don't pull_intent_query ourselves — we already know our state.
-	queryTargets := make([]hrw.Scored, 0, len(top))
-	for _, s := range top {
+	// Each target carries its requester-computed HRW rank (its index
+	// in top); fanOut threads that rank into the response so puller
+	// selection in lowestRankReachable runs against the requester's
+	// own ranking and is independent of whatever rank the responder
+	// reports (§5.3: responder rank is a *debug* signal, not the
+	// authoritative selector — see Batch-43 rationale below).
+	queryTargets := make([]rankedTarget, 0, len(top))
+	for i, s := range top {
 		if s.Node.ID != self {
-			queryTargets = append(queryTargets, s)
+			queryTargets = append(queryTargets, rankedTarget{Scored: s, requesterRank: int32(i)})
 		}
 	}
 
@@ -405,9 +411,10 @@ func (r *Resolver) probe(ctx context.Context, d digest.Digest, kind ifaces.Origi
 			selfIntent.RecipientRank = int32(selfIdx)
 		}
 		responses = append(responses, response{
-			node:   top[selfIdx].Node,
-			ok:     true,
-			intent: selfIntent,
+			node:          top[selfIdx].Node,
+			ok:            true,
+			intent:        selfIntent,
+			requesterRank: int32(selfIdx),
 		})
 	}
 
@@ -534,8 +541,11 @@ func (r *Resolver) probe(ctx context.Context, d digest.Digest, kind ifaces.Origi
 
 // fanOut issues pull_intent_query to every target in parallel. Each
 // response (or error) is recorded in the returned slice, indexed by
-// target. Targets with nil queryTimeout protection rely on ctx.
-func (r *Resolver) fanOut(ctx context.Context, targets []hrw.Scored, d digest.Digest) []response {
+// target. Targets with nil queryTimeout protection rely on ctx. The
+// requester-computed HRW rank is threaded onto the response so
+// downstream selection (lowestRankReachable) does not depend on the
+// responder reporting its own rank correctly.
+func (r *Resolver) fanOut(ctx context.Context, targets []rankedTarget, d digest.Digest) []response {
 	out := make([]response, len(targets))
 	var wg sync.WaitGroup
 	wg.Add(len(targets))
@@ -545,10 +555,11 @@ func (r *Resolver) fanOut(ctx context.Context, targets []hrw.Scored, d digest.Di
 			defer wg.Done()
 			intent, err := r.opts.Coord.PullIntentQuery(ctx, s.Node.ID, d)
 			out[i] = response{
-				node:   s.Node,
-				ok:     err == nil,
-				err:    err,
-				intent: intent,
+				node:          s.Node,
+				ok:            err == nil,
+				err:           err,
+				intent:        intent,
+				requesterRank: s.requesterRank,
 			}
 		}()
 	}
@@ -556,11 +567,25 @@ func (r *Resolver) fanOut(ctx context.Context, targets []hrw.Scored, d digest.Di
 	return out
 }
 
+// rankedTarget pairs an HRW scored node with the rank the requester
+// (the caller of fanOut) has computed for it. Threading the rank
+// onto the response ensures the puller-selection sort uses the
+// requester's own ranking, not whatever rank the responder reports
+// — which can be stale during informer lag or a rolling membership
+// update and would otherwise let the cascade pick the wrong puller
+// in exactly the convergence window where the algorithm is most
+// fragile.
+type rankedTarget struct {
+	hrw.Scored
+	requesterRank int32
+}
+
 type response struct {
-	node   ifaces.Node
-	ok     bool
-	err    error
-	intent ifaces.PullIntent
+	node          ifaces.Node
+	ok            bool
+	err           error
+	intent        ifaces.PullIntent
+	requesterRank int32 // requester-computed HRW rank for response.node
 }
 
 func reachableResponses(in []response) []response {
@@ -661,11 +686,22 @@ func findTransientCooldown(rs []response) (bool, time.Time) {
 }
 
 func lowestRankReachable(rs []response) *response {
-	// Sort by reported hrw_rank ascending; the lowest-numbered rank is
-	// the highest-priority puller (§5.2 step 6).
+	// Sort by requester-computed hrw_rank ascending; the
+	// lowest-numbered rank is the highest-priority puller
+	// (§5.2 step 6).
+	//
+	// We deliberately use the *requester's* rank (response.requesterRank,
+	// set in fanOut from this resolver's own HRW top-K) rather than
+	// the responder-reported intent.RecipientRank. Otherwise a peer
+	// that is mid-rollout, has stale membership informer cache, or
+	// is simply misconfigured can mis-report its rank and steer the
+	// requester to a non-canonical puller — duplicating origin
+	// pulls in exactly the convergence windows the algorithm is
+	// meant to protect. The responder-reported rank is kept around
+	// (see checkRankMismatches) purely as a divergence signal.
 	sorted := append([]response(nil), rs...)
 	sort.SliceStable(sorted, func(i, j int) bool {
-		ri, rj := sorted[i].intent.RecipientRank, sorted[j].intent.RecipientRank
+		ri, rj := sorted[i].requesterRank, sorted[j].requesterRank
 		// Treat negative (unknown) ranks as +∞ so they're picked last.
 		if ri < 0 {
 			ri = int32(1<<31 - 1)
