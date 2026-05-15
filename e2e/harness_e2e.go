@@ -169,13 +169,10 @@ func (h *harness) applyDaemonSet(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	// Swap the image reference to our locally-loaded tag.
-	patched := strings.Replace(string(raw),
-		"ghcr.io/vpatelsj/gantry:latest", imageTag, 1)
-	// Force imagePullPolicy=Never so kubelet doesn't try to pull
-	// gantry:e2e from a registry — we've side-loaded it via kind.
-	patched = strings.Replace(patched,
-		"imagePullPolicy: IfNotPresent", "imagePullPolicy: Never", 1)
+	patched, err := patchDaemonSetForE2E(string(raw), imageTag)
+	if err != nil {
+		return err
+	}
 
 	cmd := exec.CommandContext(ctx, "kubectl", "apply", "-f", "-")
 	cmd.Stdin = strings.NewReader(patched)
@@ -186,6 +183,52 @@ func (h *harness) applyDaemonSet(ctx context.Context) error {
 		return fmt.Errorf("kubectl apply: %w (stderr: %s)", err, stderr.String())
 	}
 	return nil
+}
+
+// gantryContainerAnchor is the line + pull-policy pair that uniquely
+// identifies the GANTRY container (not the busybox initContainer) in
+// deploy/daemonset.yaml. The trailing `# build.sh fills this with
+// `git describe“ comment is part of the anchor on purpose: it makes
+// the match brittle in exactly the right way — if the gantry image
+// line is ever reformatted, patchDaemonSetForE2E fails fast at apply
+// time rather than silently leaving the production image in place.
+const gantryContainerAnchor = "image: ghcr.io/vpatelsj/gantry:latest   # build.sh fills this with `git describe`\n          imagePullPolicy: IfNotPresent"
+
+// patchDaemonSetForE2E rewrites deploy/daemonset.yaml's gantry
+// container — and ONLY the gantry container — to use the
+// side-loaded e2e image with imagePullPolicy=Never. The busybox
+// initContainer (which also has `imagePullPolicy: IfNotPresent`)
+// is left untouched so kind's containerd can pull it from the
+// public registry on first boot.
+//
+// This pure helper exists so the patch logic is unit-testable
+// without spinning up a kind cluster or shelling out to kubectl.
+// The harness's applyDaemonSet wraps it.
+//
+// Why this is structural rather than two independent
+// strings.Replace calls: deploy/daemonset.yaml has TWO
+// `imagePullPolicy: IfNotPresent` entries. A previous revision
+// used `strings.Replace(..., 1)` on the policy line alone, which
+// patched the busybox initContainer (first occurrence) instead of
+// gantry. The result on a fresh kind cluster was busybox:1.36
+// being set to `Never` — but busybox is not preloaded into kind
+// so kubelet hit ErrImageNeverPull and the initContainer never
+// started. The eleventh-review fix was to anchor the swap on a
+// multi-line pattern that uniquely matches the gantry container,
+// then fail loud if the anchor stops matching.
+func patchDaemonSetForE2E(raw, imageTag string) (string, error) {
+	replacement := "image: " + imageTag + "   # e2e local image (side-loaded via kind load)\n          imagePullPolicy: Never"
+	patched := strings.Replace(raw, gantryContainerAnchor, replacement, 1)
+	if patched == raw {
+		// Anchor didn't match. Almost certainly because the gantry
+		// container's image line was reformatted in
+		// deploy/daemonset.yaml. Bail loud — we'd rather fail the
+		// e2e test than ship a half-patched manifest that rolls
+		// out the production tag (or, worse, the wrong
+		// imagePullPolicy on the wrong container).
+		return "", fmt.Errorf("patchDaemonSetForE2E: gantry image/policy anchor not found in deploy/daemonset.yaml; update gantryContainerAnchor in harness_e2e.go")
+	}
+	return patched, nil
 }
 
 // waitForRollout polls until the DaemonSet reports all desired pods
