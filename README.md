@@ -1,17 +1,84 @@
 # Gantry
 
-**Cluster-internal peer-to-peer container image distribution for Kubernetes at 10k+ node scale.**
+**Kill the registry thundering herd. Pull images peer-to-peer at 10,000-node scale.**
 
-Gantry is a per-node daemon that turns every Kubernetes node into both a
-client *and* a cache for OCI image content. When a kubelet asks
-containerd for an image, containerd is configured to mirror the request
-to a local Gantry agent on `127.0.0.1:5000`. The agent serves the bytes
-out of its on-disk cache if it has them, otherwise it discovers other
-nodes that already have the layer via a libp2p Kademlia DHT and streams
-them peer-to-peer over `:5001`. Only on full peer-miss does Gantry fall
-back to the upstream registry — so a 10,000-node rollout pulls each
-unique blob from the origin a small number of times rather than 10,000
-times.
+Gantry is a per-node daemon that turns every Kubernetes node into a
+caching peer for OCI image content. Without changing your kubelet,
+containerd, registry, or workloads, Gantry replaces the "every node
+talks to the registry" pull pattern with a deterministic peer-to-peer
+fabric — and bounds origin pulls to roughly one per unique blob per
+cluster, no matter how many nodes you have.
+
+## Why Gantry
+
+### 1. The thundering herd is solved by construction
+
+Roll a 10,000-replica Deployment of a 2 GiB image and naive container
+runtimes will open 10,000 simultaneous TLS connections to your registry,
+asking for the same bytes 10,000 times. That's the cost that dominates
+large-scale rollouts: registry rate limits, NAT exhaustion, cluster ↔
+registry link saturation, slow pod-startup p99s, and very real cloud
+egress bills.
+
+Gantry collapses that into **F1: one origin pull per unique digest per
+cluster** — not per node, not per image, not per pod. Concretely:
+
+- **Per-digest designated puller via rendezvous hashing (HRW).** Every
+  node in the cluster independently computes the same rank order for
+  any given digest. The rank-0 node is the only one that contacts the
+  registry. Manifest, config, and each layer of an image generally HRW
+  to *different* nodes, so origin contact is spread across N+2 nodes
+  for an N-layer image — no single "image owner" hot-spot.
+- **Receiver-side per-digest dedupe.** If 9,999 nodes all hit a cold
+  digest at the same instant, the first `please_pull` RPC starts the
+  origin pull; the other 9,998 get `already_pulling` immediately and
+  switch to polling the DHT for the puller's Provide announcement.
+  No registry-side coordination, no leader election, no Redis.
+- **DHT-side polling, not puller-side polling.** Requesters wait on
+  the DHT for the Provide record, not on the puller's HTTP endpoint.
+  The 10,000-node herd never lands on a single node.
+- **Negative caching of origin failures (§5.8).** A registry 4xx/5xx
+  for one digest doesn't get re-tried by every node in lockstep.
+- **Range-resumable peer transfers (RFC 7233).** A 2 GiB layer that
+  dies at 1.7 GiB resumes from byte 1.7 G against another peer, not
+  from byte 0 against the registry.
+
+Net effect on a fully-cold N-node, M-layer rollout: roughly **M+1
+origin pulls total** instead of N × (M+1).
+
+### 2. Peer-to-peer image sharing as the hot path
+
+Every Gantry agent is simultaneously a client and a server. Once any
+node in the cluster has pulled a blob, the rest of the cluster can fan
+it out laterally without ever touching origin again.
+
+- **libp2p Kademlia DHT for provider discovery.** Sub-second lookup
+  ("who has digest `sha256:abc…`?") at 10k-node scale; no central
+  registry of who-has-what.
+- **Plaintext HTTP/2 (h2c) for the bulk transfer hot path.** No TLS
+  handshake tax on the inner-cluster pull, so layer transfer is
+  bandwidth-bound, not handshake-bound.
+- **Streaming digest verification on every byte received from a
+  peer.** A malicious or buggy peer cannot poison your cache —
+  bytes are hashed in-band through `internal/digestpipe` as they
+  commit, and a digest mismatch fails the write atomically.
+- **Sparse, demand-driven replication.** Each digest is replicated
+  only to nodes that actually demanded it (plus its HRW-designated
+  puller). No node holds the full image catalog; no per-cluster
+  storage blowup.
+- **Workloads are unchanged.** Kubelet and containerd are configured
+  once via `hosts.toml` to mirror `/v2/` through the local agent on
+  `127.0.0.1:5000`. The pod spec, the registry secret, the image
+  reference — all untouched. Disable Gantry and the cluster falls
+  back to direct origin pulls transparently.
+- **Mesh-friendly.** Coordination plane (`:4001`) is libp2p with
+  Noise transport encryption + Ed25519 peer identity. Transfer plane
+  (`:5001`) is h2c that you can wrap in Istio / Linkerd / Cilium
+  mTLS if your threat model needs it.
+
+---
+
+Concretely the data path looks like this:
 
 ```mermaid
 flowchart LR
