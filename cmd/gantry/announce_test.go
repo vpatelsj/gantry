@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"testing"
 
 	"github.com/gantry/gantry/internal/config"
@@ -293,3 +294,65 @@ func TestBootstrapConvergenceTarget(t *testing.T) {
 		})
 	}
 }
+
+// bootstrapPeerCount must consult SnapshotForBootstrap (Running +
+// annotated, regardless of Ready) when the Members implementation
+// exposes it, and fall back to Snapshot only for Members
+// implementations that don't (the dev-mode single-self fake, test
+// stubs). The bootstrap view is the correct denominator for the DHT
+// routing-table target and the /readyz DHT-convergence gate during
+// a cold rollout where no pod is Ready yet — using the serving view
+// there is the readiness-bypass bug this helper exists to prevent.
+func TestBootstrapPeerCount(t *testing.T) {
+	t.Run("fallback to Snapshot when no SnapshotForBootstrap", func(t *testing.T) {
+		// fakes.Members implements ifaces.Members but NOT the
+		// bootstrapper extension; verify the fallback branch.
+		f := fakes.NewMembers(
+			ifaces.NodeID("self"),
+			ifaces.Node{ID: "self"},
+			ifaces.Node{ID: "peer-a"},
+			ifaces.Node{ID: "peer-b"},
+		)
+		if got := bootstrapPeerCount(f); got != 3 {
+			t.Errorf("bootstrapPeerCount(fakes) = %d, want 3 (fallback to Snapshot)", got)
+		}
+	})
+	t.Run("uses SnapshotForBootstrap when available and prefers it over Snapshot", func(t *testing.T) {
+		// During a cold rollout Snapshot() may report 0 while
+		// SnapshotForBootstrap reports the full announced set.
+		// bootstrapPeerCount MUST pick up the bootstrap value or
+		// the /readyz DHT-convergence gate gets bypassed.
+		m := &bootstrapStub{
+			snapshot: nil, // simulate "no Ready peers yet"
+			boot: []ifaces.Node{
+				{ID: "self"},
+				{ID: "peer-a"},
+				{ID: "peer-b"},
+				{ID: "peer-c"},
+			},
+		}
+		if got := bootstrapPeerCount(m); got != 4 {
+			t.Errorf("bootstrapPeerCount(stub) = %d, want 4 (must read SnapshotForBootstrap, not Snapshot)", got)
+		}
+	})
+	t.Run("single-self bootstrap returns 1", func(t *testing.T) {
+		m := &bootstrapStub{boot: []ifaces.Node{{ID: "self"}}}
+		if got := bootstrapPeerCount(m); got != 1 {
+			t.Errorf("bootstrapPeerCount(single-self stub) = %d, want 1", got)
+		}
+	})
+}
+
+// bootstrapStub is a minimal Members implementation that ALSO
+// exposes SnapshotForBootstrap, so we can exercise the structural
+// type assertion inside bootstrapPeerCount without dragging the
+// full k8s informer plumbing into a unit test.
+type bootstrapStub struct {
+	snapshot []ifaces.Node
+	boot     []ifaces.Node
+}
+
+func (s *bootstrapStub) Self() ifaces.NodeID                 { return "self" }
+func (s *bootstrapStub) Snapshot() []ifaces.Node             { return s.snapshot }
+func (s *bootstrapStub) SnapshotForBootstrap() []ifaces.Node { return s.boot }
+func (s *bootstrapStub) WaitForSync(_ context.Context) error { return nil }

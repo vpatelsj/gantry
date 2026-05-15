@@ -277,10 +277,19 @@ func runAgent(args []string) error {
 	// kademlia_max_routing_table_size); the constant cap of 256 is
 	// derived from kad-dht's bucket-size 20 × log2(10000) ≈ 266 and
 	// rounded down. Read live on every score call.
+	//
+	// Sizing uses bootstrapPeerCount (= SnapshotForBootstrap when
+	// available) instead of Snapshot. During a fresh rollout no peer
+	// is Ready yet, so Snapshot() reports 0–1 and the DHT health score
+	// computed downstream from this target looks artificially good
+	// ("target=0, current=0, score=1.0"). The bootstrap view counts
+	// every Running pod that has published a p2p-addrs annotation,
+	// which is the set of peers we actually expect kad-dht to learn
+	// about, so the score reflects real convergence pressure.
 	const kademliaMaxRoutingTable = 256
 	if monitor := disco.Monitor(); monitor != nil {
 		monitor.SetRoutingTableTarget(func() int {
-			sz := len(memberView.Snapshot())
+			sz := bootstrapPeerCount(memberView)
 			if sz > kademliaMaxRoutingTable {
 				return kademliaMaxRoutingTable
 			}
@@ -568,7 +577,21 @@ func runAgent(args []string) error {
 		// pod's informer has synced but the second hasn't started).
 		// The bootstrap loop applies the matching carve-out via
 		// bootstrapConvergenceTarget returning 0.
-		if len(memberView.Snapshot()) > 1 && disco.RoutingTableSize() < 1 {
+		//
+		// IMPORTANT: this uses bootstrapPeerCount (= Running pods
+		// with a p2p-addrs annotation, regardless of Ready),
+		// NOT Snapshot() which is the Ready-only serving view.
+		// During a fresh rollout the current pod is not Ready yet
+		// and peer pods may also not be Ready yet, so Snapshot()
+		// returns 0–1 and this guard would skip the DHT check
+		// entirely — letting pods become Ready before libp2p/DHT
+		// has converged and starting their mirror traffic into a
+		// non-functional cluster, which thunders the origin. The
+		// bootstrap view is the right scope because the DHT can
+		// only converge through peers that have at least announced
+		// libp2p addresses, which is exactly what the bootstrap
+		// view filters for.
+		if bootstrapPeerCount(memberView) > 1 && disco.RoutingTableSize() < 1 {
 			return "dht routing table empty", false
 		}
 		return "", true
@@ -1348,6 +1371,39 @@ func bootstrapConvergenceTarget(snapshotSize, maxSize int) int {
 		return peers
 	}
 	return maxSize
+}
+
+// bootstrapPeerCount returns the number of cluster members visible
+// through the bootstrap view: every Running pod that has published a
+// gantry.io/p2p-addrs annotation, regardless of Ready status. Falls
+// back to the serving Snapshot() when the Members implementation
+// doesn't expose a bootstrap-specific view (e.g. the dev-mode
+// single-self fake, or test stubs).
+//
+// Used by two places that *must not* gate on Ready: the kad-dht
+// routing-table target (Phase 5) and the readiness probe's DHT
+// check. Both of them need to know "how many peers do we expect the
+// routing table to learn about", and that population is the set of
+// peers whose libp2p addresses are dialable — strictly larger than
+// the Ready set, especially during a cold rollout where *no* pod is
+// Ready yet. Using Snapshot() here was a latent readiness-bypass
+// bug: a fresh rollout would see snapshot size 0 or 1 across the
+// whole cluster, the "snapshot > 1" guard on the DHT check would
+// short-circuit to true, and every pod would flip Ready before
+// libp2p/DHT had actually converged.
+//
+// The bootstrapper interface is matched structurally so this
+// package doesn't need to import internal/members for the type
+// assertion (which would create a build-time cycle with the
+// fakes/test stubs used by announce_test.go).
+func bootstrapPeerCount(m ifaces.Members) int {
+	type bootstrapper interface {
+		SnapshotForBootstrap() []ifaces.Node
+	}
+	if b, ok := m.(bootstrapper); ok {
+		return len(b.SnapshotForBootstrap())
+	}
+	return len(m.Snapshot())
 }
 
 // bootstrapPeerAddrs collects every published p2p multiaddr across all
