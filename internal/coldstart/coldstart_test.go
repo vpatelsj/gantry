@@ -1944,3 +1944,38 @@ func TestPullerSelectionIgnoresResponderRank(t *testing.T) {
 		t.Errorf("Resolution providers[0] = %v; want first = %s (requester rank 0)", res, requesterRank0)
 	}
 }
+
+// TestKindLabel asserts eighth-review #4: the three OriginRefKind
+// values map to distinct Prometheus label values so config-blob
+// fetches don't smear into the layer bucket.
+//
+// Why this matters: cold-start metrics
+// (gantry_coldstart_duration_seconds, gantry_hrw_rank_mismatch_total,
+// gantry_designated_puller_takeover_total) are labelled by `kind`,
+// and a typical image pull traverses manifest → config → layer*.
+// If KindConfig collapses into "layer" the config fetch (a small,
+// usually fast pull) drags the layer p99 down and hides regressions
+// in actual layer transfers. KindConfig.String() already returns
+// "config" so the package-internal label MUST agree.
+//
+// The default branch covers KindBlob (the common case) and any
+// future enum value — "layer" is the conservative fallback for
+// "we don't have a metric bucket for that yet", not for KindConfig.
+func TestKindLabel(t *testing.T) {
+	cases := []struct {
+		name string
+		kind ifaces.OriginRefKind
+		want string
+	}{
+		{"KindManifest -> manifest", ifaces.KindManifest, "manifest"},
+		{"KindConfig -> config (eighth-review #4)", ifaces.KindConfig, "config"},
+		{"KindBlob -> layer", ifaces.KindBlob, "layer"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := coldstart.KindLabelForTest(tc.kind); got != tc.want {
+				t.Errorf("kindLabel(%v) = %q; want %q", tc.kind, got, tc.want)
+			}
+		})
+	}
+}

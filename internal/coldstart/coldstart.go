@@ -69,7 +69,8 @@ type Discovery interface {
 type MetricsHooks struct {
 	// OnRankMismatch fires once per pull_intent response whose
 	// reported hrw_rank disagrees with the requester's computed
-	// rank for that responder. kindLabel is "manifest" or "layer".
+	// rank for that responder. kindLabel is "manifest", "config",
+	// or "layer".
 	OnRankMismatch func(kindLabel string, responder ifaces.NodeID)
 	// OnDhtFalseEmpty fires when the orchestrator observes the
 	// false-empty case: DHT had returned 0 providers, but a
@@ -87,8 +88,9 @@ type MetricsHooks struct {
 	// responder reports in_flight=true but its started_at is older
 	// than the per-§5.2a stall threshold, so the requester excludes
 	// it from rule-3 piggyback and routes via the next-ranked node
-	// (rule 6 / rule 7). kindLabel is "manifest" or "layer". Maps to
-	// §7.6 metric `p2p_designated_puller_takeover_total`.
+	// (rule 6 / rule 7). kindLabel is "manifest", "config", or
+	// "layer". Maps to §7.6 metric
+	// `p2p_designated_puller_takeover_total`.
 	OnDesignatedPullerTakeover func(kindLabel string)
 	// OnTopKExpansion fires once per expansion pass to top-2K (or
 	// top-(K × TopKExpansionFactor) when the factor is configured).
@@ -896,10 +898,14 @@ func (r *Resolver) recordHonorWindow(d digest.Digest, cooldownUntil time.Time) {
 }
 
 func kindLabel(k ifaces.OriginRefKind) string {
-	if k == ifaces.KindManifest {
+	switch k {
+	case ifaces.KindManifest:
 		return "manifest"
+	case ifaces.KindConfig:
+		return "config"
+	default:
+		return "layer"
 	}
-	return "layer"
 }
 
 func prefix(p, s string) string {
