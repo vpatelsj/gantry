@@ -539,7 +539,17 @@ func runAgent(args []string) error {
 			// surfaces an RBAC misconfiguration immediately.
 			return "members self-announce pending (check pods/patch RBAC)", false
 		}
-		if disco.RoutingTableSize() < 1 {
+		// Single-node cluster carve-out: with only self in the
+		// members view there are no peers to dial, so the kad-dht
+		// routing table will stay empty by definition. Without this
+		// check /readyz would hang forever on a legitimate
+		// single-node deploy (an operator running one agent in a
+		// dev cluster, a one-node staging environment, or the
+		// transient state during an initial rollout where the first
+		// pod's informer has synced but the second hasn't started).
+		// The bootstrap loop applies the matching carve-out via
+		// bootstrapConvergenceTarget returning 0.
+		if len(memberView.Snapshot()) > 1 && disco.RoutingTableSize() < 1 {
 			return "dht routing table empty", false
 		}
 		return "", true
@@ -1283,19 +1293,19 @@ func announceSelfAndBootstrap(ctx context.Context, mgr *members.Manager, disco *
 // bootstrapConvergenceTarget returns the RoutingTableSize threshold
 // that signals "bootstrap converged; ceasing periodic dials". It is
 // the minimum of the per-cluster cap (maxSize) and the peer count
-// (members snapshot size minus 1 for self), with a floor of 1 so
-// even a single-node cluster eventually exits the loop.
+// (members snapshot size minus 1 for self).
 //
 // snapshotSize is the size of SnapshotForBootstrap() (peers + self).
-// Returns 1 when snapshotSize ≤ 1: a lone agent has nothing to dial
-// but should not loop forever waiting for an impossible
-// RoutingTableSize ≥ 5 condition. The first ConnectPeers pass (with
-// zero candidates) will satisfy this immediately and the loop
-// exits.
+// Returns 0 when snapshotSize ≤ 1: a lone agent has nothing to dial
+// and the DHT routing table will stay empty by definition, so any
+// positive target would loop forever. Treating 0 as "converged"
+// lets a single-node cluster exit the bootstrap loop on the first
+// pass and lets /readyz flip to ready (the readiness probe applies
+// the same single-node carve-out to the routing-table check).
 func bootstrapConvergenceTarget(snapshotSize, maxSize int) int {
 	peers := snapshotSize - 1
 	if peers < 1 {
-		return 1
+		return 0
 	}
 	if peers < maxSize {
 		return peers

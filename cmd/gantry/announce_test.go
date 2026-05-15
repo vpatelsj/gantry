@@ -265,9 +265,9 @@ func TestSelfAnnounceRequiredForReadiness(t *testing.T) {
 // bootstrapConvergenceTarget gates "bootstrap converged; ceasing
 // periodic dials" on RoutingTableSize ≥ target. A fixed target of 5
 // loops forever on small clusters (2-3 nodes) because the routing
-// table can never grow that big; a floor of 1 prevents the
-// single-node case from spinning indefinitely waiting for peers it
-// can never have.
+// table can never grow that big; for single-node deploys we return
+// 0 so the loop exits immediately on the first pass (no peers to
+// dial; routing-table will stay empty by definition).
 func TestBootstrapConvergenceTarget(t *testing.T) {
 	cases := []struct {
 		name         string
@@ -275,8 +275,8 @@ func TestBootstrapConvergenceTarget(t *testing.T) {
 		maxSize      int
 		want         int
 	}{
-		{name: "single-node cluster floors at 1", snapshotSize: 1, maxSize: 5, want: 1},
-		{name: "empty snapshot defensively floors at 1", snapshotSize: 0, maxSize: 5, want: 1},
+		{name: "single-node cluster targets 0", snapshotSize: 1, maxSize: 5, want: 0},
+		{name: "empty snapshot defensively returns 0", snapshotSize: 0, maxSize: 5, want: 0},
 		{name: "2-node cluster targets 1 peer", snapshotSize: 2, maxSize: 5, want: 1},
 		{name: "3-node cluster targets 2 peers", snapshotSize: 3, maxSize: 5, want: 2},
 		{name: "5-node cluster targets 4 peers", snapshotSize: 5, maxSize: 5, want: 4},
