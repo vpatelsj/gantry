@@ -20,8 +20,10 @@
 #     pod the agent binds 0.0.0.0:5000 (configmap.yaml has
 #     mirror_bind_allow_non_loopback: true) because kube-proxy /
 #     portmap DNAT delivers the traffic to <podIP>:5000, not the
-#     pod's loopback. The NetworkPolicy denies ingress on 5000 from
-#     anywhere except the host.
+#     pod's loopback. The NetworkPolicy allows ingress on TCP/5000
+#     from the node CIDR (operator-edit placeholder) because after
+#     DNAT the pod observes source = node IP; a default-deny rule
+#     without that allowance silently breaks every mirror pull.
 #   - Resource requests are placeholders (NF6 validation pending).
 #     Operators should size them after observing
 #     p2p_in_flight_pulls / cache_budget under their workload.

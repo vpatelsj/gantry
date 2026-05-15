@@ -1,5 +1,5 @@
-# NetworkPolicy restricting transfer (5001), libp2p (4001), and
-# metrics (9095) ports per §7.5.
+# NetworkPolicy restricting transfer (5001), libp2p (4001), mirror
+# (5000), and metrics (9095) ports per §7.5.
 #
 # Phase 6: the policy was upgraded from the Phase 2 stub (ingress
 # only) to include explicit egress restrictions. Egress is allowed to
@@ -8,9 +8,18 @@
 # Operators with explicit registry endpoints should tighten the last
 # rule to their registry IPs or labels.
 #
-# The loopback mirror endpoint (:5000) is bound to 127.0.0.1 by the
-# agent and never reachable from the pod network, so it doesn't
-# appear in this policy.
+# Mirror port 5000 ingress: although the DaemonSet exposes the mirror
+# via `hostPort: 5000` with `hostIP: 127.0.0.1` (so the host-side
+# endpoint is loopback-only), the in-pod listener binds 0.0.0.0:5000
+# and the kubelet's portmap/iptables DNAT rewrites incoming traffic
+# from `127.0.0.1:5000` on the node to `<podIP>:5000` in the pod's
+# network namespace. The source address the pod observes is the
+# node's IP (the source NAT happens for return-path SNAT, not
+# ingress), so a default-deny NetworkPolicy with no rule for 5000
+# drops the DNATed mirror traffic entirely — containerd then sees
+# connection-refused on every pull. We therefore explicitly allow
+# TCP/5000 from the node CIDR (operator-edit; the same 0.0.0.0/0
+# kubelet-permissive default used by the metrics rule applies).
 #
 # Requires a CNI that enforces NetworkPolicy (Calico, Cilium, etc.).
 apiVersion: networking.k8s.io/v1
@@ -69,6 +78,27 @@ spec:
       ports:
         - protocol: TCP
           port: 9095
+    # Mirror endpoint (5000) exposed via DaemonSet hostPort with
+    # hostIP: 127.0.0.1. After kubelet/portmap DNAT, the in-pod
+    # listener sees source = node IP and destination = <podIP>:5000.
+    # Without this rule, default-deny drops the DNATed mirror
+    # traffic and containerd gets connection-refused on every pull.
+    #
+    # ipBlock 0.0.0.0/0 matches the kubelet-permissive default used
+    # by the 9095 metrics rule. Operators should tighten it to the
+    # actual node CIDR:
+    #   kubectl get nodes -o jsonpath='{.items[*].status.addresses[?(@.type=="InternalIP")].address}'
+    # In particular this rule MUST NOT widen the policy to allow
+    # pod-network access to 5000 (which would bypass the
+    # hostIP: 127.0.0.1 binding's whole reason for existing);
+    # tightening to the node CIDR preserves the loopback-only
+    # invariant the daemonset.yaml comment claims.
+    - from:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+      ports:
+        - protocol: TCP
+          port: 5000
   egress:
     # DNS for Service / Node lookups.
     - to:
