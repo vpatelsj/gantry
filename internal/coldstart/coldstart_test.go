@@ -1357,3 +1357,99 @@ func (g *gatedLocalPull) StartLocalPull(ctx context.Context, _, _ string, _ ifac
 	}
 	return out, nil
 }
+
+// TestLocalPullIntentObeysProbeDeadline asserts that the context
+// handed to LocalIntentProvider.LocalPullIntent carries the same
+// per-query deadline as the peer fan-out (QueryTimeout), not the
+// outer Resolve context. Seventh code review #4: previously the
+// resolver passed the outer ctx, which may have no deadline at all
+// (mirror request contexts usually inherit from the agent's
+// long-lived service context). LocalPullIntent may consult the
+// secondary blob source (containerd content store) on cache miss;
+// without the timeout a stall in that lookup would block the whole
+// probe past the per-digest budget while peer responses have
+// already arrived.
+func TestLocalPullIntentObeysProbeDeadline(t *testing.T) {
+	nodes := clusterNodes()
+	self := ifaces.NodeID("n2")
+	d := findDigestWhereSelfIsRank0(t, nodes, self, 3)
+	top := hrw.TopK(nodes, d, 3)
+
+	coord := &stubCoord{}
+	programPeerIntentsByRank(coord, top, self)
+	// rule 7 success path so Resolve doesn't fail before recording
+	// the local-intent deadline.
+	disco := &stubDisco{
+		providers: [][]ifaces.Provider{
+			nil,
+			{{NodeID: self, Addr: "local:5001"}},
+		},
+	}
+
+	li := &deadlineCapturingLocalIntent{}
+	lp := &stubLocalPull{}
+
+	mems := fakes.NewMembers(self, nodes...)
+	infl := inflight.New(inflight.DefaultStalls(), time.Now)
+	const queryTimeout = 200 * time.Millisecond
+	r := coldstart.New(coldstart.Options{
+		Members:      mems,
+		Discovery:    disco,
+		Coord:        coord,
+		Inflight:     infl,
+		HrwK:         3,
+		HrwScope:     hrw.ScopeCluster,
+		LocalIntent:  li,
+		LocalPull:    lp,
+		QueryTimeout: queryTimeout,
+		PollManifest: 10 * time.Millisecond,
+		PollLayer:    10 * time.Millisecond,
+	})
+
+	// Outer ctx has NO deadline — this is the production case for
+	// most Resolve calls (the mirror handler's request ctx is
+	// derived from the long-lived service ctx). The probeCtx wrap
+	// is the only thing that can bound LocalPullIntent's view of
+	// the budget.
+	start := time.Now()
+	_, _ = r.Resolve(context.Background(), d, ifaces.KindManifest, "reg.example.com", "test/repo", 0)
+
+	deadline, hasDeadline := li.lastDeadline()
+	if !hasDeadline {
+		t.Fatalf("LocalPullIntent ctx had no deadline; expected one derived from QueryTimeout (%v)", queryTimeout)
+	}
+	// The deadline must be within [QueryTimeout - small slack,
+	// QueryTimeout + small slack] of the call start. We allow 250ms
+	// of slack to absorb scheduler jitter; the assertion that
+	// matters is "deadline is bounded by QueryTimeout, NOT by the
+	// outer ctx (which has none)".
+	got := deadline.Sub(start)
+	if got < queryTimeout-50*time.Millisecond || got > queryTimeout+250*time.Millisecond {
+		t.Errorf("LocalPullIntent ctx deadline = +%v from call start; want close to QueryTimeout=%v", got, queryTimeout)
+	}
+}
+
+// deadlineCapturingLocalIntent records the deadline of every
+// context passed to LocalPullIntent so tests can assert the
+// resolver applied the probe-level timeout.
+type deadlineCapturingLocalIntent struct {
+	mu       sync.Mutex
+	deadline time.Time
+	hasDdl   bool
+}
+
+func (l *deadlineCapturingLocalIntent) LocalPullIntent(ctx context.Context, _ digest.Digest) ifaces.PullIntent {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if d, ok := ctx.Deadline(); ok {
+		l.deadline = d
+		l.hasDdl = true
+	}
+	return ifaces.PullIntent{}
+}
+
+func (l *deadlineCapturingLocalIntent) lastDeadline() (time.Time, bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.deadline, l.hasDdl
+}

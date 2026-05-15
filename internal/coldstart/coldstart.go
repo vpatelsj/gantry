@@ -385,8 +385,17 @@ func (r *Resolver) probe(ctx context.Context, d digest.Digest, kind ifaces.Origi
 	// the HRW-designated puller — two nodes both ranking each other
 	// as the puller can each issue a please_pull and both
 	// origin-pull, violating the F1 invariant.
+	//
+	// Uses probeCtx (not the outer ctx) so self-intent obeys the
+	// same per-query deadline as the peer fan-out. LocalPullIntent
+	// may consult the secondary blob source (containerd content
+	// store) on cache miss — that lookup is fast in steady state
+	// but can stall a containerd that's busy compacting its content
+	// store, and without the timeout a slow self-intent would block
+	// the whole probe past the per-digest budget while peers have
+	// already returned.
 	if r.opts.LocalIntent != nil && selfIdx >= 0 {
-		selfIntent := r.opts.LocalIntent.LocalPullIntent(ctx, d)
+		selfIntent := r.opts.LocalIntent.LocalPullIntent(probeCtx, d)
 		// Defensive: the synthetic responder MUST report the rank we
 		// expect for self so the cascade's lowest-rank-reachable
 		// picks correctly. The server-side computeLocalIntent uses
