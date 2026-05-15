@@ -400,3 +400,117 @@ func TestOriginMetricKind_MapsToDesignVocabulary(t *testing.T) {
 		}
 	}
 }
+
+// TestHead_DoesNotFirePullMetrics pins the twelfth-review contract:
+// origin.Client.Head must NOT invoke onPullStart or onPullFailure,
+// regardless of outcome. HEAD is a metadata-only operation; folding
+// it into p2p_origin_pull_total broke the per-pull arithmetic
+// (started == success + failure + in_flight) because HEAD never
+// produces bytes and therefore can fire neither success (no commit)
+// nor downstream-failure (no body copy).
+func TestHead_DoesNotFirePullMetrics(t *testing.T) {
+	body := []byte("head-metadata-only")
+	d := digestOf(body)
+
+	t.Run("success path", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodHead {
+				t.Errorf("origin received method %q, want HEAD", r.Method)
+			}
+			w.Header().Set("Content-Length", fmt.Sprintf("%d", len(body)))
+			w.WriteHeader(http.StatusOK)
+		}))
+		defer srv.Close()
+
+		var starts, failures int32
+		cfg := &config.Config{UpstreamRegistries: []config.UpstreamRegistry{
+			{Name: "reg", Endpoint: srv.URL},
+		}}
+		c, err := New(cfg, WithMetrics(
+			func(_ string) { atomic.AddInt32(&starts, 1) },
+			func(_, _ string) { atomic.AddInt32(&failures, 1) },
+		))
+		if err != nil {
+			t.Fatal(err)
+		}
+		size, err := c.Head(context.Background(), ifaces.OriginRef{
+			Registry: "reg", Repository: "lib/n", Digest: d, Kind: ifaces.KindBlob,
+		})
+		if err != nil {
+			t.Fatalf("Head: %v", err)
+		}
+		if size != int64(len(body)) {
+			t.Errorf("size = %d, want %d", size, len(body))
+		}
+		if n := atomic.LoadInt32(&starts); n != 0 {
+			t.Errorf("starts = %d, want 0 (Head must NOT bump p2p_origin_pull_total)", n)
+		}
+		if n := atomic.LoadInt32(&failures); n != 0 {
+			t.Errorf("failures = %d, want 0", n)
+		}
+	})
+
+	t.Run("404 failure path", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusNotFound)
+		}))
+		defer srv.Close()
+
+		var starts, failures int32
+		cfg := &config.Config{UpstreamRegistries: []config.UpstreamRegistry{
+			{Name: "reg", Endpoint: srv.URL},
+		}}
+		c, err := New(cfg, WithMetrics(
+			func(_ string) { atomic.AddInt32(&starts, 1) },
+			func(_, _ string) { atomic.AddInt32(&failures, 1) },
+		))
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = c.Head(context.Background(), ifaces.OriginRef{
+			Registry: "reg", Repository: "lib/n", Digest: d, Kind: ifaces.KindBlob,
+		})
+		if err == nil {
+			t.Fatal("Head: expected error on 404")
+		}
+		var oe *ifaces.OriginError
+		if !errors.As(err, &oe) || oe.Class != ifaces.FailureNotFound {
+			t.Errorf("err = %v, want OriginError{Class=not_found}", err)
+		}
+		if n := atomic.LoadInt32(&starts); n != 0 {
+			t.Errorf("starts = %d, want 0 (Head must NOT bump p2p_origin_pull_total)", n)
+		}
+		// HEAD failures also stay out of the pull-failure family
+		// for now — operators see HEAD failures via the mirror's
+		// HTTP response code. A future batch can add a dedicated
+		// HEAD failure counter if needed.
+		if n := atomic.LoadInt32(&failures); n != 0 {
+			t.Errorf("failures = %d, want 0 (Head must NOT bump p2p_origin_pull_failure_total either)", n)
+		}
+	})
+
+	t.Run("unknown registry", func(t *testing.T) {
+		var starts, failures int32
+		c, err := New(&config.Config{UpstreamRegistries: []config.UpstreamRegistry{
+			{Name: "known", Endpoint: "http://localhost"},
+		}}, WithMetrics(
+			func(_ string) { atomic.AddInt32(&starts, 1) },
+			func(_, _ string) { atomic.AddInt32(&failures, 1) },
+		))
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = c.Head(context.Background(), ifaces.OriginRef{
+			Registry: "absent", Repository: "lib/n", Digest: d, Kind: ifaces.KindBlob,
+		})
+		if err == nil {
+			t.Fatal("Head: expected error for unknown registry")
+		}
+		if n := atomic.LoadInt32(&starts); n != 0 {
+			t.Errorf("starts = %d, want 0", n)
+		}
+		if n := atomic.LoadInt32(&failures); n != 0 {
+			t.Errorf("failures = %d, want 0", n)
+		}
+	})
+}

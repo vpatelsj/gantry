@@ -201,6 +201,25 @@ type OriginPuller interface {
 	// On terminal failure the returned error is wrapped in an *OriginError
 	// carrying the failure classification used by §5.8.
 	Pull(ctx context.Context, ref OriginRef) (io.ReadCloser, int64, error)
+
+	// Head fetches metadata for a digest without transferring the body.
+	// Used by the mirror's HEAD handler to satisfy distribution-spec
+	// metadata requests on a cache miss without doing a full origin pull.
+	//
+	// Head is deliberately NOT counted in p2p_origin_pull_total or its
+	// success/failure siblings. Those counters describe byte-pull
+	// attempts: metadata-only HEAD is a different operation class, and
+	// folding HEAD calls into pull totals broke the per-pull arithmetic
+	// (started == success + failure + in_flight) because HEAD never
+	// produces bytes, never commits to cache, and therefore can fire
+	// neither success nor downstream-failure. See origin.Client.Head's
+	// implementation comment for why HEAD failures also stay out of
+	// p2p_origin_pull_failure_total.
+	//
+	// On terminal failure the returned error is wrapped in an
+	// *OriginError carrying the failure classification used by §5.8 so
+	// the mirror can convert it to the right HTTP status.
+	Head(ctx context.Context, ref OriginRef) (int64, error)
 }
 
 // OriginError is the error returned by OriginPuller.Pull for terminal

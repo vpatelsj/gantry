@@ -547,18 +547,45 @@ func (s *Server) serveDigest(w http.ResponseWriter, r *http.Request, upstream, r
 		}
 	}
 
-	// 3. Origin pull, stream-and-cache. The started, failure, AND
-	// success counters are all bumped inside origin.Pull (via
-	// origin.WithMetrics) — origin is the single chokepoint that
-	// both the mirror direct-origin path and the coordinated
-	// please_pull / runOriginPull goroutine route through, so
-	// counting there means dashboards see one source of truth and
-	// the failure breakdown by class is consistent across both
-	// paths. (Success is the deliberate exception — origin emits
-	// STARTED and FAILURE at its own boundary; we emit SUCCESS
-	// from below after cw.Commit because origin has no way to know
-	// whether the caller actually committed bytes.)
+	// 3. Origin pull, stream-and-cache.
+	//
+	// Metric placement (twelfth-review correction):
+	//   - p2p_origin_pull_total{kind} bumps inside origin.Pull at
+	//     entry (via origin.WithMetrics' onPullStart hook).
+	//   - p2p_origin_pull_failure_total{kind,class} +
+	//     p2p_origin_failure_total{class} bump inside
+	//     origin.recordFailure on origin-side terminal failures
+	//     (same WithMetrics closure double-bumps both).
+	//   - p2p_origin_pull_success_total{kind} bumps HERE in the
+	//     mirror after cw.Commit succeeds (and analogously in
+	//     runOriginPull after that path's Commit). Success cannot
+	//     live in origin because origin has no way to know whether
+	//     the caller actually committed the bytes to cache.
+	//
+	// HEAD takes the separate s.origin.Head path explicitly so it
+	// does NOT bump p2p_origin_pull_total: HEAD is metadata-only,
+	// it never warms the cache, so counting it as a pull-attempt
+	// inflated the started counter against operations that could
+	// fire neither success (no commit) nor downstream-failure
+	// (no body copy). See origin.Client.Head's comment for the
+	// full rationale.
 	pRef := ifaces.OriginRef{Registry: upstream, Repository: repo, Digest: d, Kind: kind}
+	if r.Method == http.MethodHead {
+		// Metadata-only path. Single round-trip to origin to learn
+		// the blob's Content-Length, write headers, return. Does
+		// NOT touch the cache writer, does NOT bump any pull-family
+		// counter. A subsequent GET for the same digest follows the
+		// normal cache-miss origin path below and warms the cache
+		// then.
+		hsize, herr := s.origin.Head(ctx, pRef)
+		if herr != nil {
+			writeOriginError(w, herr, logger)
+			return
+		}
+		writeBlobHeaders(w, d, hsize, kind)
+		return
+	}
+
 	pr, psize, perr := s.origin.Pull(ctx, pRef)
 	if perr != nil {
 		writeOriginError(w, perr, logger)
@@ -587,44 +614,6 @@ func (s *Server) serveDigest(w http.ResponseWriter, r *http.Request, upstream, r
 	}
 
 	writeBlobHeaders(w, d, psize, kind)
-	if r.Method == http.MethodHead {
-		// Intentional design choice (review §4): HEAD on a cache-miss
-		// path does NOT warm the cache. The origin reader is closed
-		// by the defer above without being drained, and the cache
-		// writer (already opened for streaming) is aborted via its
-		// own defer.
-		//
-		// Rationale:
-		//   - HEAD's distribution-spec contract is metadata only;
-		//     clients invoking HEAD are explicitly NOT asking for
-		//     bytes. Reading + caching the full blob here would
-		//     turn a 0-byte response into a multi-GB origin pull,
-		//     blowing the operator's bandwidth budget and the
-		//     transfer-endpoint inflight budget on a non-existent
-		//     "ask".
-		//   - The OCI distribution spec lets the server choose
-		//     whether HEAD knows the size up front. We chose to
-		//     query origin for it (psize above) because clients
-		//     that HEAD-then-GET want the size to size up their
-		//     buffer; quoting an unknown size would force a second
-		//     round-trip.
-		//   - A subsequent GET for the same digest follows the
-		//     normal cache-miss path and warms the cache then.
-		//
-		// Cost: an origin metadata round-trip per HEAD even when
-		// the next GET would have hit the cache anyway. Acceptable
-		// because the alternative (cache-warming on HEAD) is far
-		// worse for the bandwidth-amplification case it's meant to
-		// avoid.
-		//
-		// We deliberately do NOT fire onOriginSuccess on this path:
-		// origin returned metadata, but no usable bytes were
-		// produced for the cluster. Counting this as a success
-		// would inflate p2p_origin_pull_success_total against an
-		// operation that never warmed cache nor delivered body
-		// bytes to a client.
-		return
-	}
 	written, err := io.Copy(dest, pr)
 	if err != nil {
 		// Bytes already sent; we can't undo. Cache will be aborted by defer.

@@ -359,7 +359,19 @@ func TestMirror_OriginSuccessMetric_FiresOnlyOnCacheCommit(t *testing.T) {
 		f := newFixture(t, map[digest.Digest][]byte{d: body})
 
 		var successCalls int32
-		oc, err := origin.New(f.cfg)
+		// Also count origin.Pull starts (p2p_origin_pull_total) so
+		// we can pin the twelfth-review invariant: HEAD must NOT
+		// bump that counter. Before Batch 61 the mirror called
+		// s.origin.Pull on HEAD which fired onPullStart even
+		// though HEAD never read the body, drifting the pull
+		// arithmetic.
+		var pullStarts int32
+		oc, err := origin.New(f.cfg,
+			origin.WithMetrics(
+				func(_ string) { atomic.AddInt32(&pullStarts, 1) },
+				func(_, _ string) {},
+			),
+		)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -386,6 +398,17 @@ func TestMirror_OriginSuccessMetric_FiresOnlyOnCacheCommit(t *testing.T) {
 		// targets.
 		if n := atomic.LoadInt32(&successCalls); n != 0 {
 			t.Fatalf("successCalls after HEAD = %d, want 0 (HEAD never reads the body so it never produces a real success)", n)
+		}
+		// Twelfth-review invariant: HEAD must NOT bump
+		// p2p_origin_pull_total either. HEAD now routes through
+		// origin.Client.Head which deliberately does NOT call
+		// onPullStart. If this regresses, started would inflate
+		// against operations that fire neither success
+		// (no commit) nor downstream-failure (no body copy),
+		// breaking the started == success + failure + in_flight
+		// arithmetic.
+		if n := atomic.LoadInt32(&pullStarts); n != 0 {
+			t.Fatalf("pullStarts after HEAD = %d, want 0 (HEAD must take the origin.Head path and NOT bump p2p_origin_pull_total)", n)
 		}
 	})
 

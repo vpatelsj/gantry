@@ -167,6 +167,45 @@ func (c *Client) recordFailure(kind string, err error) {
 	c.metrics.onPullFailure(kind, class)
 }
 
+// Head implements ifaces.OriginPuller.
+//
+// HEAD is a deliberately separate code path from Pull. Two design
+// points matter:
+//
+//  1. HEAD does NOT fire onPullStart. p2p_origin_pull_total
+//     counts byte-pull attempts; mixing HEAD in inflated the
+//     counter against an operation that produces no bytes, never
+//     commits to cache, and therefore can fire neither
+//     p2p_origin_pull_success_total (because mirror+puller-pump
+//     bump success after Commit, and HEAD never writes a cache
+//     entry) nor a downstream-failure counter (HEAD doesn't
+//     io.Copy a body, so it can't fail at the body-copy boundary).
+//     Leaving HEAD out keeps the
+//     started == success + failure + in_flight identity intact
+//     for the pull arithmetic. The twelfth code review flagged
+//     exactly this drift.
+//
+//  2. HEAD also does NOT fire onPullFailure. The pull-failure
+//     hook double-bumps p2p_origin_pull_failure_total{kind,class}
+//     + p2p_origin_failure_total{class} (see cmd/gantry/main.go's
+//     origin.WithMetrics closure); both belong to the pull
+//     family. A future batch can add a dedicated
+//     p2p_origin_head_total / _failure_total pair if operators
+//     need HEAD-specific signal, but for now HEAD failures
+//     surface to operators via the mirror's HTTP status and
+//     access log alone.
+func (c *Client) Head(ctx context.Context, ref ifaces.OriginRef) (int64, error) {
+	r, ok := c.registries[ref.Registry]
+	if !ok {
+		return 0, &ifaces.OriginError{
+			Ref:   ref,
+			Class: ifaces.FailureNotFound,
+			Err:   fmt.Errorf("unknown registry %q", ref.Registry),
+		}
+	}
+	return r.head(ctx, ref)
+}
+
 // Compile-time check.
 var _ ifaces.OriginPuller = (*Client)(nil)
 
@@ -242,6 +281,30 @@ func (r *registry) pull(ctx context.Context, ref ifaces.OriginRef) (io.ReadClose
 		}
 	}
 	return resp.Body, size, nil
+}
+
+// head issues an HTTP HEAD against the digest URL and returns the
+// content length (or -1 if the registry omitted Content-Length).
+// The response body is always drained-and-closed because HEAD
+// responses may carry a body in some non-conforming registries and
+// leaving it open would leak the underlying connection.
+func (r *registry) head(ctx context.Context, ref ifaces.OriginRef) (int64, error) {
+	path := r.urlFor(ref)
+	resp, err := r.do(ctx, http.MethodHead, path)
+	if err != nil {
+		return 0, &ifaces.OriginError{Ref: ref, Class: ifaces.FailureTransient, Err: err}
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		return 0, classify(ref, resp)
+	}
+	size := int64(-1)
+	if cl := resp.Header.Get("Content-Length"); cl != "" {
+		if n, err := strconv.ParseInt(cl, 10, 64); err == nil {
+			size = n
+		}
+	}
+	return size, nil
 }
 
 // urlFor returns the full URL for an OriginRef.

@@ -135,12 +135,19 @@ type OriginPuller struct {
 	entries map[string][]byte
 	// PullCount records pull attempts per digest for assertions.
 	pullCount map[string]int
+	// HeadCount records HEAD attempts per digest for assertions
+	// (used by mirror tests to assert that HEAD on a cache miss
+	// routes through Head, NOT through Pull — see
+	// TestMirror_OriginSuccessMetric_FiresOnlyOnCacheCommit's HEAD
+	// subtest).
+	headCount map[string]int
 }
 
 func NewOriginPuller() *OriginPuller {
 	return &OriginPuller{
 		entries:   map[string][]byte{},
 		pullCount: map[string]int{},
+		headCount: map[string]int{},
 	}
 }
 
@@ -161,11 +168,32 @@ func (o *OriginPuller) Pull(_ context.Context, ref ifaces.OriginRef) (io.ReadClo
 	return io.NopCloser(bytes.NewReader(b)), int64(len(b)), nil
 }
 
+// Head implements ifaces.OriginPuller. The fake returns the same size
+// it would have served from Pull (so callers that HEAD-then-GET see a
+// consistent Content-Length) without consuming a Pull slot.
+func (o *OriginPuller) Head(_ context.Context, ref ifaces.OriginRef) (int64, error) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.headCount[ref.Digest.String()]++
+	b, ok := o.entries[ref.Digest.String()]
+	if !ok {
+		return 0, &ifaces.OriginError{Ref: ref, Class: ifaces.FailureNotFound, Err: errors.New("404")}
+	}
+	return int64(len(b)), nil
+}
+
 // PullCount returns the number of Pull invocations seen for d.
 func (o *OriginPuller) PullCount(d digest.Digest) int {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	return o.pullCount[d.String()]
+}
+
+// HeadCount returns the number of Head invocations seen for d.
+func (o *OriginPuller) HeadCount(d digest.Digest) int {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.headCount[d.String()]
 }
 
 // ---------------------------------------------------------------------------
