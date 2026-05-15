@@ -332,11 +332,23 @@ func runAgent(args []string) error {
 		)
 	}
 	// A successful self-announce is required for readiness iff the
-	// agent is running in production K8s mode with no static
-	// bootstrap peers — i.e. dynamic discovery via annotations is the
-	// *only* path other pods have to find us. Static bootstrap
-	// deployments bypass this gate because operator-supplied peers
-	// give the routing table a seed regardless of our annotation.
+	// agent is running in production K8s mode with its own pod name
+	// set. The self-announce publishes the gantry.io/peer-id,
+	// gantry.io/p2p-addrs, and gantry.io/transfer-addr annotations
+	// on this pod so other agents can translate a K8s-node-name
+	// membership entry (the cluster's HRW key) into the libp2p
+	// peer-ID + multiaddrs they actually dial.
+	//
+	// Static bootstrap peers do NOT bypass this gate. Bootstrap
+	// peers solve *DHT seeding* — they help kademlia discover other
+	// peers' addresses — but they do not solve the membership-ID →
+	// libp2p peer-ID mapping problem, which is what the per-pod
+	// annotations carry. An agent that DHT-bootstrapped successfully
+	// but never published its annotations still 503s every inbound
+	// please_pull / pull_intent_query because other agents fail to
+	// translate its node name. The full rationale (and the test that
+	// pins this contract) lives at selfAnnounceRequiredForReadiness
+	// below.
 	requireSelfAnnounce := false
 	if mgr, ok := memberView.(*members.Manager); ok && c.PodName != "" {
 		requireSelfAnnounce = selfAnnounceRequiredForReadiness(c)
