@@ -1453,3 +1453,146 @@ func (l *deadlineCapturingLocalIntent) lastDeadline() (time.Time, bool) {
 	defer l.mu.Unlock()
 	return l.deadline, l.hasDdl
 }
+
+// TestPrefetchLayers_RoutesSelfToLocalPull asserts that when self is
+// the HRW rank-0 designated puller for one or more digests in a
+// prefetch batch AND the Resolver is configured with a
+// LocalPullStarter, those digests are dispatched as a single
+// StartLocalPull call (one batch, all self-digests in it) rather
+// than silently skipped. Seventh code review #5: previously the
+// self-bucket was always dropped; that was safe because the
+// per-digest Resolve cascade still recovered via rule 7 when
+// containerd actually asked, but it lost the latency benefit of
+// speculative prefetch for layers assigned to self.
+func TestPrefetchLayers_RoutesSelfToLocalPull(t *testing.T) {
+	cluster := clusterNodes()
+	self := ifaces.NodeID("n0")
+	// 3 digests land on self, 2 on n1, 1 on n2 → expect:
+	//   - 1 StartLocalPull(self) carrying 3 digests
+	//   - 2 PleasePull calls (one to n1, one to n2)
+	targets := map[ifaces.NodeID]int{"n0": 3, "n1": 2, "n2": 1}
+	digests := findManyDigestsForPullers(t, cluster, targets)
+
+	coord := &stubCoord{}
+	disco := &stubDisco{health: 1.0}
+	lp := &stubLocalPull{}
+
+	mems := fakes.NewMembers(self, cluster...)
+	infl := inflight.New(inflight.DefaultStalls(), time.Now)
+	var pullerCount, digestCount int
+	var hookMu sync.Mutex
+	r := coldstart.New(coldstart.Options{
+		Members:      mems,
+		Discovery:    disco,
+		Coord:        coord,
+		Inflight:     infl,
+		HrwK:         3,
+		HrwScope:     hrw.ScopeCluster,
+		LocalPull:    lp,
+		QueryTimeout: 200 * time.Millisecond,
+		PollManifest: 20 * time.Millisecond,
+		PollLayer:    50 * time.Millisecond,
+		Metrics: coldstart.MetricsHooks{
+			OnPrefetchBatch: func(p, ds int) {
+				hookMu.Lock()
+				defer hookMu.Unlock()
+				pullerCount = p
+				digestCount = ds
+			},
+		},
+	})
+
+	if err := r.PrefetchLayers(context.Background(), digests, "docker.io", "library/nginx"); err != nil {
+		t.Fatalf("PrefetchLayers: %v", err)
+	}
+
+	// Remote pullers: exactly 2 PleasePulls (n1, n2).
+	coord.mu.Lock()
+	gotRemote := len(coord.pleasePullCalls)
+	gotPullerSet := append([]ifaces.NodeID{}, coord.pleasePullCalls...)
+	coord.mu.Unlock()
+	if gotRemote != 2 {
+		t.Fatalf("PleasePull remote calls: got %d (%v), want 2 (only n1+n2)", gotRemote, gotPullerSet)
+	}
+	for _, id := range gotPullerSet {
+		if id == self {
+			t.Fatalf("PleasePull was dispatched to self=%s; should have gone through StartLocalPull", self)
+		}
+	}
+
+	// Self-puller: exactly one StartLocalPull call carrying all 3
+	// self-digests, and registry/repo plumbed through correctly.
+	lp.mu.Lock()
+	defer lp.mu.Unlock()
+	if got := len(lp.registry); got != 1 {
+		t.Fatalf("StartLocalPull calls: got %d, want 1 (single self-batch)", got)
+	}
+	if lp.registry[0] != "docker.io" {
+		t.Errorf("StartLocalPull registry: got %q, want docker.io", lp.registry[0])
+	}
+	if lp.repo[0] != "library/nginx" {
+		t.Errorf("StartLocalPull repository: got %q, want library/nginx", lp.repo[0])
+	}
+	if len(lp.digests) != 1 || len(lp.digests[0]) != 3 {
+		t.Fatalf("StartLocalPull batch shape: got %v batches with sizes %v, want 1 batch of 3", len(lp.digests), digestBatchSizes(lp.digests))
+	}
+
+	// Metric: total pullers = remote (2) + self (1) = 3; total
+	// digests = 6.
+	hookMu.Lock()
+	defer hookMu.Unlock()
+	if pullerCount != 3 {
+		t.Errorf("OnPrefetchBatch pullers: got %d, want 3 (n1+n2+self)", pullerCount)
+	}
+	if digestCount != 6 {
+		t.Errorf("OnPrefetchBatch digests: got %d, want 6 (all 6 digests routed)", digestCount)
+	}
+}
+
+func digestBatchSizes(batches [][]digest.Digest) []int {
+	out := make([]int, len(batches))
+	for i, b := range batches {
+		out[i] = len(b)
+	}
+	return out
+}
+
+// TestPrefetchLayers_NilLocalPullStillSkipsSelf is a guardrail: when
+// LocalPull is NOT configured (e.g. unit tests, or a deployment that
+// hasn't wired the embedded coordinator yet), self-digests must
+// continue to be silently skipped. This is the legacy behaviour
+// preserved by the seventh-review #5 fix so that
+// LocalPull-less callers keep working unchanged.
+func TestPrefetchLayers_NilLocalPullStillSkipsSelf(t *testing.T) {
+	cluster := clusterNodes()
+	self := ifaces.NodeID("n0")
+	targets := map[ifaces.NodeID]int{"n0": 4}
+	digests := findManyDigestsForPullers(t, cluster, targets)
+
+	coord := &stubCoord{}
+	disco := &stubDisco{health: 1.0}
+
+	mems := fakes.NewMembers(self, cluster...)
+	infl := inflight.New(inflight.DefaultStalls(), time.Now)
+	r := coldstart.New(coldstart.Options{
+		Members:   mems,
+		Discovery: disco,
+		Coord:     coord,
+		Inflight:  infl,
+		HrwK:      3,
+		HrwScope:  hrw.ScopeCluster,
+		// LocalPull omitted on purpose.
+		QueryTimeout: 200 * time.Millisecond,
+		PollManifest: 20 * time.Millisecond,
+		PollLayer:    50 * time.Millisecond,
+	})
+
+	if err := r.PrefetchLayers(context.Background(), digests, "docker.io", "library/nginx"); err != nil {
+		t.Fatalf("PrefetchLayers: %v", err)
+	}
+	coord.mu.Lock()
+	defer coord.mu.Unlock()
+	if got := len(coord.pleasePullCalls); got != 0 {
+		t.Fatalf("PleasePull calls: got %d, want 0 (self-bucket skipped without LocalPull)", got)
+	}
+}

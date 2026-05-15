@@ -38,7 +38,11 @@ import (
 
 // PrefetchLayers groups digests by their HRW rank-0 reachable
 // designated puller and issues one PleasePull RPC per puller. Digests
-// HRW'ing to self are skipped (the local agent doesn't ask itself).
+// HRW'ing to self are diverted to the local LocalPullStarter (if
+// configured) and batched as a single StartLocalPull call; if no
+// LocalPullStarter is configured, the self-bucket is skipped (the
+// per-digest Resolve cascade will still recover via rule 7 when
+// containerd actually asks for the layer).
 // Already-cached or otherwise filtered digests should be removed by
 // the caller before invoking.
 //
@@ -73,10 +77,16 @@ func (r *Resolver) PrefetchLayers(ctx context.Context, digests []digest.Digest, 
 		return nil
 	}
 
-	// Group digests by HRW rank-0 puller, excluding self. Deterministic
-	// digest order inside each group: input order, which is also the
-	// order containerd will pull the layers.
+	// Group digests by HRW rank-0 puller. Self is a valid puller key
+	// when LocalPull is configured: we route its digests through
+	// StartLocalPull as a single batch, matching the rule-7 self path
+	// in probe(). When LocalPull is nil the self-bucket is dropped
+	// before the dispatch fan-out (preserving the original
+	// "skip-self" semantics). Deterministic digest order inside each
+	// group: input order, which is also the order containerd will
+	// pull the layers.
 	byPuller := make(map[ifaces.NodeID][]digest.Digest)
+	selfDigests := []digest.Digest(nil)
 	skippedSelf := 0
 	skippedNoTop := 0
 	// Suppress duplicate digests within a single call so a malformed
@@ -95,12 +105,16 @@ func (r *Resolver) PrefetchLayers(ctx context.Context, digests []digest.Digest, 
 		}
 		puller := top[0].Node.ID
 		if puller == self {
-			skippedSelf++
+			if r.opts.LocalPull != nil {
+				selfDigests = append(selfDigests, d)
+			} else {
+				skippedSelf++
+			}
 			continue
 		}
 		byPuller[puller] = append(byPuller[puller], d)
 	}
-	if len(byPuller) == 0 {
+	if len(byPuller) == 0 && len(selfDigests) == 0 {
 		r.opts.Logger.Debug("coldstart: prefetch had no remote pullers",
 			slog.Int("digests", len(digests)),
 			slog.Int("skipped_self", skippedSelf),
@@ -116,17 +130,48 @@ func (r *Resolver) PrefetchLayers(ctx context.Context, digests []digest.Digest, 
 	}
 	sort.Slice(pullerIDs, func(i, j int) bool { return pullerIDs[i] < pullerIDs[j] })
 
+	// Total puller count for the OnPrefetchBatch metric: remote
+	// pullers + 1 for self when self has digests to pull. This keeps
+	// the "pullers per batch" histogram meaningful now that self is
+	// a real puller participant rather than a silent skip.
+	totalPullers := len(byPuller)
+	if len(selfDigests) > 0 {
+		totalPullers++
+	}
+	totalDigests := len(digests) - skippedSelf - skippedNoTop
+
 	r.opts.Logger.Debug("coldstart: prefetch batching",
 		slog.Int("digests", len(digests)),
-		slog.Int("pullers", len(byPuller)),
+		slog.Int("pullers", totalPullers),
+		slog.Int("self_digests", len(selfDigests)),
 		slog.Int("skipped_self", skippedSelf),
 	)
 	if r.opts.Metrics.OnPrefetchBatch != nil {
-		r.opts.Metrics.OnPrefetchBatch(len(byPuller), len(digests)-skippedSelf-skippedNoTop)
+		r.opts.Metrics.OnPrefetchBatch(totalPullers, totalDigests)
 	}
 
 	var wg sync.WaitGroup
 	var failures atomic.Int32
+	// Self batch (if any) runs concurrently with peer batches so a
+	// slow LocalPull doesn't gate remote dispatch — and so a slow
+	// peer doesn't gate the local pull. Both branches are bounded by
+	// QueryTimeout so PrefetchLayers' overall latency is unchanged.
+	if len(selfDigests) > 0 {
+		wg.Add(1)
+		go func(digests []digest.Digest) {
+			defer wg.Done()
+			callCtx, cancel := context.WithTimeout(ctx, r.opts.QueryTimeout)
+			defer cancel()
+			_, err := r.opts.LocalPull.StartLocalPull(callCtx, registry, repository, ifaces.KindBlob, digests)
+			if err != nil {
+				failures.Add(1)
+				r.opts.Logger.Debug("coldstart: prefetch local pull failed",
+					slog.Int("batch_size", len(digests)),
+					slog.Any("err", err),
+				)
+			}
+		}(selfDigests)
+	}
 	for _, id := range pullerIDs {
 		ds := byPuller[id]
 		wg.Add(1)
@@ -147,7 +192,7 @@ func (r *Resolver) PrefetchLayers(ctx context.Context, digests []digest.Digest, 
 	}
 	wg.Wait()
 	if n := failures.Load(); n > 0 {
-		return fmt.Errorf("%w: %d/%d pullers errored", ErrPrefetchPartial, n, len(byPuller))
+		return fmt.Errorf("%w: %d/%d pullers errored", ErrPrefetchPartial, n, totalPullers)
 	}
 	return nil
 }
