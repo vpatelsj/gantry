@@ -313,8 +313,13 @@ fixed thresholds. Multi-pronged approach:
     | metric | `baseline (no gantry)` | `gantry cold-start (coordinator path)` | `gantry warm (cache path)` |
     | --- | --- | --- | --- |
     | total pod-ready time | from in-pod `POD_READY` logs | … | … |
-    | ACR `TotalPullCount` (Azure Monitor, coarse) | ≈ `node_count` | ≈ 1–3 | ≈ 0 |
+    | ACR `TotalPullCount` / `SuccessfulPullCount` (Azure Monitor, coarse)[^pullcount] | measured | measured | measured |
     | ACR repository events (Log Analytics, headline) | ≈ `node_count × digest_count` | `digest_count` – `3 × digest_count` | ≈ 0 |
+
+    [^pullcount]: Do not use this row as the headline ratio. Azure Monitor
+    pull counters are coarse, image-level, and their exact shape under the
+    demo's pull pattern is not contractually specified. The authoritative
+    pull-load comparison is the Log Analytics repository-events count.
     | ACR 429 events (Log Analytics) | ≥ 0 (bonus if non-zero) | ≈ 0 | ≈ 0 |
     | `p2p_origin_pull_started_total` delta | n/a | `digest_count` – `3 × digest_count` | 0 |
     | `p2p_peer_hit_total` delta | n/a | ≈ `(node_count - 1) × digest_count` | 0 |
