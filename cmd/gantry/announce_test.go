@@ -210,3 +210,54 @@ func TestIsProductionMode(t *testing.T) {
 		})
 	}
 }
+
+// selfAnnounceRequiredForReadiness must be true exactly when the
+// agent is in production mode, has a PodName (so AnnounceSelf has
+// anything to patch), AND no static bootstrap peers are configured.
+// A misclassification either lets a broken-RBAC pod report Ready
+// silently isolated (the bug this gate fixes), or stalls rollouts
+// when static peers would have seeded the DHT anyway.
+func TestSelfAnnounceRequiredForReadiness(t *testing.T) {
+	cases := []struct {
+		name string
+		c    *config.Config
+		want bool
+	}{
+		{
+			name: "dev mode never requires self-announce",
+			c:    &config.Config{},
+			want: false,
+		},
+		{
+			name: "prod mode with PodName and no static peers requires it",
+			c: &config.Config{
+				NodeName: "node-1",
+				PodName:  "gantry-abc",
+			},
+			want: true,
+		},
+		{
+			name: "prod mode with static bootstrap peers bypasses gate",
+			c: &config.Config{
+				NodeName:             "node-1",
+				PodName:              "gantry-abc",
+				Libp2pBootstrapPeers: []string{"/ip4/10.0.0.1/tcp/4001/p2p/Qm..."},
+			},
+			want: false,
+		},
+		{
+			name: "prod mode without PodName cannot self-announce, so no gate",
+			c: &config.Config{
+				NodeName: "node-1",
+			},
+			want: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := selfAnnounceRequiredForReadiness(tc.c); got != tc.want {
+				t.Errorf("selfAnnounceRequiredForReadiness = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}

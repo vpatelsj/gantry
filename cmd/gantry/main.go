@@ -242,11 +242,25 @@ func runAgent(args []string) error {
 	// Phase 3 (cont.) — self-announce: write libp2p peer.ID, listen
 	// multiaddrs, and the transfer endpoint into our own Pod's
 	// annotations so peer agents can discover this node without
-	// operator-supplied bootstrap_peers. Fire-and-forget so a missing
-	// `pods/patch` RBAC permission only degrades discovery, not the
-	// agent. Only attempted when the real informer is in use.
+	// operator-supplied bootstrap_peers. Loops with capped backoff
+	// for the lifetime of ctx — when self-announce is the only path
+	// to peer discovery (prod + dynamic bootstrap), the readiness
+	// probe below gates traffic on the first successful patch so
+	// missing `pods/patch` RBAC surfaces as a stuck deploy rather
+	// than a silently-isolated agent.
+	var selfAnnounced atomic.Bool
+	// A successful self-announce is required for readiness iff the
+	// agent is running in production K8s mode with no static
+	// bootstrap peers — i.e. dynamic discovery via annotations is the
+	// *only* path other pods have to find us. Static bootstrap
+	// deployments bypass this gate because operator-supplied peers
+	// give the routing table a seed regardless of our annotation.
+	requireSelfAnnounce := false
 	if mgr, ok := memberView.(*members.Manager); ok && c.PodName != "" {
-		go announceSelfAndBootstrap(ctx, mgr, disco, c, logger)
+		requireSelfAnnounce = selfAnnounceRequiredForReadiness(c)
+		go announceSelfAndBootstrap(ctx, mgr, disco, c, logger, func() {
+			selfAnnounced.Store(true)
+		})
 	}
 
 	// Phase 5 — wire the routing-table target now that memberView is
@@ -515,6 +529,13 @@ func runAgent(args []string) error {
 		}
 		if !membersReady.Load() {
 			return "members informer not synced", false
+		}
+		if requireSelfAnnounce && !selfAnnounced.Load() {
+			// Production + dynamic bootstrap: peers cannot
+			// discover us until our pods/patch lands. Staying
+			// 503 until then makes the rolling deploy pause and
+			// surfaces an RBAC misconfiguration immediately.
+			return "members self-announce pending (check pods/patch RBAC)", false
 		}
 		if disco.RoutingTableSize() < 1 {
 			return "dht routing table empty", false
@@ -901,6 +922,19 @@ func isProductionMode(c *config.Config) bool {
 	return c.NodeName != "" || c.PodName != "" || c.MembersNamespace != ""
 }
 
+// selfAnnounceRequiredForReadiness reports whether a successful
+// pods/patch self-announce must precede the agent reporting Ready.
+// True when production-mode K8s membership is wired AND the agent
+// has its own pod name AND no static bootstrap peers are configured.
+// Static-bootstrap deployments are exempt because operator-supplied
+// peers seed the routing table regardless of our annotation; without
+// static peers, the annotation is the *only* path other agents have
+// to discover us, so a stuck pods/patch RBAC must surface as a
+// stalled rollout instead of a silently-isolated agent.
+func selfAnnounceRequiredForReadiness(c *config.Config) bool {
+	return isProductionMode(c) && c.PodName != "" && len(c.Libp2pBootstrapPeers) == 0
+}
+
 // buildMembers tries to construct a k8s-informer-backed Members
 // Manager. Behaviour depends on whether production-mode env vars
 // signal that K8s membership is expected:
@@ -1118,16 +1152,21 @@ func membershipPeerIDResolver(mv ifaces.Members, logger *slog.Logger) func(iface
 // announceSelfAndBootstrap publishes this agent's libp2p identity into
 // its own Pod's annotations, then dials every peer announcement in the
 // membership snapshot to seed the kad-dht routing table. The
-// announcement is retried with exponential backoff on transient API
-// errors; bootstrap dials run on a periodic loop (not once) so a
-// rolling deploy where peers patch their annotations at staggered
-// times still produces a populated routing table.
+// announcement is retried with capped exponential backoff for the
+// lifetime of ctx — there is no permanent-failure exit; if `pods/patch`
+// RBAC is eventually fixed, the patch succeeds on the next attempt and
+// onAnnounced fires.
+//
+// onAnnounced is invoked exactly once, the first time AnnounceSelf
+// succeeds. Callers that gate readiness on it (production deploys with
+// dynamic bootstrap and no static peers) keep returning 503 until then,
+// which is the canonical "your pods/patch RBAC is wrong" signal.
 //
 // The bootstrap snapshot intentionally includes NotReady pods
 // (SnapshotForBootstrap) because readiness depends on RoutingTableSize
 // being > 0 — a deadlock if every peer is waiting for every other
 // peer to be Ready first.
-func announceSelfAndBootstrap(ctx context.Context, mgr *members.Manager, disco *discovery.Host, c *config.Config, logger *slog.Logger) {
+func announceSelfAndBootstrap(ctx context.Context, mgr *members.Manager, disco *discovery.Host, c *config.Config, logger *slog.Logger, onAnnounced func()) {
 	// Build the announcement. Wildcard listen addresses (0.0.0.0,
 	// ::) are not dialable from other pods; substitute the agent's
 	// Pod IP so the published p2p-addrs are usable.
@@ -1151,12 +1190,15 @@ func announceSelfAndBootstrap(ctx context.Context, mgr *members.Manager, disco *
 		TransferAddr: advertisedTransferAddr(c.TransferListen, c.PodIP),
 	}
 
-	// Retry the patch with capped exponential backoff. The pod
-	// informer is independent of this call so a missing `pods/patch`
-	// permission only degrades discovery — the agent still serves.
+	// Retry the patch with capped exponential backoff. Loops until
+	// success or ctx cancellation — the previous 5-attempt cap
+	// silently exited into the bootstrap loop on a permanent RBAC
+	// failure, leaving the cluster's annotation pool missing this
+	// pod forever. Now an eventual RBAC fix self-heals on the next
+	// attempt and onAnnounced flips the readiness gate.
 	backoff := 1 * time.Second
 	const maxBackoff = 30 * time.Second
-	for attempt := 0; attempt < 5; attempt++ {
+	for {
 		err := mgr.AnnounceSelf(ctx, c.PodName, ann)
 		if err == nil {
 			logger.Info("members: self-announce ok",
@@ -1164,10 +1206,13 @@ func announceSelfAndBootstrap(ctx context.Context, mgr *members.Manager, disco *
 				slog.String("peer_id", peerID.String()),
 				slog.Int("p2p_addrs", len(multiaddrs)),
 			)
+			if onAnnounced != nil {
+				onAnnounced()
+			}
 			break
 		}
 		logger.Warn("members: self-announce failed; will retry",
-			slog.Int("attempt", attempt+1),
+			slog.Duration("backoff", backoff),
 			slog.Any("err", err),
 		)
 		select {
