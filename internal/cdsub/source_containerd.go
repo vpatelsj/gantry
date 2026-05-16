@@ -42,6 +42,7 @@ import (
 	"github.com/containerd/containerd/v2/core/content"
 	"github.com/containerd/containerd/v2/core/images"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
+	"github.com/containerd/errdefs"
 	"github.com/containerd/typeurl/v2"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 
@@ -301,6 +302,14 @@ func (s *ContainerdSource) buildEvent(ctx context.Context, kind ImageEventKind, 
 //
 // Uses images.Walk + images.Children which are exactly the helpers
 // containerd internally uses for image GC.
+//
+// Tolerates errdefs.IsNotFound errors from images.Children: under
+// CRI, kubelet pulls only the platform-relevant subtree of a
+// multi-arch image index, so attestation manifests and other-arch
+// child manifests are referenced by the index but absent from the
+// content store. Aborting on the first such miss would discard the
+// entire image's blob set including the digests we DO have, so
+// instead we record what we can reach and skip absent subtrees.
 func walkBlobs(ctx context.Context, store content.Store, target ocispec.Descriptor) ([]gdigest.Digest, error) {
 	var (
 		out  []gdigest.Digest
@@ -319,15 +328,25 @@ func walkBlobs(ctx context.Context, store content.Store, target ocispec.Descript
 		if err != nil {
 			// Skip non-sha256 entries; the rest of the agent only
 			// handles sha256 (per internal/digest).
-			return images.Children(ctx, store, desc)
+			return childrenIfPresent(ctx, store, desc)
 		}
 		out = append(out, d)
-		return images.Children(ctx, store, desc)
+		return childrenIfPresent(ctx, store, desc)
 	})
 	if err := images.Walk(ctx, handler, target); err != nil {
 		return nil, err
 	}
 	return out, nil
+}
+
+// childrenIfPresent calls images.Children and downgrades a content-
+// store "not found" miss to (nil, nil). See walkBlobs for the rationale.
+func childrenIfPresent(ctx context.Context, store content.Store, desc ocispec.Descriptor) ([]ocispec.Descriptor, error) {
+	children, err := images.Children(ctx, store, desc)
+	if err != nil && errdefs.IsNotFound(err) {
+		return nil, nil
+	}
+	return children, err
 }
 
 // registryFromImage extracts the host (registry) portion of a
