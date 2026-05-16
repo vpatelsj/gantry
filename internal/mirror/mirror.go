@@ -23,6 +23,8 @@
 package mirror
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -606,12 +608,23 @@ func (s *Server) serveDigest(w http.ResponseWriter, r *http.Request, upstream, r
 	if err == nil {
 		defer func() { _ = rc.Close() }()
 		s.bumpCacheHit()
-		writeBlobHeaders(w, d, size, kind)
+		// Sniff the first bytes so writeBlobHeaders can label a manifest
+		// returned for a /blobs/<digest> request with its real mediaType
+		// (otherwise containerd CRI fails with \"Target.MediaType must be
+		// set\" — see writeBlobHeadersWithPrefix for the full story).
+		br := bufio.NewReader(rc)
+		var sniff []byte
+		if kind == ifaces.KindBlob {
+			if peek, _ := br.Peek(512); len(peek) > 0 {
+				sniff = peek
+			}
+		}
+		writeBlobHeadersWithPrefix(w, d, size, kind, sniff)
 		s.firePrefetch(kind, upstream, repo, d)
 		if r.Method == http.MethodHead {
 			return
 		}
-		if _, err := io.Copy(w, rc); err != nil {
+		if _, err := io.Copy(w, br); err != nil {
 			logger.Debug("mirror: copy from cache failed", slog.Any("err", err))
 		}
 		return
@@ -758,8 +771,20 @@ func (s *Server) serveDigest(w http.ResponseWriter, r *http.Request, upstream, r
 		dest = directVerifier
 	}
 
-	writeBlobHeaders(w, d, psize, kind)
-	written, err := io.Copy(dest, pr)
+	// Peek the origin body so writeBlobHeaders can label a manifest that
+	// arrived via origin's /blobs/->/manifests/ fallback with the right
+	// Content-Type. Without this, kind == KindBlob → octet-stream and
+	// containerd CRI rejects the unpacked content as "Target.MediaType
+	// must be set". The peek consumes nothing (bufio buffers the bytes).
+	prBuf := bufio.NewReader(pr)
+	var sniff []byte
+	if kind == ifaces.KindBlob {
+		if peek, _ := prBuf.Peek(512); len(peek) > 0 {
+			sniff = peek
+		}
+	}
+	writeBlobHeadersWithPrefix(w, d, psize, kind, sniff)
+	written, err := io.Copy(dest, prBuf)
 	if err != nil {
 		// Bytes already sent; we can't undo. Cache will be aborted by defer.
 		// This is a terminal downstream failure: origin returned 2xx
@@ -1089,11 +1114,21 @@ func (s *Server) fetchOneProvider(ctx context.Context, w http.ResponseWriter, r 
 	defer func() { _ = rcLocal.Close() }()
 	s.bumpPeerFetch("hit")
 	s.bumpPeerFetchLatency("hit", fetchStart)
-	writeBlobHeaders(w, d, size, kind)
+	// Sniff the cached body's prefix so writeBlobHeaders can label a
+	// manifest with its real Content-Type when kind == KindBlob (see
+	// writeBlobHeadersWithPrefix for the rationale).
+	rcLocalBuf := bufio.NewReader(rcLocal)
+	var sniff []byte
+	if kind == ifaces.KindBlob {
+		if peek, _ := rcLocalBuf.Peek(512); len(peek) > 0 {
+			sniff = peek
+		}
+	}
+	writeBlobHeadersWithPrefix(w, d, size, kind, sniff)
 	if r.Method == http.MethodHead {
 		return true
 	}
-	if _, err := io.Copy(w, rcLocal); err != nil {
+	if _, err := io.Copy(w, rcLocalBuf); err != nil {
 		logger.Debug("mirror: copy from cache (post-peer) failed", slog.Any("err", err))
 	}
 	return true
@@ -1284,18 +1319,68 @@ func (s *Server) bumpDhtLookup(outcome string, dur time.Duration) {
 }
 
 // writeBlobHeaders sets the OCI distribution headers the client expects.
+//
+// When kind == KindBlob, sniffPrefix may carry the first bytes of the
+// body so the function can detect manifest JSON (produced by origin's
+// /blobs/->/manifests/ fallback or by a peer that happened to cache a
+// manifest digest) and set the matching Content-Type. Containerd's CRI
+// plugin rejects manifest bytes returned with Content-Type:
+// application/octet-stream as "Target.MediaType must be set".
 func writeBlobHeaders(w http.ResponseWriter, d digest.Digest, size int64, kind ifaces.OriginRefKind) {
+	writeBlobHeadersWithPrefix(w, d, size, kind, nil)
+}
+
+func writeBlobHeadersWithPrefix(w http.ResponseWriter, d digest.Digest, size int64, kind ifaces.OriginRefKind, sniffPrefix []byte) {
 	w.Header().Set("Docker-Content-Digest", d.String())
 	if kind == ifaces.KindBlob {
 		// Reasonable default; client doesn't verify this for content-
 		// addressed pulls.
 		if w.Header().Get("Content-Type") == "" {
-			w.Header().Set("Content-Type", "application/octet-stream")
+			if ct := sniffManifestContentType(sniffPrefix); ct != "" {
+				w.Header().Set("Content-Type", ct)
+			} else {
+				w.Header().Set("Content-Type", "application/octet-stream")
+			}
 		}
 	}
 	if size >= 0 {
 		w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
 	}
+}
+
+// sniffManifestContentType returns an OCI/Docker manifest Content-Type
+// when the prefix bytes look like a manifest JSON envelope, otherwise
+// an empty string. Used by writeBlobHeadersWithPrefix to label content
+// retrieved via origin's /blobs/->/manifests/ fallback so containerd's
+// CRI plugin can unpack it. We inspect mediaType because the same
+// schemaVersion=2 envelope is used by both image-manifest, image-index,
+// docker-manifest, and docker-manifest-list and the client needs the
+// right one to dispatch unpacking.
+func sniffManifestContentType(prefix []byte) string {
+	if len(prefix) < 2 || prefix[0] != '{' {
+		return ""
+	}
+	// Try to find a mediaType field. We don't fully parse JSON here
+	// because the prefix may not contain a complete value; a substring
+	// match against the well-known media types is sufficient for the
+	// types Gantry ever sees on the /blobs/ fallback path.
+	switch {
+	case bytes.Contains(prefix, []byte("application/vnd.oci.image.index.v1+json")):
+		return "application/vnd.oci.image.index.v1+json"
+	case bytes.Contains(prefix, []byte("application/vnd.oci.image.manifest.v1+json")):
+		return "application/vnd.oci.image.manifest.v1+json"
+	case bytes.Contains(prefix, []byte("application/vnd.docker.distribution.manifest.list.v2+json")):
+		return "application/vnd.docker.distribution.manifest.list.v2+json"
+	case bytes.Contains(prefix, []byte("application/vnd.docker.distribution.manifest.v2+json")):
+		return "application/vnd.docker.distribution.manifest.v2+json"
+	}
+	// Schema-version-2 envelope without a recognisable mediaType: use
+	// the OCI manifest content type as a safe default (containerd's
+	// unpacker will pick the right schema from the envelope itself).
+	if bytes.Contains(prefix, []byte("\"schemaVersion\"")) || bytes.Contains(prefix, []byte("\"schemaVersion\":")) {
+		return "application/vnd.oci.image.manifest.v1+json"
+	}
+	return ""
 }
 
 // writeOriginError maps an *ifaces.OriginError to an HTTP status code that
