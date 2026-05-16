@@ -28,7 +28,11 @@ data:
     cache_forced_eviction_headroom_pct: 5
     eviction_provider_count_threshold: 3
 
-    containerd_socket: ""
+    # Demo-only: point at the host containerd socket so cdsub announces
+    # every cached blob into the DHT. The DaemonSet is patched (in
+    # 41-deploy-gantry.sh) to run as UID 0 so it can read the
+    # root-owned socket (option (a) from deploy/daemonset.yaml).
+    containerd_socket: "/run/containerd/containerd.sock"
     containerd_namespace: "k8s.io"
 
     upstream_registries:

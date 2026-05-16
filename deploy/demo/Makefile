@@ -63,7 +63,7 @@ harness-baseline:
 	[ ! -f $(INFRA_DIR)/.state.env ] || . $(INFRA_DIR)/.state.env; \
 	[ ! -f $(ENV_FILE) ] || . $(ENV_FILE); \
 	set +a; \
-	cd harness && DEMO_RUN_LIVE=1 go test -tags=demo -run TestPhaseBaseline -timeout=90m ./...
+	cd harness && DEMO_RUN_LIVE=1 go test -tags=demo -count=1 -run TestPhaseBaseline -timeout=90m -v ./...
 
 .PHONY: harness-gantry-cold
 harness-gantry-cold:
@@ -71,7 +71,7 @@ harness-gantry-cold:
 	[ ! -f $(INFRA_DIR)/.state.env ] || . $(INFRA_DIR)/.state.env; \
 	[ ! -f $(ENV_FILE) ] || . $(ENV_FILE); \
 	set +a; \
-	cd harness && DEMO_RUN_LIVE=1 go test -tags=demo -run TestPhaseGantryCold -timeout=90m -v ./...
+	cd harness && DEMO_RUN_LIVE=1 go test -tags=demo -count=1 -run TestPhaseGantryCold -timeout=90m -v ./...
 
 .PHONY: harness-gantry-warm
 harness-gantry-warm:
@@ -79,7 +79,7 @@ harness-gantry-warm:
 	[ ! -f $(INFRA_DIR)/.state.env ] || . $(INFRA_DIR)/.state.env; \
 	[ ! -f $(ENV_FILE) ] || . $(ENV_FILE); \
 	set +a; \
-	cd harness && DEMO_RUN_LIVE=1 DEMO_ALLOW_CONTENT_PURGE=1 go test -tags=demo -run TestPhaseGantryWarm -timeout=90m -v ./...
+	cd harness && DEMO_RUN_LIVE=1 DEMO_ALLOW_CONTENT_PURGE=1 go test -tags=demo -count=1 -run TestPhaseGantryWarm -timeout=90m -v ./...
 
 # ---- greenfield Azure infra ------------------------------------------------
 

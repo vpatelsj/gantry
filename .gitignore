@@ -39,3 +39,9 @@ demo/acr/.with-gantry-end
 demo/acr/.cached-start
 demo/acr/.cached-end
 demo/acr/artifacts/
+
+# Demo run artifacts (proxy /debug/summary snapshots, harness logs)
+deploy/demo/artifacts/
+
+# Editor / scratch backups
+deploy/demo/infra/env.local.bak.*

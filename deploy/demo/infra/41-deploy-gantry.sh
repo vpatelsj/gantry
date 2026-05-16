@@ -65,6 +65,21 @@ kubectl apply -f "${tmpdir}/daemonset.yaml"
 log "Adding Prometheus scrape annotations to gantry pods"
 kubectl -n "${namespace}" patch ds/gantry --type strategic -p '{"spec":{"template":{"metadata":{"annotations":{"prometheus.io/scrape":"true","prometheus.io/port":"9095","prometheus.io/path":"/metrics"}}}}}'
 
+# Demo-only: run gantry container as UID 0 so it can read the
+# root:root 0660 containerd.sock that the demo configmap points
+# cdsub at. Without this, cdsub falls back to NoOpSource and never
+# announces locally cached blobs to the DHT — causing warm-cache
+# pulls to fall through to NF5 → origin (deploy/demo/RUNBOOK.md
+# Phase 3 expects 0 origin requests). This is the option (a) the
+# daemonset.yaml comment block recommends. Production should use
+# fsGroup or a node-side socket-perms patch instead.
+log "Patching gantry container to run as UID 0 (demo-only, for containerd.sock access)"
+kubectl -n "${namespace}" patch ds/gantry --type json -p '[
+  {"op":"replace","path":"/spec/template/spec/containers/0/securityContext/runAsNonRoot","value":false},
+  {"op":"replace","path":"/spec/template/spec/containers/0/securityContext/runAsUser","value":0},
+  {"op":"replace","path":"/spec/template/spec/containers/0/securityContext/runAsGroup","value":0}
+]'
+
 log "Waiting for Gantry DaemonSet rollout"
 kubectl -n "${namespace}" rollout status ds/gantry --timeout=10m
 
