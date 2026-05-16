@@ -28,15 +28,15 @@ reverse proxy in front of ACR. Full methodology + raw JSON in
 
 | metric | **BASELINE** (no Gantry) | **GANTRY cold-start** | reduction |
 |---|---:|---:|---:|
-| total proxy requests | 76 | 34 | **55.3 %** |
-| **bytes from origin** | **15.04 GB** | **6.45 GB** | **57.1 %** |
-| blob requests | 28 | **10** | **64.3 %** |
-| `manifest_by_digest` requests | 28 | 4 | 85.7 % |
-| `manifest_by_tag` requests | 20 | 21 | _by design — F9_ |
+| total proxy requests | 121 | 50 | **59 %** |
+| **bytes from origin** | **27.01 GB** | **14.01 GB** | **48 %** |
+| blob requests | 54 | **18** | **67 %** |
+| `manifest_by_digest` requests | 67 | 32 | 52 % |
+| `manifest_by_tag` requests | 0 | 0 | _digest-pinned, F9 not triggered_ |
 
-8.59 GB of origin egress avoided on a single 20-node rollout. From
+13 GB of origin egress avoided on a single 20-node rollout. From
 Gantry's own metrics during cold-start: only **7 origin pulls** cluster-wide
-(`p2p_origin_pull_total`) and **95 peer-to-peer fetch hits**
+(`p2p_origin_pull_total`) and **69 peer-to-peer fetch hits**
 (`p2p_peer_fetch_total{outcome="hit"}`).
 
 ## Data path
