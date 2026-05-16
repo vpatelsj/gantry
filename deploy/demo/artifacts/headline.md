@@ -26,26 +26,45 @@ Built from these commits (see `git log`):
 
 ## Results
 
-| metric                          | **BASELINE** (no Gantry) | **GANTRY cold-start** | reduction |
-|---|---:|---:|---:|
-| total proxy requests            | 121          | 50             | **59 %** |
-| **bytes from origin**           | **27.01 GB** | **14.01 GB**   | **48 %** |
-| blob requests                   | 54           | **18**         | **67 %** |
-| blob bytes                      | 27.01 GB     | 14.01 GB       | 48 %     |
-| `manifest_by_digest` requests   | 67           | 32             | 52 %     |
-| `manifest_by_tag` requests      | 0            | 0              | _digest-pinned, F9 not triggered_ |
+| metric                          | **BASELINE** (no Gantry) | **GANTRY cold-start** (first) | **GANTRY cold-start** (reproduce) | reduction (first / reproduce) |
+|---|---:|---:|---:|---:|
+| total proxy requests            | 121          | 50             | **29**         | **59 % / 76 %** |
+| **bytes from origin**           | **27.01 GB** | **14.01 GB**   | **7.00 GB**    | **48 % / 74 %** |
+| blob requests                   | 54           | **18**         | **9**          | **67 % / 83 %** |
+| blob bytes                      | 27.01 GB     | 14.01 GB       | 7.00 GB        | 48 % / 74 %     |
+| `manifest_by_digest` requests   | 67           | 32             | 19             | 52 % / 72 %     |
+| `manifest_by_tag` requests      | 0            | 0              | 0              | _digest-pinned, F9 not triggered_ |
 
-Per-pod start latency (median / p95 / p100):
+Two cold-start measurements are reported because the second one is a
+useful complement, not a contradiction:
 
-- **Baseline**: 23.0 s / 26.0 s / 26.0 s
-- **Gantry cold-start**: 25.1 s / 26.1 s / 26.1 s
+- **First cold-start** is taken immediately after `make -C deploy/demo
+  infra-gantry` deploys a brand-new DaemonSet — 20 fresh gantry pods,
+  empty libp2p identity files, empty hostPath caches, members informer
+  still catching up. This is the honest pessimistic case.
 
-From Gantry's own metrics during the cold-start phase:
+- **Reproduce cold-start** is the same harness run a few minutes later
+  on the same cluster: gantry pods are identical, hostPath cache still
+  holds previous-image blobs (different digests but warmer DHT), libp2p
+  routing tables have converged, members informer is stable. F1 hits
+  its theoretical minimum: **3 cluster-wide origin pulls** for the
+  image's 3 unique digests (1 manifest + 1 config + 1 layer), and
+  **102 peer-fetch hits** absorb the remaining ~17 nodes × 3 digests of
+  blob traffic.
 
-- `p2p_origin_pull_total` delta = **7** (cluster-wide origin pulls Gantry initiated)
-- `p2p_peer_fetch_total{outcome="hit"}` = **69** (peer-to-peer hits served from another node's Gantry cache)
+Per-pod start latency is essentially identical across runs (p50 ≈ 25 s,
+p100 ≈ 26 s — comparable to the no-Gantry baseline's 23–26 s, with no
+thundering-herd tail).
 
-**13.00 GB of origin egress avoided on a single 20-node rollout.**
+From Gantry's own metrics:
+
+| metric                                          | first cold | reproduce cold |
+|---|---:|---:|
+| `p2p_origin_pull_total` delta (cluster-wide)    | 7          | **3**          |
+| `p2p_peer_fetch_total{outcome="hit"}` delta     | 69         | **102**        |
+
+**13.00 GB origin egress avoided on the first cold-start; 20.01 GB on
+the reproduce run.**
 
 The baseline number (27 GB rather than the naive 20 GB) is higher than
 ideal because kubelet on AKS retries blob GETs at least once per pod
@@ -55,6 +74,8 @@ kubelet boundary.
 
 ## Raw artifacts
 
+First cold-start (clean-redeploy):
+
 | file | what |
 |---|---|
 | [clean-pre-baseline.json](clean-pre-baseline.json) | proxy `/debug/summary` immediately before phase 1 (counters at zero) |
@@ -63,6 +84,14 @@ kubelet boundary.
 | [clean-baseline.log](clean-baseline.log) | raw `go test -v` output for `TestPhaseBaseline` |
 | [clean-cold.log](clean-cold.log) | raw `go test -v` output for `TestPhaseGantryCold` |
 | [clean-run-start.txt](clean-run-start.txt) / [clean-run-end.txt](clean-run-end.txt) | UTC unix timestamps bracketing the run window |
+
+Reproduce cold-start (same cluster, ~5 min later, no redeploy):
+
+| file | what |
+|---|---|
+| [repro-pre.json](repro-pre.json) | proxy `/debug/summary` immediately before the reproduce phase |
+| [repro-post.json](repro-post.json) | after the reproduce 20-pod pull |
+| [repro-cold.log](repro-cold.log) | raw `go test -v` output |
 
 Re-derive the table from the JSON snapshots:
 

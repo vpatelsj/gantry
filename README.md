@@ -26,18 +26,21 @@ workload changes.
 reverse proxy in front of ACR. Full methodology + raw JSON in
 [deploy/demo/artifacts/headline.md](deploy/demo/artifacts/headline.md).
 
-| metric | **BASELINE** (no Gantry) | **GANTRY cold-start** | reduction |
+| metric | **BASELINE** (no Gantry) | **GANTRY cold-start** | **GANTRY** (warmed cluster) |
 |---|---:|---:|---:|
-| total proxy requests | 121 | 50 | **59 %** |
-| **bytes from origin** | **27.01 GB** | **14.01 GB** | **48 %** |
-| blob requests | 54 | **18** | **67 %** |
-| `manifest_by_digest` requests | 67 | 32 | 52 % |
-| `manifest_by_tag` requests | 0 | 0 | _digest-pinned, F9 not triggered_ |
+| total proxy requests | 121 | 50 (−59 %) | **29 (−76 %)** |
+| **bytes from origin** | **27.01 GB** | **14.01 GB (−48 %)** | **7.00 GB (−74 %)** |
+| blob requests | 54 | 18 (−67 %) | **9 (−83 %)** |
+| `manifest_by_digest` requests | 67 | 32 (−52 %) | 19 (−72 %) |
+| `manifest_by_tag` requests | 0 | 0 | 0 _(digest-pinned, F9 not triggered)_ |
 
-13 GB of origin egress avoided on a single 20-node rollout. From
-Gantry's own metrics during cold-start: only **7 origin pulls** cluster-wide
-(`p2p_origin_pull_total`) and **69 peer-to-peer fetch hits**
-(`p2p_peer_fetch_total{outcome="hit"}`).
+From Gantry's own metrics on the warmed-cluster cold-start: only
+**3 origin pulls** cluster-wide (`p2p_origin_pull_total`) — exactly one
+per unique digest in the image (1 manifest + 1 config + 1 layer) — and
+**102 peer-to-peer fetch hits** (`p2p_peer_fetch_total{outcome="hit"}`).
+That's the F1 invariant hitting its theoretical optimum.
+
+20 GB of origin egress avoided on the warmed-cluster rollout.
 
 ## Data path
 
