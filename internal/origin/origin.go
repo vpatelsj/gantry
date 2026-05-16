@@ -270,6 +270,46 @@ func (r *registry) pull(ctx context.Context, ref ifaces.OriginRef) (io.ReadClose
 	if err != nil {
 		return nil, 0, &ifaces.OriginError{Ref: ref, Class: ifaces.FailureTransient, Err: err}
 	}
+	if resp.StatusCode == http.StatusNotFound && ref.Kind != ifaces.KindManifest {
+		// Containerd treats every digest in a pod spec as a generic
+		// "content descriptor" and fetches it via /v2/<repo>/blobs/
+		// <digest>. When that digest happens to be an image manifest,
+		// registries (ACR, Docker Hub, GHCR all behave this way) only
+		// serve the bytes at /v2/<repo>/manifests/<digest>. Without
+		// this fallback the 404 from /blobs/ would be classified as
+		// FailureNotFound, recorded in the cluster-wide negative cache,
+		// and the next cold-start cascade through any peer would hit
+		// rule-1 short-circuit (ErrFailureShortCircuit -> 5xx) for
+		// every node trying to pull the same image. Symptom on
+		// kubelet: ImagePullBackOff for the entire Job. Retry as a
+		// manifest GET; on 200 return those bytes, on continued 404
+		// surface the original blob 404 so the cluster still gets a
+		// truthful negative-cache record.
+		_ = resp.Body.Close()
+		mRef := ref
+		mRef.Kind = ifaces.KindManifest
+		mPath := r.urlFor(mRef)
+		mResp, mErr := r.do(ctx, http.MethodGet, mPath)
+		if mErr == nil && mResp.StatusCode == http.StatusOK {
+			mSize := int64(-1)
+			if cl := mResp.Header.Get("Content-Length"); cl != "" {
+				if n, err := strconv.ParseInt(cl, 10, 64); err == nil {
+					mSize = n
+				}
+			}
+			return mResp.Body, mSize, nil
+		}
+		if mResp != nil {
+			_ = mResp.Body.Close()
+		}
+		// Manifest fallback didn't help; surface the original 404 by
+		// re-issuing it (we already drained the first response body)
+		// so classify() sees a faithful response object.
+		resp, err = r.do(ctx, http.MethodGet, path)
+		if err != nil {
+			return nil, 0, &ifaces.OriginError{Ref: ref, Class: ifaces.FailureTransient, Err: err}
+		}
+	}
 	if resp.StatusCode != http.StatusOK {
 		defer func() { _ = resp.Body.Close() }()
 		return nil, 0, classify(ref, resp)
@@ -288,11 +328,40 @@ func (r *registry) pull(ctx context.Context, ref ifaces.OriginRef) (io.ReadClose
 // The response body is always drained-and-closed because HEAD
 // responses may carry a body in some non-conforming registries and
 // leaving it open would leak the underlying connection.
+//
+// HEAD applies the same /blobs/ -> /manifests/ fallback that pull does:
+// containerd does HEAD /blobs/<digest> first when verifying a content
+// descriptor in a pod spec; for manifest digests that 404s. Without
+// the fallback we'd return FailureNotFound and the kubelet pull would
+// fail before the GET phase ever runs.
 func (r *registry) head(ctx context.Context, ref ifaces.OriginRef) (int64, error) {
 	path := r.urlFor(ref)
 	resp, err := r.do(ctx, http.MethodHead, path)
 	if err != nil {
 		return 0, &ifaces.OriginError{Ref: ref, Class: ifaces.FailureTransient, Err: err}
+	}
+	if resp.StatusCode == http.StatusNotFound && ref.Kind != ifaces.KindManifest {
+		_ = resp.Body.Close()
+		mRef := ref
+		mRef.Kind = ifaces.KindManifest
+		mResp, mErr := r.do(ctx, http.MethodHead, r.urlFor(mRef))
+		if mErr == nil && mResp.StatusCode == http.StatusOK {
+			defer func() { _ = mResp.Body.Close() }()
+			size := int64(-1)
+			if cl := mResp.Header.Get("Content-Length"); cl != "" {
+				if n, err := strconv.ParseInt(cl, 10, 64); err == nil {
+					size = n
+				}
+			}
+			return size, nil
+		}
+		if mResp != nil {
+			_ = mResp.Body.Close()
+		}
+		resp, err = r.do(ctx, http.MethodHead, path)
+		if err != nil {
+			return 0, &ifaces.OriginError{Ref: ref, Class: ifaces.FailureTransient, Err: err}
+		}
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
