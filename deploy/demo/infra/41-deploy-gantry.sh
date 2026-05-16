@@ -80,6 +80,18 @@ kubectl -n "${namespace}" patch ds/gantry --type json -p '[
   {"op":"replace","path":"/spec/template/spec/containers/0/securityContext/runAsGroup","value":0}
 ]'
 
+# The base daemonset.yaml drops ALL capabilities. Root inside the demo
+# container needs DAC_OVERRIDE to read containerd.sock (0660 root:root)
+# AND the libp2p identity file (mode 0600 owned by the chown-hostpaths
+# init container's UID 65532 even after we switched the gantry
+# container to run as UID 0). Without these caps the gantry container
+# crashloops with "stat /var/lib/gantry/libp2p/identity.key: open ...:
+# permission denied" on every restart.
+log "Adding DAC_OVERRIDE + DAC_READ_SEARCH so root can read the libp2p key + containerd socket"
+kubectl -n "${namespace}" patch ds/gantry --type json -p '[
+  {"op":"add","path":"/spec/template/spec/containers/0/securityContext/capabilities/add","value":["DAC_OVERRIDE","DAC_READ_SEARCH"]}
+]'
+
 log "Waiting for Gantry DaemonSet rollout"
 kubectl -n "${namespace}" rollout status ds/gantry --timeout=10m
 
