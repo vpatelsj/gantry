@@ -1332,10 +1332,24 @@ func writeBlobHeaders(w http.ResponseWriter, d digest.Digest, size int64, kind i
 
 func writeBlobHeadersWithPrefix(w http.ResponseWriter, d digest.Digest, size int64, kind ifaces.OriginRefKind, sniffPrefix []byte) {
 	w.Header().Set("Docker-Content-Digest", d.String())
-	if kind == ifaces.KindBlob {
-		// Reasonable default; client doesn't verify this for content-
-		// addressed pulls.
-		if w.Header().Get("Content-Type") == "" {
+	if w.Header().Get("Content-Type") == "" {
+		switch kind {
+		case ifaces.KindManifest:
+			// containerd's CRI plugin uses the HEAD /manifests/<digest>
+			// response Content-Type to populate the in-memory image's
+			// Target.MediaType. With an empty header it later rejects
+			// the unpack with "Target.MediaType must be set: invalid
+			// argument" — even though the manifest body carries its
+			// own schemaVersion + mediaType. Pick a safe OCI default;
+			// the body's mediaType is what the unpacker dispatches on.
+			w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+		case ifaces.KindBlob:
+			// /blobs/<digest> can carry either real layer/config bytes
+			// (octet-stream) OR a manifest body served via origin's
+			// /blobs/->/manifests/ fallback. Sniff the prefix to tell
+			// the difference; if it looks like a manifest envelope use
+			// the matching manifest content type, otherwise the
+			// distribution-spec default.
 			if ct := sniffManifestContentType(sniffPrefix); ct != "" {
 				w.Header().Set("Content-Type", ct)
 			} else {
