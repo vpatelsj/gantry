@@ -88,7 +88,7 @@ func FetchLiveProxySummary(ctx context.Context, cfg LiveConfig) (ProxySummary, e
 
 func BuildFreshWorkloadImage(ctx context.Context, cfg LiveConfig, phase PhaseName) (string, error) {
 	tag := fmt.Sprintf("%s-%s", phase, time.Now().UTC().Format("20060102150405"))
-	image := fmt.Sprintf("%s/%s:%s", cfg.ACRLoginServer, cfg.WorkloadRepo, tag)
+	taggedImage := fmt.Sprintf("%s/%s:%s", cfg.ACRLoginServer, cfg.WorkloadRepo, tag)
 	tmpdir, err := os.MkdirTemp("", "gantry-demo-image-*")
 	if err != nil {
 		return "", err
@@ -106,11 +106,53 @@ CMD ["sh", "-c", "date -u +%Y-%m-%dT%H:%M:%SZ"]
 		return "", err
 	}
 
-	_, err = runCommand(ctx, tmpdir, nil, "docker", "buildx", "build", "--platform", cfg.ImagePlatform, "-t", image, "--push", ".")
+	// --metadata-file makes buildx write the pushed manifest's digest to JSON
+	// so we can return a digest-pinned ref. The pod spec then references the
+	// image by @sha256:... instead of :tag, which makes containerd skip the
+	// tag→digest resolution roundtrip at the registry. With a tag in the spec
+	// every node would issue a /v2/<repo>/manifests/<tag> request that
+	// Gantry deliberately falls through to origin (F9), inflating the
+	// proxy-side request count. We don't want F9 noise in the F1 measurement.
+	//
+	// --output type=image,push=true is the explicit form of --push that lets
+	// us pass `oci-mediatypes=true` and override the default behaviour. The
+	// key part is that we don't pass --provenance / --sbom (default off when
+	// using `type=image`), so buildx pushes a single platform-specific
+	// manifest, NOT an OCI image-index. The demo workload only ever runs on
+	// linux/amd64 so a multi-arch index buys us nothing — and an index forces
+	// containerd to traverse it via /v2/<repo>/blobs/<index-digest> on
+	// kubelet pull, which most registries (ACR included) only serve at
+	// /v2/<repo>/manifests/<digest>. The /blobs/ → 404 from origin then
+	// poisoned the cluster's negative cache (failure_class=not_found) and
+	// caused every node's cold-start cascade to short-circuit on §5.2 rule
+	// 1, leading to ImagePullBackOff for the entire Job.
+	metaPath := filepath.Join(tmpdir, "buildx-meta.json")
+	_, err = runCommand(ctx, tmpdir, nil, "docker", "buildx", "build",
+		"--platform", cfg.ImagePlatform,
+		"-t", taggedImage,
+		"--output", "type=image,push=true,oci-mediatypes=true",
+		"--provenance=false",
+		"--sbom=false",
+		"--metadata-file", metaPath,
+		".")
 	if err != nil {
 		return "", err
 	}
-	return image, nil
+
+	metaBytes, err := os.ReadFile(metaPath)
+	if err != nil {
+		return "", fmt.Errorf("read buildx metadata: %w", err)
+	}
+	var meta struct {
+		Digest string `json:"containerimage.digest"`
+	}
+	if err := json.Unmarshal(metaBytes, &meta); err != nil {
+		return "", fmt.Errorf("parse buildx metadata: %w", err)
+	}
+	if meta.Digest == "" {
+		return "", fmt.Errorf("buildx metadata did not include containerimage.digest (got %s)", string(metaBytes))
+	}
+	return fmt.Sprintf("%s/%s@%s", cfg.ACRLoginServer, cfg.WorkloadRepo, meta.Digest), nil
 }
 
 func InstallHostsToml(ctx context.Context, cfg LiveConfig, mode string) error {
