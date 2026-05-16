@@ -7,7 +7,7 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
 
 env_arg="${1:-}"
 mode="${2:-${HOSTS_TOML_MODE:-baseline}}"
-if [[ "${env_arg}" == "baseline" || "${env_arg}" == "gantry" ]]; then
+if [[ "${env_arg}" == "baseline" || "${env_arg}" == "gantry" || "${env_arg}" == "gantry-strict" ]]; then
     mode="${env_arg}"
     env_arg=""
 fi
@@ -20,8 +20,8 @@ validate_acr_name
 select_subscription
 
 case "${mode}" in
-    baseline|gantry) ;;
-    *) die "mode must be baseline or gantry, got: ${mode}" ;;
+    baseline|gantry|gantry-strict) ;;
+    *) die "mode must be baseline, gantry, or gantry-strict, got: ${mode}" ;;
 esac
 
 login_server="$(acr_login_server)"
@@ -43,6 +43,7 @@ log "Publishing hosts.toml templates"
 kubectl -n "${GANTRY_DEMO_NAMESPACE}" create configmap hosts-toml-templates \
     --from-file=baseline="${DEMO_ROOT}/hosts.toml.baseline.template" \
     --from-file=gantry="${DEMO_ROOT}/hosts.toml.gantry.template" \
+    --from-file=gantry-strict="${DEMO_ROOT}/hosts.toml.gantry-strict.template" \
     --dry-run=client -o yaml | kubectl apply -f -
 
 log "Rendering hosts-toml-installer for ${mode} mode (${login_server} -> ${proxy_cluster_ip})"

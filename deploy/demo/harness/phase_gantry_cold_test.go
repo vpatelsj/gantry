@@ -50,7 +50,7 @@ func TestPhaseGantryCold(t *testing.T) {
 	}
 	t.Logf("pushed cold-start image %s", image)
 
-	if err := InstallHostsToml(ctx, cfg, "gantry"); err != nil {
+	if err := InstallHostsToml(ctx, cfg, gantryHostsMode()); err != nil {
 		t.Fatalf("install gantry hosts.toml: %v", err)
 	}
 

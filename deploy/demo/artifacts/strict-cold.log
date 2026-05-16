@@ -1,0 +1,18 @@
+make: Entering directory '/home/vapa/code/gantry/deploy/demo'
+set -a; \
+[ ! -f infra/.state.env ] || . infra/.state.env; \
+[ ! -f /home/vapa/code/gantry/deploy/demo/infra/env.local ] || . /home/vapa/code/gantry/deploy/demo/infra/env.local; \
+set +a; \
+cd harness && DEMO_RUN_LIVE=1 go test -tags=demo -count=1 -run TestPhaseGantryCold -timeout=90m -v ./...
+=== RUN   TestPhaseGantryCold
+    phase_gantry_cold_test.go:33: preflight pull through proxy: gantry-demo-pull@sha256:b04bb9e783b37e0c5547c68caac419b9da6a276bfc3d54921d6d91fdf4aa9292
+    phase_gantry_cold_test.go:51: pushed cold-start image gantrydemovapa.azurecr.io/gantry-demo-pull@sha256:2e8cdabc5c74be8b024db302f1fed3d05bfae6dd15895aa798bf1176893c04df
+    phase_gantry_cold_test.go:62: completed job gantry-demo-gantry-cold-20260516104923 with 20 pod log timestamps
+    phase_gantry_cold_test.go:69: proxy delta: requests=19 bytes_to_client=1074071395 by_path_class=map[blob:{Requests:2 Bytes:1074070719} manifest_by_digest:{Requests:17 Bytes:676} manifest_by_tag:{Requests:0 Bytes:0} other:{Requests:0 Bytes:0} ping:{Requests:0 Bytes:0}]
+    phase_gantry_cold_test.go:73: gantry p2p_origin_pull_total delta: 3
+    phase_gantry_cold_test.go:76: gantry p2p_peer_fetch_total{outcome="hit"}: 123
+    phase_gantry_cold_test.go:86: pod-start latency from phase start: p50=32.258593306s p95=33.258593306s p100=34.258593306s
+--- PASS: TestPhaseGantryCold (273.78s)
+PASS
+ok  	github.com/gantry/gantry/deploy/demo/harness	273.790s
+make: Leaving directory '/home/vapa/code/gantry/deploy/demo'

@@ -160,6 +160,18 @@ func InstallHostsToml(ctx context.Context, cfg LiveConfig, mode string) error {
 	return err
 }
 
+// gantryHostsMode returns the hosts.toml mode the gantry phases install on
+// nodes. Defaults to "gantry" (Gantry-first with proxy fallback). Override
+// with DEMO_GANTRY_HOSTS_MODE=gantry-strict to attribute proxy traffic
+// unambiguously to Gantry's origin client during cold-start measurement
+// (no containerd-direct fallback path).
+func gantryHostsMode() string {
+	if m := os.Getenv("DEMO_GANTRY_HOSTS_MODE"); m != "" {
+		return m
+	}
+	return "gantry"
+}
+
 func RunPullJob(ctx context.Context, cfg LiveConfig, phase PhaseName, image string) ([]time.Time, string, error) {
 	jobName := fmt.Sprintf("gantry-demo-%s-%s", strings.ReplaceAll(string(phase), "_", "-"), time.Now().UTC().Format("20060102150405"))
 	manifest := fmt.Sprintf(`apiVersion: batch/v1

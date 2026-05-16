@@ -46,7 +46,7 @@ spec:
             - sh
             - -ceu
             - |
-              case "${MODE}" in baseline|gantry) ;; *) echo "unsupported MODE=${MODE}" >&2; exit 2 ;; esac
+              case "${MODE}" in baseline|gantry|gantry-strict) ;; *) echo "unsupported MODE=${MODE}" >&2; exit 2 ;; esac
               dest_dir="/host-certs.d/${REGISTRY_HOST}"
               mkdir -p "${dest_dir}"
               sed "s|\${PROXY_CLUSTER_IP}|${PROXY_CLUSTER_IP}|g" "/templates/${MODE}" >"${dest_dir}/hosts.toml"

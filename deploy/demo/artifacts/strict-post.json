@@ -1,21 +1,21 @@
 {
   "since": "2026-05-16T10:11:15Z",
-  "uptime_seconds": 979,
+  "uptime_seconds": 2346,
   "totals": {
-    "requests_completed": 202,
-    "bytes_to_client": 51559029422,
+    "requests_completed": 222,
+    "bytes_to_client": 52633100836,
     "by_path_class": {
       "blob": {
-        "requests": 81,
-        "bytes": 51559008409
+        "requests": 83,
+        "bytes": 52633079128
       },
       "manifest_by_digest": {
-        "requests": 118,
-        "bytes": 20956
+        "requests": 135,
+        "bytes": 21632
       },
       "manifest_by_tag": {
-        "requests": 3,
-        "bytes": 57
+        "requests": 4,
+        "bytes": 76
       },
       "other": {
         "requests": 0,

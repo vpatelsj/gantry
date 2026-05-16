@@ -1,0 +1,18 @@
+# Demo Gantry path — STRICT mode: local Gantry only, NO proxy fallback.
+#
+# When this hosts.toml is installed on a node, containerd has exactly
+# ONE upstream for the configured registry: 127.0.0.1:5000. If Gantry
+# returns 5xx, containerd retries against Gantry — it does NOT fall
+# through to the proxy or to ACR. This is the right config for
+# attributing the cold-start origin-load measurement to Gantry's
+# pipeline cleanly: any blob bytes the proxy sees during the cold
+# phase came from Gantry's origin client (via the puller-pump or NF5
+# escape valve), never from a containerd-direct fallback.
+#
+# Pulls fail loudly if Gantry is unavailable. Use deploy/demo/
+# hosts.toml.gantry.template instead for production-shaped fallback
+# behaviour.
+
+[host."http://127.0.0.1:5000"]
+  capabilities = ["pull", "resolve"]
+  skip_verify = true

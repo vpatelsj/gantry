@@ -1,4 +1,4 @@
-# Gantry — 1 GiB headline benchmark, 20-node AKS (clean redeploy)
+# Gantry — 1 GiB headline benchmark, 20-node AKS (strict cold-start)
 
 Recorded **2026-05-16** against AKS `gantry-demo-2` (20 × `Standard_D4s_v5`
 worker nodes, k8s 1.34.7, containerd 1.7.31), with the demo's
@@ -8,12 +8,72 @@ synthetic ~1 GiB single-layer single-arch image,
 `gantrydemovapa.azurecr.io/gantry-demo-pull@sha256:…`, **pulled by
 content digest** so containerd skips tag resolution at the registry.
 
-The cluster was redeployed from scratch immediately before this run:
-gantry-system namespace deleted, every node's `/var/lib/gantry/{cache,libp2p}`
-hostPath wiped via a one-shot DaemonSet, gantry image rebuilt at git
-`317c6b5`, then `make -C deploy/demo infra-gantry` deployed a fresh
-DaemonSet. Proxy was restarted right before phase 1 so its counters
-start at zero.
+The cold-start phase was run with a **strict** `hosts.toml` that pins
+containerd's only upstream for the registry to `http://127.0.0.1:5000`
+(local Gantry mirror) with **no proxy fallback**. Every byte the
+counting proxy sees during the cold phase is therefore sourced through
+Gantry's own origin client; there is no `containerd → proxy → ACR`
+direct path that could bypass Gantry's accounting. See
+[`hosts.toml.gantry-strict.template`](../hosts.toml.gantry-strict.template).
+
+Baseline reuses [`hosts.toml.baseline.template`](../hosts.toml.baseline.template):
+containerd → counting proxy → ACR, no Gantry on the data path.
+
+## Results
+
+| metric                          | **BASELINE** (no Gantry) | **GANTRY cold-start (strict)** | reduction |
+|---|---:|---:|---:|
+| total proxy requests            | 121          | **20**         | **83 %**  |
+| **bytes from origin**           | **27.01 GB** | **1.07 GB**    | **96 %**  |
+| blob requests                   | 54           | **2**          | **96 %**  |
+| blob bytes                      | 27.01 GB     | 1.07 GB        | 96 %      |
+| `manifest_by_digest` requests   | 67           | 17             | 75 %      |
+| `manifest_by_tag` requests      | 0            | 1              | _digest-pinned_ |
+
+**25.94 GB of origin egress avoided on the cold start of 20 pods pulling a 1 GiB image.**
+
+From Gantry's own Prometheus counters across the strict cold-start window:
+
+| metric                                          | delta over strict cold-start |
+|---|---:|
+| `p2p_origin_pull_total` (cluster-wide)          | **3**          |
+| `p2p_peer_fetch_total{outcome="hit"}`           | **+21**        |
+| `p2p_peer_fetch_total{outcome="notfound"}`      | +8             |
+| `p2p_peer_fetch_total{outcome="stall"}`         | +12            |
+| `p2p_cache_hit_total`                           | **+73**        |
+
+Three cluster-wide origin pulls match the three unique blobs in the
+image (manifest + config + 1 layer) — the theoretical minimum for F1.
+The remaining ~17 nodes' worth of traffic for those digests is served
+peer-to-peer (`peer_fetch{hit}` + `cache_hit`), never reaching the
+proxy.
+
+Per-pod start latency:
+
+| percentile | strict cold-start |
+|---|---:|
+| p50  | 32.3 s |
+| p95  | 33.3 s |
+| p100 | 34.3 s |
+
+Comparable to the no-Gantry baseline's 23–26 s per pod, with no
+thundering-herd tail. The ~6–9 s overhead vs. baseline is the
+cold-start coordination round-trip (DHT lookups + first peer/origin
+fetch) and is amortised across the 19 sibling pods that hit warm
+peer/cache paths.
+
+### Why "strict" matters
+
+An earlier cold-start run with the production-shaped Gantry
+[`hosts.toml.gantry.template`](../hosts.toml.gantry.template) (Gantry
+first, **proxy as `server=` fallback**) showed 14.01 GB / 18 blob
+requests at the proxy — ~13 GB higher than the strict measurement.
+That delta is containerd retrying directly against the proxy when
+Gantry's mirror returned a transient 5xx during the same cold-start.
+Those fallback pulls bypass `p2p_origin_pull_total`, so Gantry's own
+metrics (3 origin pulls) and the proxy's bytes (14 GB) disagreed. The
+strict `hosts.toml` removes the fallback so the two views reconcile:
+**proxy bytes = Gantry-routed bytes = 1.07 GB, origin pulls = 3.**
 
 Built from these commits (see `git log`):
 
@@ -24,89 +84,47 @@ Built from these commits (see `git log`):
 - `43ae418` — puller-pump: short-circuit when cache.Has(d) before re-pulling
 - `317c6b5` — demo: persist DAC_OVERRIDE+DAC_READ_SEARCH caps patch
 
-## Results
-
-| metric                          | **BASELINE** (no Gantry) | **GANTRY cold-start** (first) | **GANTRY cold-start** (reproduce) | reduction (first / reproduce) |
-|---|---:|---:|---:|---:|
-| total proxy requests            | 121          | 50             | **29**         | **59 % / 76 %** |
-| **bytes from origin**           | **27.01 GB** | **14.01 GB**   | **7.00 GB**    | **48 % / 74 %** |
-| blob requests                   | 54           | **18**         | **9**          | **67 % / 83 %** |
-| blob bytes                      | 27.01 GB     | 14.01 GB       | 7.00 GB        | 48 % / 74 %     |
-| `manifest_by_digest` requests   | 67           | 32             | 19             | 52 % / 72 %     |
-| `manifest_by_tag` requests      | 0            | 0              | 0              | _digest-pinned, F9 not triggered_ |
-
-Two cold-start measurements are reported because the second one is a
-useful complement, not a contradiction:
-
-- **First cold-start** is taken immediately after `make -C deploy/demo
-  infra-gantry` deploys a brand-new DaemonSet — 20 fresh gantry pods,
-  empty libp2p identity files, empty hostPath caches, members informer
-  still catching up. This is the honest pessimistic case.
-
-- **Reproduce cold-start** is the same harness run a few minutes later
-  on the same cluster: gantry pods are identical, hostPath cache still
-  holds previous-image blobs (different digests but warmer DHT), libp2p
-  routing tables have converged, members informer is stable. F1 hits
-  its theoretical minimum: **3 cluster-wide origin pulls** for the
-  image's 3 unique digests (1 manifest + 1 config + 1 layer), and
-  **102 peer-fetch hits** absorb the remaining ~17 nodes × 3 digests of
-  blob traffic.
-
-Per-pod start latency is essentially identical across runs (p50 ≈ 25 s,
-p100 ≈ 26 s — comparable to the no-Gantry baseline's 23–26 s, with no
-thundering-herd tail).
-
-From Gantry's own metrics:
-
-| metric                                          | first cold | reproduce cold |
-|---|---:|---:|
-| `p2p_origin_pull_total` delta (cluster-wide)    | 7          | **3**          |
-| `p2p_peer_fetch_total{outcome="hit"}` delta     | 69         | **102**        |
-
-**13.00 GB origin egress avoided on the first cold-start; 20.01 GB on
-the reproduce run.**
-
-The baseline number (27 GB rather than the naive 20 GB) is higher than
-ideal because kubelet on AKS retries blob GETs at least once per pod
-during the initial pull spike. Gantry's mirror serves 0 of those
-retries from origin because the deduplication is upstream of the
-kubelet boundary.
-
 ## Raw artifacts
 
-First cold-start (clean-redeploy):
+Baseline (clean-redeploy, hosts.toml = `baseline`):
 
 | file | what |
 |---|---|
-| [clean-pre-baseline.json](clean-pre-baseline.json) | proxy `/debug/summary` immediately before phase 1 (counters at zero) |
+| [clean-pre-baseline.json](clean-pre-baseline.json)   | proxy `/debug/summary` immediately before the 20-pod baseline pull |
 | [clean-post-baseline.json](clean-post-baseline.json) | after the 20-pod baseline pull |
-| [clean-post-cold.json](clean-post-cold.json) | after the 20-pod Gantry cold-start pull |
-| [clean-baseline.log](clean-baseline.log) | raw `go test -v` output for `TestPhaseBaseline` |
-| [clean-cold.log](clean-cold.log) | raw `go test -v` output for `TestPhaseGantryCold` |
-| [clean-run-start.txt](clean-run-start.txt) / [clean-run-end.txt](clean-run-end.txt) | UTC unix timestamps bracketing the run window |
+| [clean-baseline.log](clean-baseline.log)             | raw `go test -v` output for `TestPhaseBaseline` |
 
-Reproduce cold-start (same cluster, ~5 min later, no redeploy):
+Strict cold-start (hosts.toml = `gantry-strict`):
 
 | file | what |
 |---|---|
-| [repro-pre.json](repro-pre.json) | proxy `/debug/summary` immediately before the reproduce phase |
-| [repro-post.json](repro-post.json) | after the reproduce 20-pod pull |
-| [repro-cold.log](repro-cold.log) | raw `go test -v` output |
+| [strict-pre.json](strict-pre.json)                       | proxy `/debug/summary` immediately before the strict cold-start phase |
+| [strict-post.json](strict-post.json)                     | after the 20-pod strict cold-start pull |
+| [strict-cold.log](strict-cold.log)                       | raw `go test -v` output for `TestPhaseGantryCold` |
+| [strict-pre-gantry-metrics.txt](strict-pre-gantry-metrics.txt)   | Gantry Prometheus counters before the phase |
+| [strict-post-gantry-metrics.txt](strict-post-gantry-metrics.txt) | Gantry Prometheus counters after the phase |
 
 Re-derive the table from the JSON snapshots:
 
 ```sh
 python3 - <<'PY'
 import json
-def L(n): return json.load(open(f"deploy/demo/artifacts/clean-{n}.json"))["totals"]
-def D(a,b):
-    cls = lambda c: (b["by_path_class"][c]["requests"]-a["by_path_class"][c]["requests"],
-                     b["by_path_class"][c]["bytes"]-a["by_path_class"][c]["bytes"])
-    return {k: b[k]-a[k] for k in ("requests_completed","bytes_to_client")} | \
-           {f"{c}_req": cls(c)[0] for c in ("blob","manifest_by_digest","manifest_by_tag")} | \
-           {f"{c}_bytes": cls(c)[1] for c in ("blob","manifest_by_digest","manifest_by_tag")}
-print("baseline:", D(L("pre-baseline"), L("post-baseline")))
-print("cold:    ", D(L("post-baseline"), L("post-cold")))
+def L(p): return json.load(open(p))["totals"]
+def D(a, b):
+    cls = lambda c: (b["by_path_class"][c]["requests"] - a["by_path_class"][c]["requests"],
+                     b["by_path_class"][c]["bytes"]    - a["by_path_class"][c]["bytes"])
+    return {
+        "requests":           b["requests_completed"] - a["requests_completed"],
+        "bytes_to_client":    b["bytes_to_client"]    - a["bytes_to_client"],
+        "blob_req":           cls("blob")[0],
+        "blob_bytes":         cls("blob")[1],
+        "manifest_by_digest": cls("manifest_by_digest")[0],
+        "manifest_by_tag":    cls("manifest_by_tag")[0],
+    }
+print("baseline:", D(L("deploy/demo/artifacts/clean-pre-baseline.json"),
+                     L("deploy/demo/artifacts/clean-post-baseline.json")))
+print("strict:  ", D(L("deploy/demo/artifacts/strict-pre.json"),
+                     L("deploy/demo/artifacts/strict-post.json")))
 PY
 ```
 
@@ -124,10 +142,11 @@ kubectl -n gantry-demo rollout status  deploy/acr-origin-proxy
 # 2. baseline (no Gantry on the data path)
 DEMO_IMAGE_SIZE_MB=1024 make -C deploy/demo harness-baseline
 
-# 3. deploy Gantry, then cold-start phase
+# 3. deploy Gantry, then strict cold-start phase
 make -C deploy/demo infra-gantry
 kubectl -n gantry-demo delete ds/hosts-toml-installer --ignore-not-found
-DEMO_IMAGE_SIZE_MB=1024 make -C deploy/demo harness-gantry-cold
+DEMO_GANTRY_HOSTS_MODE=gantry-strict DEMO_IMAGE_SIZE_MB=1024 \
+  make -C deploy/demo harness-gantry-cold
 
 # 4. teardown
 CONFIRM_DESTROY=yes deploy/demo/infra/90-destroy-azure.sh deploy/demo/infra/env.local

@@ -31,7 +31,7 @@ func TestPhaseGantryWarm(t *testing.T) {
 		t.Fatalf("gantry DaemonSet not converged: %v", err)
 	}
 
-	if err := InstallHostsToml(ctx, cfg, "gantry"); err != nil {
+	if err := InstallHostsToml(ctx, cfg, gantryHostsMode()); err != nil {
 		t.Fatalf("install gantry hosts.toml: %v", err)
 	}
 
