@@ -1,0 +1,30 @@
+{
+  "since": "2026-05-16T02:39:47Z",
+  "uptime_seconds": 8,
+  "totals": {
+    "requests_completed": 0,
+    "bytes_to_client": 0,
+    "by_path_class": {
+      "blob": {
+        "requests": 0,
+        "bytes": 0
+      },
+      "manifest_by_digest": {
+        "requests": 0,
+        "bytes": 0
+      },
+      "manifest_by_tag": {
+        "requests": 0,
+        "bytes": 0
+      },
+      "other": {
+        "requests": 0,
+        "bytes": 0
+      },
+      "ping": {
+        "requests": 0,
+        "bytes": 0
+      }
+    }
+  }
+}

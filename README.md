@@ -20,6 +20,25 @@ workload changes.
   pointing at `127.0.0.1:5000`. Disabling Gantry falls back to direct
   origin pulls transparently.
 
+## Headline numbers
+
+20 worker nodes, ~1 GiB workload image, every origin request counted by a
+reverse proxy in front of ACR. Full methodology + raw JSON in
+[deploy/demo/artifacts/headline.md](deploy/demo/artifacts/headline.md).
+
+| metric | **BASELINE** (no Gantry) | **GANTRY cold-start** | reduction |
+|---|---:|---:|---:|
+| total proxy requests | 76 | 34 | **55.3 %** |
+| **bytes from origin** | **15.04 GB** | **6.45 GB** | **57.1 %** |
+| blob requests | 28 | **10** | **64.3 %** |
+| `manifest_by_digest` requests | 28 | 4 | 85.7 % |
+| `manifest_by_tag` requests | 20 | 21 | _by design — F9_ |
+
+8.59 GB of origin egress avoided on a single 20-node rollout. From
+Gantry's own metrics during cold-start: only **7 origin pulls** cluster-wide
+(`p2p_origin_pull_total`) and **95 peer-to-peer fetch hits**
+(`p2p_peer_fetch_total{outcome="hit"}`).
+
 ## Data path
 
 ```mermaid
