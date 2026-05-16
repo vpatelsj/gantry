@@ -161,15 +161,21 @@ func InstallHostsToml(ctx context.Context, cfg LiveConfig, mode string) error {
 }
 
 // gantryHostsMode returns the hosts.toml mode the gantry phases install on
-// nodes. Defaults to "gantry" (Gantry-first with proxy fallback). Override
-// with DEMO_GANTRY_HOSTS_MODE=gantry-strict to attribute proxy traffic
-// unambiguously to Gantry's origin client during cold-start measurement
-// (no containerd-direct fallback path).
-func gantryHostsMode() string {
+// nodes. The caller passes the mode the phase normally uses (e.g. "gantry"
+// for warm, "gantry-strict" for cold-start measurement); env var
+// DEMO_GANTRY_HOSTS_MODE overrides it for ad-hoc experiments.
+//
+// The cold-start phase defaults to "gantry-strict" (no proxy fallback in
+// hosts.toml) so every byte the counting proxy sees during the measurement
+// is sourced through Gantry's own origin client. The warm phase defaults
+// to "gantry" (production-shaped: Gantry first, proxy as server= fallback)
+// because the warm assertion is just "no origin egress at all" and that
+// holds for either mode.
+func gantryHostsMode(defaultMode string) string {
 	if m := os.Getenv("DEMO_GANTRY_HOSTS_MODE"); m != "" {
 		return m
 	}
-	return "gantry"
+	return defaultMode
 }
 
 func RunPullJob(ctx context.Context, cfg LiveConfig, phase PhaseName, image string) ([]time.Time, string, error) {

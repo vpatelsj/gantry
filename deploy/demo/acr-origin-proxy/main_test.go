@@ -75,10 +75,10 @@ func TestProxyCountsHappyPathAndOverridesAuthorization(t *testing.T) {
 		t.Fatalf("upstream Authorization = %q, want %q", upstreamAuth, wantAuth)
 	}
 
-	assertMetric(t, obs.started.WithLabelValues(http.MethodGet, string(pathClassBlob)), 1)
-	assertMetric(t, obs.completed.WithLabelValues(http.MethodGet, string(pathClassBlob), "200"), 1)
-	assertMetric(t, obs.bytesUpstream.WithLabelValues(string(pathClassBlob), "200"), float64(len(upstreamBody)))
-	assertMetric(t, obs.bytesToClient.WithLabelValues(string(pathClassBlob), "200"), float64(len(upstreamBody)))
+	assertMetric(t, obs.started.WithLabelValues(http.MethodGet, string(pathClassBlob), string(clientClassOther)), 1)
+	assertMetric(t, obs.completed.WithLabelValues(http.MethodGet, string(pathClassBlob), string(clientClassOther), "200"), 1)
+	assertMetric(t, obs.bytesUpstream.WithLabelValues(string(pathClassBlob), string(clientClassOther), "200"), float64(len(upstreamBody)))
+	assertMetric(t, obs.bytesToClient.WithLabelValues(string(pathClassBlob), string(clientClassOther), "200"), float64(len(upstreamBody)))
 	assertMetric(t, obs.inflight.WithLabelValues(string(pathClassBlob)), 0)
 
 	snap := obs.snapshot(time.Now())
@@ -87,6 +87,12 @@ func TestProxyCountsHappyPathAndOverridesAuthorization(t *testing.T) {
 	}
 	if got := snap.Totals.ByPathClass[pathClassBlob]; got.Requests != 1 || got.Bytes != uint64(len(upstreamBody)) {
 		t.Fatalf("blob summary = %+v", got)
+	}
+	if got := snap.Totals.ByClientClass[clientClassOther]; got.Requests != 1 || got.Bytes != uint64(len(upstreamBody)) {
+		t.Fatalf("by_client_class[other] = %+v", got)
+	}
+	if len(snap.Totals.ByDigest) != 1 || snap.Totals.ByDigest[0].Digest != testDigest() {
+		t.Fatalf("by_digest = %+v", snap.Totals.ByDigest)
 	}
 }
 
@@ -102,12 +108,12 @@ func TestProxyRecordsClientClosedOnceAndClearsInflight(t *testing.T) {
 	w := &failingResponseWriter{header: make(http.Header), failAfter: 3}
 	handler.ServeHTTP(w, req)
 
-	assertMetric(t, obs.started.WithLabelValues(http.MethodGet, string(pathClassBlob)), 1)
-	assertMetric(t, obs.completed.WithLabelValues(http.MethodGet, string(pathClassBlob), "client_closed"), 1)
+	assertMetric(t, obs.started.WithLabelValues(http.MethodGet, string(pathClassBlob), string(clientClassOther)), 1)
+	assertMetric(t, obs.completed.WithLabelValues(http.MethodGet, string(pathClassBlob), string(clientClassOther), "client_closed"), 1)
 	assertMetric(t, obs.inflight.WithLabelValues(string(pathClassBlob)), 0)
 
-	toClient := testutil.ToFloat64(obs.bytesToClient.WithLabelValues(string(pathClassBlob), "client_closed"))
-	fromUpstream := testutil.ToFloat64(obs.bytesUpstream.WithLabelValues(string(pathClassBlob), "client_closed"))
+	toClient := testutil.ToFloat64(obs.bytesToClient.WithLabelValues(string(pathClassBlob), string(clientClassOther), "client_closed"))
+	fromUpstream := testutil.ToFloat64(obs.bytesUpstream.WithLabelValues(string(pathClassBlob), string(clientClassOther), "client_closed"))
 	if toClient > fromUpstream {
 		t.Fatalf("bytes_to_client=%f > bytes_upstream=%f", toClient, fromUpstream)
 	}
@@ -162,7 +168,7 @@ func TestBearerChallengeRefreshesOnceAndUsesCachedToken(t *testing.T) {
 		t.Fatalf("upstream data calls = %d, want 3 (401+200, cached 200)", got)
 	}
 	assertMetric(t, obs.authRefresh.WithLabelValues("success"), 1)
-	assertMetric(t, obs.completed.WithLabelValues(http.MethodGet, string(pathClassManifestByDigest), "200"), 2)
+	assertMetric(t, obs.completed.WithLabelValues(http.MethodGet, string(pathClassManifestByDigest), string(clientClassOther), "200"), 2)
 }
 
 func TestTokenCacheRefreshesWithinSkew(t *testing.T) {
@@ -201,8 +207,8 @@ func TestTokenCacheRefreshesWithinSkew(t *testing.T) {
 
 func TestSummaryHandlerShape(t *testing.T) {
 	obs := newObserver(prometheus.NewRegistry(), time.Now().Add(-2*time.Second))
-	obs.begin(http.MethodHead, pathClassPing)
-	obs.finish(http.MethodHead, pathClassPing, "200", 0, 0, time.Millisecond)
+	obs.begin(http.MethodHead, pathClassPing, clientClassOther)
+	obs.finish(http.MethodHead, pathClassPing, clientClassOther, "", "200", 0, 0, time.Millisecond)
 
 	rr := httptest.NewRecorder()
 	summaryHandler(obs).ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/debug/summary", nil))
@@ -227,6 +233,103 @@ func TestSummaryHandlerShape(t *testing.T) {
 		if _, ok := got.Totals.ByPathClass[class]; !ok {
 			t.Fatalf("summary missing path_class %q", class)
 		}
+	}
+	for _, cc := range allClientClasses {
+		if _, ok := got.Totals.ByClientClass[cc]; !ok {
+			t.Fatalf("summary missing client_class %q", cc)
+		}
+	}
+	if got.Totals.ByDigest == nil {
+		t.Fatalf("summary missing by_digest array")
+	}
+}
+
+func TestClassifyClient(t *testing.T) {
+	cases := []struct {
+		name string
+		ua   string
+		want clientClass
+	}{
+		{name: "empty UA", ua: "", want: clientClassOther},
+		{name: "containerd", ua: "containerd/v1.7.31", want: clientClassContainerd},
+		{name: "containerd cri", ua: "containerd/v1.7.31 cri/Distribution", want: clientClassContainerd},
+		{name: "Go-http-client default", ua: "Go-http-client/1.1", want: clientClassGantry},
+		{name: "explicit gantry UA", ua: "gantry-origin-client/0.1", want: clientClassGantry},
+		{name: "case-insensitive Gantry", ua: "Gantry/0.1", want: clientClassGantry},
+		{name: "curl", ua: "curl/8.10.1", want: clientClassOther},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := classifyClient(tc.ua); got != tc.want {
+				t.Fatalf("classifyClient(%q) = %q, want %q", tc.ua, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestClassifyRequestExtractsDigest(t *testing.T) {
+	digest := "sha256:" + strings.Repeat("a", 64)
+	cases := []struct {
+		path        string
+		wantClass   pathClass
+		wantDigest  string
+	}{
+		{path: "/v2/acme/team/svc/blobs/" + digest, wantClass: pathClassBlob, wantDigest: digest},
+		{path: "/v2/acme/team/svc/manifests/" + digest, wantClass: pathClassManifestByDigest, wantDigest: digest},
+		{path: "/v2/acme/team/svc/manifests/v1.2.3", wantClass: pathClassManifestByTag, wantDigest: ""},
+		{path: "/v2/", wantClass: pathClassPing, wantDigest: ""},
+		{path: "/status", wantClass: pathClassOther, wantDigest: ""},
+	}
+	for _, tc := range cases {
+		gotClass, gotDigest := classifyRequest(tc.path)
+		if gotClass != tc.wantClass || gotDigest != tc.wantDigest {
+			t.Fatalf("classifyRequest(%q) = (%q, %q), want (%q, %q)",
+				tc.path, gotClass, gotDigest, tc.wantClass, tc.wantDigest)
+		}
+	}
+}
+
+func TestProxyAttributesByClientClassAndDigest(t *testing.T) {
+	upstreamBody := "payload-bytes"
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, upstreamBody)
+	}))
+	defer upstream.Close()
+
+	obs, handler := testProxy(t, upstream.URL, "basic")
+
+	gantryReq := httptest.NewRequest(http.MethodGet, "/v2/acme/team/svc/blobs/"+testDigest(), nil)
+	gantryReq.Header.Set("User-Agent", "Go-http-client/1.1")
+	handler.ServeHTTP(httptest.NewRecorder(), gantryReq)
+
+	containerdReq := httptest.NewRequest(http.MethodGet, "/v2/acme/team/svc/blobs/"+testDigest(), nil)
+	containerdReq.Header.Set("User-Agent", "containerd/v1.7.31 cri/Distribution")
+	handler.ServeHTTP(httptest.NewRecorder(), containerdReq)
+
+	snap := obs.snapshot(time.Now())
+	want := uint64(len(upstreamBody))
+
+	if got := snap.Totals.ByClientClass[clientClassGantry]; got.Requests != 1 || got.Bytes != want {
+		t.Fatalf("by_client_class[gantry] = %+v, want {Requests:1 Bytes:%d}", got, want)
+	}
+	if got := snap.Totals.ByClientClass[clientClassContainerd]; got.Requests != 1 || got.Bytes != want {
+		t.Fatalf("by_client_class[containerd] = %+v, want {Requests:1 Bytes:%d}", got, want)
+	}
+	if len(snap.Totals.ByDigest) != 1 {
+		t.Fatalf("by_digest length = %d, want 1 (both requests target the same digest)", len(snap.Totals.ByDigest))
+	}
+	entry := snap.Totals.ByDigest[0]
+	if entry.Digest != testDigest() || entry.PathClass != pathClassBlob {
+		t.Fatalf("by_digest[0] = %+v", entry)
+	}
+	if entry.Requests != 2 || entry.Bytes != 2*want {
+		t.Fatalf("by_digest[0] totals = %+v", entry)
+	}
+	if got := entry.ByClientClass[clientClassGantry]; got.Requests != 1 || got.Bytes != want {
+		t.Fatalf("by_digest[0].by_client_class[gantry] = %+v", got)
+	}
+	if got := entry.ByClientClass[clientClassContainerd]; got.Requests != 1 || got.Bytes != want {
+		t.Fatalf("by_digest[0].by_client_class[containerd] = %+v", got)
 	}
 }
 
@@ -257,7 +360,7 @@ func TestSyntheticThrottle(t *testing.T) {
 		t.Fatalf("Retry-After = %q, want 7", got)
 	}
 	assertMetric(t, obs.syntheticThrottle.WithLabelValues("blob_inflight"), 1)
-	assertMetric(t, obs.completed.WithLabelValues(http.MethodGet, string(pathClassBlob), "429"), 1)
+	assertMetric(t, obs.completed.WithLabelValues(http.MethodGet, string(pathClassBlob), string(clientClassOther), "429"), 1)
 }
 
 func testProxy(t *testing.T, upstreamURL, authMode string) (*observer, http.Handler) {

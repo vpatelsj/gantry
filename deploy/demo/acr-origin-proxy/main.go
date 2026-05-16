@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/signal"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -53,6 +54,50 @@ var allPathClasses = []pathClass{
 	pathClassPing,
 	pathClassOther,
 }
+
+// clientClass attributes a request to its likely caller, derived from the
+// inbound User-Agent header. The cold-start measurement uses this to tell
+// apart bytes Gantry's origin client pulled ("gantry") from bytes
+// containerd pulled directly when its hosts.toml allows the proxy as a
+// fallback ("containerd"). Anything else is "other" (curl probes,
+// monitoring, etc.).
+type clientClass string
+
+const (
+	clientClassGantry     clientClass = "gantry"
+	clientClassContainerd clientClass = "containerd"
+	clientClassOther      clientClass = "other"
+)
+
+var allClientClasses = []clientClass{
+	clientClassGantry,
+	clientClassContainerd,
+	clientClassOther,
+}
+
+// classifyClient maps an inbound User-Agent to a clientClass. Gantry's
+// origin client uses Go's default net/http User-Agent ("Go-http-client")
+// so that prefix is treated as gantry. containerd's image puller sets a
+// User-Agent like "containerd/v1.7.31".
+func classifyClient(ua string) clientClass {
+	lc := strings.ToLower(ua)
+	switch {
+	case lc == "":
+		return clientClassOther
+	case strings.Contains(lc, "containerd"):
+		return clientClassContainerd
+	case strings.Contains(lc, "gantry"),
+		strings.HasPrefix(lc, "go-http-client"):
+		return clientClassGantry
+	default:
+		return clientClassOther
+	}
+}
+
+// maxByDigestEntries caps the per-digest summary map so a misbehaving
+// client cannot grow it without bound. The demo workload typically
+// touches O(10) digests; the cap is generous.
+const maxByDigestEntries = 1024
 
 type config struct {
 	listen                string
@@ -121,6 +166,17 @@ type pathTotals struct {
 	Bytes    uint64 `json:"bytes"`
 }
 
+// digestEntry summarises proxy traffic for a single content digest. It
+// is reported under summary.totals.by_digest. Only blob and
+// manifest_by_digest requests carry a digest; tag manifests do not.
+type digestEntry struct {
+	Digest        string                       `json:"digest"`
+	PathClass     pathClass                    `json:"path_class"`
+	Requests      uint64                       `json:"requests"`
+	Bytes         uint64                       `json:"bytes"`
+	ByClientClass map[clientClass]pathTotals   `json:"by_client_class"`
+}
+
 type summary struct {
 	Since      string `json:"since"`
 	UptimeSecs int64  `json:"uptime_seconds"`
@@ -128,9 +184,11 @@ type summary struct {
 }
 
 type totals struct {
-	RequestsCompleted uint64                   `json:"requests_completed"`
-	BytesToClient     uint64                   `json:"bytes_to_client"`
-	ByPathClass       map[pathClass]pathTotals `json:"by_path_class"`
+	RequestsCompleted uint64                       `json:"requests_completed"`
+	BytesToClient     uint64                       `json:"bytes_to_client"`
+	ByPathClass       map[pathClass]pathTotals     `json:"by_path_class"`
+	ByClientClass     map[clientClass]pathTotals   `json:"by_client_class"`
+	ByDigest          []digestEntry                `json:"by_digest"`
 }
 
 type observer struct {
@@ -144,7 +202,11 @@ type observer struct {
 	syntheticThrottle   *prometheus.CounterVec
 	startedAt           time.Time
 	mu                  sync.Mutex
-	summary             totals
+	requestsCompleted   uint64
+	bytesToClientTotal  uint64
+	byPathClass         map[pathClass]pathTotals
+	byClientClass       map[clientClass]pathTotals
+	byDigest            map[string]*digestEntry
 	inflightByPathClass map[pathClass]int
 }
 
@@ -153,24 +215,24 @@ func newObserver(reg *prometheus.Registry, now time.Time) *observer {
 		started: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "origin_requests_started_total",
 			Help: "Logical client requests started by the demo ACR origin proxy.",
-		}, []string{"method", "path_class"}),
+		}, []string{"method", "path_class", "client_class"}),
 		completed: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "origin_requests_completed_total",
 			Help: "Logical client requests completed by the demo ACR origin proxy.",
-		}, []string{"method", "path_class", "status"}),
+		}, []string{"method", "path_class", "client_class", "status"}),
 		bytesUpstream: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "origin_bytes_upstream_total",
 			Help: "Response body bytes read from upstream by the demo ACR origin proxy.",
-		}, []string{"path_class", "status"}),
+		}, []string{"path_class", "client_class", "status"}),
 		bytesToClient: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "origin_bytes_to_client_total",
 			Help: "Response body bytes written to clients by the demo ACR origin proxy.",
-		}, []string{"path_class", "status"}),
+		}, []string{"path_class", "client_class", "status"}),
 		latency: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Name:    "origin_latency_seconds",
 			Help:    "Logical request latency through the demo ACR origin proxy.",
 			Buckets: []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300},
-		}, []string{"path_class", "status"}),
+		}, []string{"path_class", "client_class", "status"}),
 		inflight: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "origin_inflight_requests",
 			Help: "Logical requests currently in flight through the demo ACR origin proxy.",
@@ -184,14 +246,19 @@ func newObserver(reg *prometheus.Registry, now time.Time) *observer {
 			Help: "Synthetic proxy throttles by reason.",
 		}, []string{"reason"}),
 		startedAt:           now,
-		summary:             totals{ByPathClass: make(map[pathClass]pathTotals)},
+		byPathClass:         make(map[pathClass]pathTotals),
+		byClientClass:       make(map[clientClass]pathTotals),
+		byDigest:            make(map[string]*digestEntry),
 		inflightByPathClass: make(map[pathClass]int),
 	}
 
 	reg.MustRegister(o.started, o.completed, o.bytesUpstream, o.bytesToClient, o.latency, o.inflight, o.authRefresh, o.syntheticThrottle)
 	for _, class := range allPathClasses {
-		o.summary.ByPathClass[class] = pathTotals{}
+		o.byPathClass[class] = pathTotals{}
 		o.inflight.WithLabelValues(string(class)).Set(0)
+	}
+	for _, cc := range allClientClasses {
+		o.byClientClass[cc] = pathTotals{}
 	}
 	o.authRefresh.WithLabelValues("success").Add(0)
 	o.authRefresh.WithLabelValues("error").Add(0)
@@ -199,37 +266,62 @@ func newObserver(reg *prometheus.Registry, now time.Time) *observer {
 	return o
 }
 
-func (o *observer) begin(method string, class pathClass) {
-	o.started.WithLabelValues(method, string(class)).Inc()
+func (o *observer) begin(method string, class pathClass, cc clientClass) {
+	o.started.WithLabelValues(method, string(class), string(cc)).Inc()
 	o.inflight.WithLabelValues(string(class)).Inc()
 	o.mu.Lock()
 	o.inflightByPathClass[class]++
 	o.mu.Unlock()
 }
 
-func (o *observer) finish(method string, class pathClass, status string, upstreamBytes, clientBytes int64, elapsed time.Duration) {
+func (o *observer) finish(method string, class pathClass, cc clientClass, digest string, status string, upstreamBytes, clientBytes int64, elapsed time.Duration) {
 	if upstreamBytes < 0 {
 		upstreamBytes = 0
 	}
 	if clientBytes < 0 {
 		clientBytes = 0
 	}
-	o.completed.WithLabelValues(method, string(class), status).Inc()
-	o.bytesUpstream.WithLabelValues(string(class), status).Add(float64(upstreamBytes))
-	o.bytesToClient.WithLabelValues(string(class), status).Add(float64(clientBytes))
-	o.latency.WithLabelValues(string(class), status).Observe(elapsed.Seconds())
+	o.completed.WithLabelValues(method, string(class), string(cc), status).Inc()
+	o.bytesUpstream.WithLabelValues(string(class), string(cc), status).Add(float64(upstreamBytes))
+	o.bytesToClient.WithLabelValues(string(class), string(cc), status).Add(float64(clientBytes))
+	o.latency.WithLabelValues(string(class), string(cc), status).Observe(elapsed.Seconds())
 	o.inflight.WithLabelValues(string(class)).Dec()
 
 	o.mu.Lock()
 	if o.inflightByPathClass[class] > 0 {
 		o.inflightByPathClass[class]--
 	}
-	o.summary.RequestsCompleted++
-	o.summary.BytesToClient += uint64(clientBytes)
-	pt := o.summary.ByPathClass[class]
+	o.requestsCompleted++
+	o.bytesToClientTotal += uint64(clientBytes)
+	pt := o.byPathClass[class]
 	pt.Requests++
 	pt.Bytes += uint64(clientBytes)
-	o.summary.ByPathClass[class] = pt
+	o.byPathClass[class] = pt
+	cct := o.byClientClass[cc]
+	cct.Requests++
+	cct.Bytes += uint64(clientBytes)
+	o.byClientClass[cc] = cct
+	if digest != "" && (class == pathClassBlob || class == pathClassManifestByDigest) {
+		entry, ok := o.byDigest[digest]
+		if !ok {
+			if len(o.byDigest) >= maxByDigestEntries {
+				o.mu.Unlock()
+				return
+			}
+			entry = &digestEntry{
+				Digest:        digest,
+				PathClass:     class,
+				ByClientClass: make(map[clientClass]pathTotals),
+			}
+			o.byDigest[digest] = entry
+		}
+		entry.Requests++
+		entry.Bytes += uint64(clientBytes)
+		dt := entry.ByClientClass[cc]
+		dt.Requests++
+		dt.Bytes += uint64(clientBytes)
+		entry.ByClientClass[cc] = dt
+	}
 	o.mu.Unlock()
 }
 
@@ -252,15 +344,43 @@ func (o *observer) snapshot(now time.Time) summary {
 	defer o.mu.Unlock()
 	byClass := make(map[pathClass]pathTotals, len(allPathClasses))
 	for _, class := range allPathClasses {
-		byClass[class] = o.summary.ByPathClass[class]
+		byClass[class] = o.byPathClass[class]
 	}
+	byCC := make(map[clientClass]pathTotals, len(allClientClasses))
+	for _, cc := range allClientClasses {
+		byCC[cc] = o.byClientClass[cc]
+	}
+	byDigest := make([]digestEntry, 0, len(o.byDigest))
+	for _, e := range o.byDigest {
+		copyBy := make(map[clientClass]pathTotals, len(e.ByClientClass))
+		for cc, pt := range e.ByClientClass {
+			copyBy[cc] = pt
+		}
+		byDigest = append(byDigest, digestEntry{
+			Digest:        e.Digest,
+			PathClass:     e.PathClass,
+			Requests:      e.Requests,
+			Bytes:         e.Bytes,
+			ByClientClass: copyBy,
+		})
+	}
+	// Sort by_digest by bytes desc so the highest-traffic digests appear
+	// first; for cold-start debugging that's typically the layer blob.
+	sort.Slice(byDigest, func(i, j int) bool {
+		if byDigest[i].Bytes != byDigest[j].Bytes {
+			return byDigest[i].Bytes > byDigest[j].Bytes
+		}
+		return byDigest[i].Digest < byDigest[j].Digest
+	})
 	return summary{
 		Since:      o.startedAt.UTC().Format(time.RFC3339),
 		UptimeSecs: int64(now.Sub(o.startedAt).Seconds()),
 		Totals: totals{
-			RequestsCompleted: o.summary.RequestsCompleted,
-			BytesToClient:     o.summary.BytesToClient,
+			RequestsCompleted: o.requestsCompleted,
+			BytesToClient:     o.bytesToClientTotal,
 			ByPathClass:       byClass,
+			ByClientClass:     byCC,
+			ByDigest:          byDigest,
 		},
 	}
 }
@@ -421,26 +541,27 @@ func nonNegativeIntEnv(name string, fallback int) (int, error) {
 
 func proxyHandler(cfg *config, cache *tokenCache, obs *observer, client *http.Client) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		class := classifyPath(r.URL.EscapedPath())
+		class, digest := classifyRequest(r.URL.EscapedPath())
+		cc := classifyClient(r.Header.Get("User-Agent"))
 		start := time.Now()
 
 		if shouldThrottle(cfg, obs, class) {
 			obs.recordSyntheticThrottle("blob_inflight")
-			obs.begin(r.Method, class)
+			obs.begin(r.Method, class, cc)
 			body := "synthetic throttle\n"
 			w.Header().Set("Retry-After", strconv.Itoa(cfg.throttleRetryAfterSec))
 			w.WriteHeader(http.StatusTooManyRequests)
 			n, _ := io.WriteString(w, body)
-			obs.finish(r.Method, class, strconv.Itoa(http.StatusTooManyRequests), 0, int64(n), time.Since(start))
+			obs.finish(r.Method, class, cc, digest, strconv.Itoa(http.StatusTooManyRequests), 0, int64(n), time.Since(start))
 			return
 		}
 
-		obs.begin(r.Method, class)
+		obs.begin(r.Method, class, cc)
 		status := "upstream_error"
 		var upstreamBytes int64
 		var clientBytes int64
 		defer func() {
-			obs.finish(r.Method, class, status, upstreamBytes, clientBytes, time.Since(start))
+			obs.finish(r.Method, class, cc, digest, status, upstreamBytes, clientBytes, time.Since(start))
 		}()
 
 		r.Header.Del("Authorization")
@@ -513,21 +634,29 @@ func summaryHandler(obs *observer) http.Handler {
 }
 
 func classifyPath(rawPath string) pathClass {
+	class, _ := classifyRequest(rawPath)
+	return class
+}
+
+// classifyRequest returns both the path class and, when the request
+// targets a content-addressed blob or manifest, the sha256 digest. The
+// digest is empty for tag manifests, ping, and unrecognised paths.
+func classifyRequest(rawPath string) (pathClass, string) {
 	path := rawPath
 	if idx := strings.IndexByte(path, '?'); idx >= 0 {
 		path = path[:idx]
 	}
 	if path == "/v2" || path == "/v2/" {
-		return pathClassPing
+		return pathClassPing, ""
 	}
 	if !strings.HasPrefix(path, "/v2/") {
-		return pathClassOther
+		return pathClassOther, ""
 	}
 
 	rest := strings.TrimPrefix(path, "/v2/")
 	sep, kind := rightmostOCIBoundary(rest)
 	if sep <= 0 {
-		return pathClassOther
+		return pathClassOther, ""
 	}
 
 	var ref string
@@ -535,23 +664,23 @@ func classifyPath(rawPath string) pathClass {
 	case "blobs":
 		ref = rest[sep+len("/blobs/"):]
 		if ref == "uploads" || strings.HasPrefix(ref, "uploads/") {
-			return pathClassOther
+			return pathClassOther, ""
 		}
 		if isDigest(ref) {
-			return pathClassBlob
+			return pathClassBlob, strings.ToLower(ref)
 		}
-		return pathClassOther
+		return pathClassOther, ""
 	case "manifests":
 		ref = rest[sep+len("/manifests/"):]
 		if strings.Contains(ref, "/") || ref == "" {
-			return pathClassOther
+			return pathClassOther, ""
 		}
 		if isDigest(ref) {
-			return pathClassManifestByDigest
+			return pathClassManifestByDigest, strings.ToLower(ref)
 		}
-		return pathClassManifestByTag
+		return pathClassManifestByTag, ""
 	default:
-		return pathClassOther
+		return pathClassOther, ""
 	}
 }
 

@@ -75,6 +75,27 @@ metrics (3 origin pulls) and the proxy's bytes (14 GB) disagreed. The
 strict `hosts.toml` removes the fallback so the two views reconcile:
 **proxy bytes = Gantry-routed bytes = 1.07 GB, origin pulls = 3.**
 
+### Per-client and per-digest attribution
+
+The counting proxy now labels every request with a `client_class`
+(derived from the inbound `User-Agent`: `gantry`, `containerd`, or
+`other`) and tracks per-digest totals in `/debug/summary.totals.by_digest`.
+On the strict cold-start the attribution is unambiguous:
+
+| `client_class` | requests Δ | bytes Δ |
+|---|---:|---:|
+| `gantry`       | **21** | **1.07 GB** |
+| `containerd`   |  0     | 0           |
+| `other`        |  1     | 19 B (preflight curl) |
+
+The single 1 GiB layer blob shows up exactly once in `by_digest`, with
+all 1.07 GB attributed to `client_class=gantry`. `client_class=containerd`
+being **zero** is the live, automated proof that no containerd-direct
+fallback path is contaminating the measurement. See
+[strictv2-pre.json](strictv2-pre.json) /
+[strictv2-post.json](strictv2-post.json) /
+[strictv2-cold.log](strictv2-cold.log) for the captured snapshots.
+
 Built from these commits (see `git log`):
 
 - `0e8ba59` — cdsub: tolerate missing children when walking a containerd image
@@ -145,8 +166,7 @@ DEMO_IMAGE_SIZE_MB=1024 make -C deploy/demo harness-baseline
 # 3. deploy Gantry, then strict cold-start phase
 make -C deploy/demo infra-gantry
 kubectl -n gantry-demo delete ds/hosts-toml-installer --ignore-not-found
-DEMO_GANTRY_HOSTS_MODE=gantry-strict DEMO_IMAGE_SIZE_MB=1024 \
-  make -C deploy/demo harness-gantry-cold
+DEMO_IMAGE_SIZE_MB=1024 make -C deploy/demo harness-gantry-cold
 
 # 4. teardown
 CONFIRM_DESTROY=yes deploy/demo/infra/90-destroy-azure.sh deploy/demo/infra/env.local
