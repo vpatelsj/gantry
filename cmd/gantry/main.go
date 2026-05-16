@@ -2044,6 +2044,25 @@ func newPullerPump(infl *inflight.Map, originClient ifaces.OriginPuller, cstore 
 				}
 			}
 		}
+		// Cache short-circuit: a previously-completed pull leaves the
+		// bytes in our cache (and the digest in the DHT via
+		// runOriginPull's dht.Provide). The next please_pull for the
+		// same digest must NOT trigger a fresh origin pull — both the
+		// in-flight registry and the negcache are empty by then, so
+		// without this check we'd loop through runOriginPull on every
+		// kubelet retry and inflate p2p_origin_pull_total by the retry
+		// count (commonly 7-10 per stuck digest until ImagePullBackOff
+		// converges). Surface ALREADY_PULLING with start=now so the
+		// caller's cold-start cascade polls DHT once and finds us as a
+		// provider, same flow as the in-flight case below.
+		if cstore != nil {
+			ctxHas, cancelHas := context.WithTimeout(context.Background(), 100*time.Millisecond)
+			has, _ := cstore.Has(ctxHas, d)
+			cancelHas()
+			if has {
+				return time.Now(), true, nil
+			}
+		}
 		// Dedupe at this node: if a pull is already running, the
 		// stream handler must report ALREADY_PULLING with the existing
 		// start time so the requester can run the §5.6 stall check.
