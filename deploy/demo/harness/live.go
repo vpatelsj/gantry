@@ -200,11 +200,19 @@ spec:
         gantry.demo/run-label: %s
     spec:
       restartPolicy: Never
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app.kubernetes.io/name: gantry-demo-pull
+                  gantry.demo/run-label: %s
+              topologyKey: kubernetes.io/hostname
       containers:
         - name: pull
           image: %s
           imagePullPolicy: Always
-`, jobName, cfg.WorkloadNamespace, phase, cfg.NodeCount, cfg.NodeCount, phase, image)
+`, jobName, cfg.WorkloadNamespace, phase, cfg.NodeCount, cfg.NodeCount, phase, phase, image)
 	if _, err := runCommand(ctx, cfg.RepoRoot, []byte(manifest), "kubectl", "apply", "-f", "-"); err != nil {
 		return nil, jobName, err
 	}

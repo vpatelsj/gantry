@@ -170,9 +170,42 @@
     {
       "datasource": {"type": "prometheus", "uid": "prometheus"},
       "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {"drawStyle": "line", "lineWidth": 3, "fillOpacity": 20, "stacking": {"mode": "none"}},
+          "unit": "reqps"
+        },
+        "overrides": [
+          {"matcher": {"id": "byName", "options": "p2p hit (served from peer)"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "green"}}]},
+          {"matcher": {"id": "byName", "options": "origin escape (went to ACR)"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "red"}}]}
+        ]
+      },
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 16},
+      "id": 50,
+      "options": {"legend": {"displayMode": "table", "placement": "right", "calcs": ["last", "max"]}, "tooltip": {"mode": "multi"}},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "sum(rate(p2p_peer_fetch_total{outcome=\"hit\"}[1m]))",
+          "legendFormat": "p2p hit (served from peer)",
+          "refId": "A"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "sum(rate(p2p_origin_pull_total[1m]))",
+          "legendFormat": "origin escape (went to ACR)",
+          "refId": "B"
+        }
+      ],
+      "title": "P2P cache hits vs origin escapes (rate)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {
         "defaults": {"color": {"mode": "palette-classic"}, "custom": {"drawStyle": "line", "lineWidth": 2, "fillOpacity": 10}, "unit": "reqps"}
       },
-      "gridPos": {"h": 7, "w": 8, "x": 0, "y": 16},
+      "gridPos": {"h": 7, "w": 8, "x": 0, "y": 24},
       "id": 7,
       "options": {"legend": {"displayMode": "table", "placement": "right", "calcs": ["last"]}, "tooltip": {"mode": "multi"}},
       "targets": [
@@ -191,7 +224,7 @@
       "fieldConfig": {
         "defaults": {"color": {"mode": "palette-classic"}, "custom": {"drawStyle": "line", "lineWidth": 2, "fillOpacity": 10}, "unit": "reqps"}
       },
-      "gridPos": {"h": 7, "w": 8, "x": 8, "y": 16},
+      "gridPos": {"h": 7, "w": 8, "x": 8, "y": 24},
       "id": 8,
       "options": {"legend": {"displayMode": "table", "placement": "right", "calcs": ["last"]}, "tooltip": {"mode": "multi"}},
       "targets": [
@@ -210,7 +243,7 @@
       "fieldConfig": {
         "defaults": {"color": {"mode": "palette-classic"}, "custom": {"drawStyle": "line", "lineWidth": 2, "fillOpacity": 10}, "unit": "reqps"}
       },
-      "gridPos": {"h": 7, "w": 4, "x": 16, "y": 16},
+      "gridPos": {"h": 7, "w": 4, "x": 16, "y": 24},
       "id": 9,
       "options": {"legend": {"displayMode": "list", "placement": "bottom"}, "tooltip": {"mode": "multi"}},
       "targets": [
@@ -235,7 +268,7 @@
           "unit": "percentunit"
         }
       },
-      "gridPos": {"h": 7, "w": 4, "x": 20, "y": 16},
+      "gridPos": {"h": 7, "w": 4, "x": 20, "y": 24},
       "id": 10,
       "options": {"orientation": "horizontal", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "showThresholdLabels": false, "showThresholdMarkers": true},
       "targets": [
@@ -250,7 +283,7 @@
     },
     {
       "collapsed": false,
-      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 23},
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 31},
       "id": 300,
       "title": "Row 3 — Rollout (secondary)",
       "type": "row"
@@ -260,7 +293,7 @@
       "fieldConfig": {
         "defaults": {"color": {"mode": "palette-classic"}, "custom": {"drawStyle": "line", "lineWidth": 2, "fillOpacity": 10}, "unit": "short"}
       },
-      "gridPos": {"h": 7, "w": 12, "x": 0, "y": 24},
+      "gridPos": {"h": 7, "w": 12, "x": 0, "y": 32},
       "id": 11,
       "options": {"legend": {"displayMode": "table", "placement": "right", "calcs": ["last"]}, "tooltip": {"mode": "multi"}},
       "targets": [
@@ -279,7 +312,7 @@
       "fieldConfig": {
         "defaults": {"color": {"mode": "palette-classic"}, "custom": {"drawStyle": "line", "lineWidth": 2, "fillOpacity": 10}, "unit": "s"}
       },
-      "gridPos": {"h": 7, "w": 12, "x": 12, "y": 24},
+      "gridPos": {"h": 7, "w": 12, "x": 12, "y": 32},
       "id": 12,
       "options": {"legend": {"displayMode": "table", "placement": "right", "calcs": ["last"]}, "tooltip": {"mode": "multi"}},
       "targets": [
@@ -307,7 +340,7 @@
     },
     {
       "collapsed": false,
-      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 31},
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 39},
       "id": 400,
       "title": "Row 4 — Cost / overhead",
       "type": "row"
@@ -317,7 +350,7 @@
       "fieldConfig": {
         "defaults": {"color": {"mode": "palette-classic"}, "custom": {"drawStyle": "line", "lineWidth": 2, "fillOpacity": 10}, "unit": "percentunit"}
       },
-      "gridPos": {"h": 7, "w": 6, "x": 0, "y": 32},
+      "gridPos": {"h": 7, "w": 6, "x": 0, "y": 40},
       "id": 13,
       "options": {"legend": {"displayMode": "list", "placement": "bottom"}, "tooltip": {"mode": "multi"}},
       "targets": [
@@ -336,7 +369,7 @@
       "fieldConfig": {
         "defaults": {"color": {"mode": "palette-classic"}, "custom": {"drawStyle": "line", "lineWidth": 2, "fillOpacity": 10}, "unit": "Bps"}
       },
-      "gridPos": {"h": 7, "w": 6, "x": 6, "y": 32},
+      "gridPos": {"h": 7, "w": 6, "x": 6, "y": 40},
       "id": 14,
       "options": {"legend": {"displayMode": "list", "placement": "bottom"}, "tooltip": {"mode": "multi"}},
       "targets": [
@@ -361,7 +394,7 @@
       "fieldConfig": {
         "defaults": {"color": {"mode": "palette-classic"}, "custom": {"drawStyle": "line", "lineWidth": 2, "fillOpacity": 10}, "unit": "short"}
       },
-      "gridPos": {"h": 7, "w": 6, "x": 12, "y": 32},
+      "gridPos": {"h": 7, "w": 6, "x": 12, "y": 40},
       "id": 15,
       "options": {"legend": {"displayMode": "table", "placement": "right", "calcs": ["last", "max"]}, "tooltip": {"mode": "multi"}},
       "targets": [
@@ -380,7 +413,7 @@
       "fieldConfig": {
         "defaults": {"color": {"mode": "palette-classic"}, "custom": {"drawStyle": "line", "lineWidth": 2, "fillOpacity": 10}, "unit": "decbytes"}
       },
-      "gridPos": {"h": 7, "w": 6, "x": 18, "y": 32},
+      "gridPos": {"h": 7, "w": 6, "x": 18, "y": 40},
       "id": 16,
       "options": {"legend": {"displayMode": "list", "placement": "bottom"}, "tooltip": {"mode": "multi"}},
       "targets": [
@@ -405,6 +438,6 @@
   "timezone": "",
   "title": "Gantry ACR demo",
   "uid": "gantry-acr-demo",
-  "version": 1,
+  "version": 2,
   "weekStart": ""
 }

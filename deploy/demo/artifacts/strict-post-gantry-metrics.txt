@@ -1,8 +1,0 @@
-PROM sum(p2p_origin_pull_total):
-{} 27
-PROM sum by (outcome)(p2p_peer_fetch_total):
-{"outcome":"hit"} 123
-{"outcome":"notfound"} 58
-{"outcome":"stall"} 12
-PROM sum(p2p_cache_hit_total):
-{} 346
